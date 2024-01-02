@@ -27,6 +27,11 @@ else:
 
 
 query_engine = index.as_query_engine()
+response = query_engine.query("llama index 를 시작하려면?")
+print(type(response))
+print(response.metadata)
+print(response)
+
 response = query_engine.query("도전 과제 세가지가 뭐였어?")
 
 print(type(response))
