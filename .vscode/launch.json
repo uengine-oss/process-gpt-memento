@@ -5,6 +5,14 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Python: Module",
+            "type": "python",
+            "request": "launch",
+            "module": "uvicorn",
+            "justMyCode": true,
+            "args": ["memento-service:app", "--reload"]
+        },
+        {
             "name": "Python: Current File",
             "type": "python",
             "request": "launch",

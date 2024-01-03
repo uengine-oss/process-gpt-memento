@@ -9,6 +9,11 @@ from llama_index import (
     load_index_from_storage,
 )
 
+from typing import Union
+from fastapi import FastAPI
+
+app = FastAPI()
+
 # logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 # logging.getLogger().addHandler(logging.StreamHandler(stream=sys.stdout))
 
@@ -32,10 +37,24 @@ print(type(response))
 print(response.metadata)
 print(response)
 
-response = query_engine.query("임진왜란때 강화도에서는 무슨일이 있었어?")
+response = query_engine.query("도전 과제 세가지가 뭐였어?")
 
 print(type(response))
 print(response.metadata)
 print(response)
 
 
+@app.get("/query/{query}")
+def read_item(query: str, q: Union[str, None] = None):
+    response = query_engine.query(query)
+
+    print(type(response))
+    print(response.metadata)
+    print(response)
+
+    return response
+
+
+# @app.post("/doc")
+# def post_doc():
+    
