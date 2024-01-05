@@ -12,6 +12,9 @@ python-pptx = "*"
 pillow = "*"
 fastapi = "*"
 uvicorn = {extras = ["standard"], version = "*"}
+python-multipart = "*"
+pypdf = "*"
+setuptools = "==39.1.0"
 
 [dev-packages]
 
