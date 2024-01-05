@@ -52,7 +52,7 @@ def read_item(query: str):
 import os
 import shutil
 
-drop_directory = "drop"
+drop_directory = "./drop"
 
 @app.post("/uploadfile/")
 async def create_upload_file(file: UploadFile = File(...)):
@@ -68,9 +68,18 @@ async def main():
 <input type="submit">
 </form>
 """
-    return HTMLResponse(content=content)
+    return HTMLResponse(content="<script>window.location='/query'</script>")
     
 
+# @app.get("/queryform")
+# async def queryform():
+#     content = """
+# <form action="/query/" method="get">
+# <input name="query" type="text">
+# <input type="submit">
+# </form>
+# """
+#     return HTMLResponse(content=content)
 
 
 # ---- intervally search directory and indexing ----
