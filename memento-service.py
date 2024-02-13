@@ -1,8 +1,7 @@
-from llama_index import VectorStoreIndex, SimpleDirectoryReader
 import logging
 import sys
 import os.path
-from llama_index import (
+from llama_index.core import (
     VectorStoreIndex,
     SimpleDirectoryReader,
     StorageContext,
@@ -10,7 +9,7 @@ from llama_index import (
     
 )
 
-from llama_index.node_parser import SimpleNodeParser
+from llama_index.core.node_parser import SimpleNodeParser
 
 from typing import Union
 from fastapi import FastAPI, File, UploadFile
@@ -37,17 +36,18 @@ else:
 global query_engine
 query_engine = index.as_query_engine()
 
+from fastapi import Body
 
-@app.get("/query")
-def read_item(query: str):
-    response = query_engine.query(query)
+@app.post("/query")
+def read_item(query: dict = Body(...)):
+    query_text = query.get("queryText", "")
+    response = query_engine.query(query_text)
 
     print(type(response))
     print(response.metadata)
     print(response)
 
     return response
-
 
 import os
 import shutil
@@ -68,7 +68,7 @@ async def main():
 <input type="submit">
 </form>
 """
-    return HTMLResponse(content="<script>window.location='/query'</script>")
+    return HTMLResponse(content=content)
     
 
 # @app.get("/queryform")
