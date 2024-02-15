@@ -15,6 +15,12 @@ from typing import Union
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import HTMLResponse
 
+#from llama_index.embeddings.openai import OpenAIEmbedding
+
+from llama_index.core.retrievers import VectorIndexAutoRetriever
+from llama_index.core.vector_stores.types import MetadataInfo, VectorStoreInfo
+
+
 app = FastAPI()
 
 # logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
@@ -38,9 +44,50 @@ query_engine = index.as_query_engine()
 
 from fastapi import Body
 
+@app.post("/retrieve")
+def read_item(query: dict = Body(...)):
+    query_text = query.get("query", "")
+
+    # embed_model = OpenAIEmbedding()
+    # query_embedding = embed_model.get_query_embedding(query_text)
+
+    # response = index.query_vector_store(query_embedding, top_k=10)
+
+    vector_store_info = VectorStoreInfo(
+        content_info="company documents",
+        metadata_info=[]
+        #     MetadataInfo(
+        #         name="category",
+        #         type="str",
+        #         description=(
+        #             "Category of the celebrity, one of [Sports, Entertainment,"
+        #             " Business, Music]"
+        #         ),
+        #     ),
+        #     MetadataInfo(
+        #         name="country",
+        #         type="str",
+        #         description=(
+        #             "Country of the celebrity, one of [United States, Barbados,"
+        #             " Portugal]"
+        #         ),
+        #     ),
+        # ],
+    )
+    retriever = VectorIndexAutoRetriever(
+        index, vector_store_info=vector_store_info
+    )
+
+    response = retriever.retrieve(query_text)
+
+    print(type(response))
+    print(response)
+
+    return response
+
 @app.post("/query")
 def read_item(query: dict = Body(...)):
-    query_text = query.get("queryText", "")
+    query_text = query.get("query", "")
     response = query_engine.query(query_text)
 
     print(type(response))
@@ -138,3 +185,17 @@ def startup_event():
     interval = 10
     thread = Thread(target=index_periodically, args=(drop_directory, interval))
     thread.start()
+
+
+"""
+http POST http://localhost:8000/query query="brief stroy of netflix microservices journey"
+http POST http://localhost:8000/retrieve query="brief stroy of netflix microservices journey"
+http POST http://localhost:8000/retrieve query="최근에 오픈ai가 얼마를 투자받았어?"
+
+"""
+
+import uvicorn
+
+if __name__ == "__main__":
+    uvicorn.run("memento-service:app", host="0.0.0.0", port=8005, log_level="info")
+
