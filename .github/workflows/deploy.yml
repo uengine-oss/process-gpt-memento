@@ -20,7 +20,7 @@ jobs:
       - name: Build and push Docker image
         run: |
           IMAGE_TAG=$(echo $GITHUB_SHA | cut -c1-7)
-          IMAGE_NAME=ghcr.io/uengine-oss/process-gpt-execution:$IMAGE_TAG
+          IMAGE_NAME=ghcr.io/uengine-oss/process-gpt-memento:$IMAGE_TAG
 
           docker build -t $IMAGE_NAME .
           docker push $IMAGE_NAME
@@ -49,4 +49,4 @@ jobs:
 
       - name: Deploy to GKE
         run: |
-          kubectl set image deployment/execution-deployment execution=$IMAGE_NAME
+          kubectl set image deployment/memento-deployment memento=$IMAGE_NAME
