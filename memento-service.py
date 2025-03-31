@@ -1,26 +1,23 @@
-import logging
-import sys
-import os.path
-from llama_index.core import (
-    VectorStoreIndex,
-    SimpleDirectoryReader,
-    StorageContext,
-    load_index_from_storage,
-    
-)
-
-from llama_index.core.node_parser import SimpleNodeParser
-
-from typing import Union
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import HTMLResponse
-
-#from llama_index.embeddings.openai import OpenAIEmbedding
-
-from llama_index.core.retrievers import VectorIndexAutoRetriever
-from llama_index.core.vector_stores.types import MetadataInfo, VectorStoreInfo
+from fastapi import FastAPI, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
+import requests
+import tempfile
+import fitz  # PyMuPDF
+import docx
+import pptx
+import os
+
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import SupabaseVectorStore
+from supabase import create_client
+
+from langchain.chains import RetrievalQA
+from langchain.chat_models import ChatOpenAI
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import Document
 
 app = FastAPI()
 
@@ -32,176 +29,127 @@ app.add_middleware(
     allow_headers=["*"],  # 모든 HTTP 헤더 허용
 )
 
-# logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
-# logging.getLogger().addHandler(logging.StreamHandler(stream=sys.stdout))
+supabase_url = os.getenv("SUPABASE_URL")
+if not supabase_url:
+    supabase_url = "http://127.0.0.1:54321"
+
+supabase_key = os.getenv("SUPABASE_KEY")
+if not supabase_key:
+    supabase_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU"
+
+supabase_client = create_client(supabase_url, supabase_key)
+
+openai_api_key = os.getenv("OPENAI_API_KEY")
+model = ChatOpenAI(openai_api_key=openai_api_key)
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small", deployment="text-embedding-3-small", openai_api_key=openai_api_key)
+
+vector_store = SupabaseVectorStore(
+    client=supabase_client,
+    embedding=embeddings,
+    table_name="documents",
+    query_name="match_documents",
+)
 
 
-PERSIST_DIR = "./storage"
-global index
-if not os.path.exists(PERSIST_DIR):
-    documents = SimpleDirectoryReader("data").load_data()
-    index = VectorStoreIndex.from_documents(documents)
-    # store it for later
-    index.storage_context.persist(persist_dir=PERSIST_DIR)
-else:
-    # load the existing index
-    storage_context = StorageContext.from_defaults(persist_dir=PERSIST_DIR)
-    index = load_index_from_storage(storage_context)
+class FileRequest(BaseModel):
+    path: str
 
-global query_engine
-query_engine = index.as_query_engine()
+@app.post("/index")
+async def index_file(request: Request):
+    json_data = await request.json()
+    path = json_data.get('path')
+    
+    if path is None:
+        return {"message": "Path is required."}
+    
+    host_name = request.headers.get('X-Forwarded-Host')
+    if host_name is None or any(substring in host_name for substring in ['localhost']):
+        tenant_id = 'localhost'
+    else:
+        tenant_id = host_name.split('.')[0]
+    
+    file_name = path.split("/")[-1]
+    file_url = f"{supabase_url}/storage/v1/object/public/{path}"
+    file_ext = path.split(".")[-1]
 
-from fastapi import Body
+    response = requests.get(file_url)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as tmp:
+        tmp.write(response.content)
+        tmp_path = tmp.name
 
-@app.post("/retrieve")
-def read_item(query: dict = Body(...)):
-    query_text = query.get("query", "")
+    content = extract_text(tmp_path, file_ext)
+    if not content.strip():
+        return {"message": "No text extracted from file."}
 
-    # embed_model = OpenAIEmbedding()
-    # query_embedding = embed_model.get_query_embedding(query_text)
-
-    # response = index.query_vector_store(query_embedding, top_k=10)
-
-    vector_store_info = VectorStoreInfo(
-        content_info="company documents",
-        metadata_info=[]
-        #     MetadataInfo(
-        #         name="category",
-        #         type="str",
-        #         description=(
-        #             "Category of the celebrity, one of [Sports, Entertainment,"
-        #             " Business, Music]"
-        #         ),
-        #     ),
-        #     MetadataInfo(
-        #         name="country",
-        #         type="str",
-        #         description=(
-        #             "Country of the celebrity, one of [United States, Barbados,"
-        #             " Portugal]"
-        #         ),
-        #     ),
-        # ],
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=100
     )
-    retriever = VectorIndexAutoRetriever(
-        index, vector_store_info=vector_store_info
-    )
+    chunks = text_splitter.split_text(content)
 
-    response = retriever.retrieve(query_text)
+    documents = [
+        Document(
+            page_content=chunk,
+            metadata={
+                "tenant_id": tenant_id,
+                "type": "upload_file",
+                "file_path": file_url,
+                "file_name": file_name,
+                "chunk_index": i
+            }
+        )
+        for i, chunk in enumerate(chunks)
+    ]
 
-    print(type(response))
-    print(response)
+    vector_store.add_documents(documents)
 
-    return response
+    return {"message": f"{len(chunks)} chunks indexed."}
+
+def extract_text(path: str, ext: str) -> str:
+    if ext == "pdf":
+        return "\n".join([page.get_text() for page in fitz.open(path)])
+    elif ext == "docx":
+        doc = docx.Document(path)
+        return "\n".join([p.text for p in doc.paragraphs])
+    elif ext == "pptx":
+        ppt = pptx.Presentation(path)
+        return "\n".join([shape.text for slide in ppt.slides for shape in slide.shapes if hasattr(shape, "text")])
+    elif ext == "md":
+        return open(path, "r", encoding="utf-8").read()
+    else:
+        return {"message": f"Unsupported file format: {ext}"}
+
+
 
 @app.post("/query")
-def read_item(query: dict = Body(...)):
-    query_text = query.get("query", "")
-    response = query_engine.query(query_text)
-
-    print(type(response))
-    print(response.metadata)
-    print(response)
-
-    return response
-
-import os
-import shutil
-
-drop_directory = "./drop"
-
-@app.post("/uploadfile/")
-async def create_upload_file(file: UploadFile = File(...)):
-    with open(f"{drop_directory}/{file.filename}", "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    return {"filename": file.filename}
-
-@app.get("/")
-async def main():
-    content = """
-<form action="/uploadfile/" enctype="multipart/form-data" method="post">
-<input name="file" type="file">
-<input type="submit">
-</form>
-"""
-    return HTMLResponse(content=content)
+def query_vector_store(input: dict = Body(...)):
+    query = input.get("query", "")
+    tenant_id = input.get("tenant_id", "localhost")
     
+    retriever = vector_store.as_retriever(search_kwargs={
+        "k": 5,
+        "filter": {
+            "tenant_id": tenant_id,
+            "type": "upload_file"
+        }
+    })
+    
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=model,
+        retriever=retriever,
+        return_source_documents=True
+    )
 
-# @app.get("/queryform")
-# async def queryform():
-#     content = """
-# <form action="/query/" method="get">
-# <input name="query" type="text">
-# <input type="submit">
-# </form>
-# """
-#     return HTMLResponse(content=content)
+    result = qa_chain.invoke(query)
 
+    return {
+        "response": result["result"],
+        "metadata": {
+            f"{doc.metadata.get('file_name', 'unknown')}#{doc.metadata.get('chunk_index', i)}": doc.metadata
+            for i, doc in enumerate(result["source_documents"])
+        }
+    }
 
-# ---- intervally search directory and indexing ----
-from threading import Thread
-import time
-
-def find_first_file(directory):
-    for file in os.listdir(directory):
-        if os.path.isfile(os.path.join(directory, file)):
-            return file
-    return None
-
-def delete_all_files_in_directory(directory):
-    for filename in os.listdir(directory):
-        file_path = os.path.join(directory, filename)
-        try:
-            if os.path.isfile(file_path) or os.path.islink(file_path):
-                os.remove(file_path)
-            elif os.path.isdir(file_path):
-                shutil.rmtree(file_path)
-        except Exception as e:
-            print('Failed to delete %s. Reason: %s' % (file_path, e))
-
-
-def index_periodically(directory, interval):
-    global query_engine
-    while True:
-        file_name = find_first_file(directory)
-        if file_name:
-            print(file_name)
-
-            documents = SimpleDirectoryReader(directory).load_data()
-            # new_index = VectorStoreIndex.from_documents(documents)
-            #     # store it for later
-            # new_index.storage_context.persist(persist_dir=PERSIST_DIR)
-                    
-            parser = SimpleNodeParser()
-            new_nodes = parser.get_nodes_from_documents(documents)
-
-            # Add nodes to the existing index
-            print("Adding new nodes to the existing index...")
-            index.insert_nodes(new_nodes)
-            index.storage_context.persist(persist_dir=PERSIST_DIR)
-            query_engine = index.as_query_engine()
-
-            delete_all_files_in_directory(directory)
-            print("Indexing Done.")
-
-        # else:
-        #     print(".")
-        time.sleep(interval)
-
-@app.on_event("startup")
-def startup_event():
-
-    interval = 10
-    thread = Thread(target=index_periodically, args=(drop_directory, interval))
-    thread.start()
-
-
-"""
-http POST http://localhost:8000/query query="brief stroy of netflix microservices journey"
-http POST http://localhost:8000/retrieve query="brief stroy of netflix microservices journey"
-http POST http://localhost:8000/retrieve query="최근에 오픈ai가 얼마를 투자받았어?"
-
-"""
 
 import uvicorn
 

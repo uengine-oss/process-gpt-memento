@@ -4,19 +4,27 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-llama-index = "*"
-exceptiongroup = "*"
-torch = "*"
-transformers = "*"
 python-pptx = "*"
 pillow = "*"
+pypdf = "*"
+docx2txt = "*"
+python-multipart = "*"
 fastapi = "*"
 uvicorn = {extras = ["standard"], version = "*"}
-python-multipart = "*"
-pypdf = "*"
-setuptools = "==39.1.0"
+openai = "*"
+llama-index = "*"
 llama-index-embeddings-openai = "*"
-docx2txt = "*"
+torch = "*"
+transformers = "*"
+supabase = "*"
+langchain = "*"
+langchain-openai = "*"
+langchain-community = "*"
+exceptiongroup = "*"
+setuptools = "==39.1.0"
+requests = "*"
+pymupdf = "*"
+docx = "*"
 
 [dev-packages]
 
