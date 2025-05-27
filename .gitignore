@@ -161,3 +161,10 @@ cython_debug/
 storage/default__vector_store.json
 storage/docstore.json
 storage/index_store.json
+
+token.json
+credentials.json
+*.lock
+pyproject.toml
+.python-version
+documents/
