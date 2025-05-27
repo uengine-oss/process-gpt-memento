@@ -4,9 +4,7 @@ Google Drive document loader and processor
 import os
 import io
 from typing import List, Optional
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload, MediaIoBaseUpload
 
@@ -14,44 +12,36 @@ from document_loader import DocumentProcessor
 
 SCOPES = [
     'https://www.googleapis.com/auth/drive.readonly',
-    'https://www.googleapis.com/auth/drive.file'  # For file upload
+    'https://www.googleapis.com/auth/drive.file'
 ]
 
-credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 
 class GoogleDriveLoader:
     """Handles loading and processing of documents from Google Drive"""
     
-    def __init__(self, token_path: str = 'token.json'):
+    def __init__(self, credentials_path: str = None):
         """
         Initialize the Google Drive loader
         
         Args:
-            token_path: Path to save/load the token.json file
+            credentials_path: Path to the service account credentials JSON file
         """
-        self.credentials_path = credentials_path
-        self.token_path = token_path
-        self.credentials = None
+        self.credentials_path = credentials_path or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         self.service = None
         self.document_loader = DocumentProcessor()
         
     def authenticate(self) -> None:
-        """Authenticate with Google Drive API"""
-        if os.path.exists(self.token_path):
-            self.credentials = Credentials.from_authorized_user_file(self.token_path, SCOPES)
-            
-        if not self.credentials or not self.credentials.valid:
-            if self.credentials and self.credentials.expired and self.credentials.refresh_token:
-                self.credentials.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(self.credentials_path, SCOPES)
-                self.credentials = flow.run_local_server(port=0)
-                
-            with open(self.token_path, 'w') as token:
-                token.write(self.credentials.to_json())
-                
-        self.service = build('drive', 'v3', credentials=self.credentials)
+        """Authenticate with Google Drive API using service account"""
+        try:
+            credentials = service_account.Credentials.from_service_account_file(
+                self.credentials_path,
+                scopes=SCOPES
+            )
+            self.service = build('drive', 'v3', credentials=credentials)
+        except Exception as e:
+            print(f"Error authenticating with Google Drive: {e}")
+            raise
         
     def list_files(self, file_types: Optional[List[str]] = None) -> List[dict]:
         """
