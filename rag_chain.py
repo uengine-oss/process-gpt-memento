@@ -134,6 +134,7 @@ class RAGChain:
     def get_processed_files(self, tenant_id: str) -> List[str]:
         """Get list of already processed files for a tenant"""
         try:
+            print(f"Getting processed files for tenant: {tenant_id}")
             result = self.supabase.table('processed_files') \
                 .select('file_id') \
                 .eq('tenant_id', tenant_id) \

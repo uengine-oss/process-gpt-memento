@@ -95,7 +95,7 @@ class VectorStoreManager:
         try:
             print(f"Searching for documents similar to query: {query}")
             if filter:
-                # print(f"Using filter: {filter}")
+                print(f"Using filter: {filter}")
                 if 'type' not in filter:
                     filter['type'] = "upload_file"
             else:
