@@ -3,6 +3,7 @@ Document loader and processor
 """
 import os
 import uuid
+import tempfile
 from typing import List, Optional
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -45,8 +46,16 @@ class DocumentProcessor:
                 loader = UnstructuredExcelLoader(file_content, mode="single")
                 documents = loader.load()
             elif file_extension == '.pdf':
-                loader = PyPDFLoader(file_content)
-                documents = loader.load()
+                # Save BytesIO to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+                    tmp.write(file_content.read())
+                    tmp_path = tmp.name
+                try:
+                    loader = PyPDFLoader(tmp_path)
+                    documents = loader.load()
+                finally:
+                    # Clean up temporary file
+                    os.unlink(tmp_path)
             else:
                 print(f"Unsupported file type: {file_extension}")
                 return None
