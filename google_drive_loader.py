@@ -30,6 +30,7 @@ class GoogleDriveLoader:
         self.credentials_path = credentials_path or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         self.service = None
         self.document_loader = DocumentProcessor()
+        self.root_folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
         
     def authenticate(self) -> None:
         """Authenticate with Google Drive API using service account"""
@@ -43,12 +44,58 @@ class GoogleDriveLoader:
             print(f"Error authenticating with Google Drive: {e}")
             raise
         
-    def list_files(self, file_types: Optional[List[str]] = None) -> List[dict]:
+    def get_tenant_folder_id(self, tenant_id: str) -> str:
         """
-        List files in Google Drive, optionally filtered by folder and file types
+        Get or create a folder for a specific tenant
+        
+        Args:
+            tenant_id: The tenant ID
+            
+        Returns:
+            The folder ID for the tenant
+        """
+        if not self.service:
+            self.authenticate()
+            
+        try:
+            # Search for existing tenant folder
+            query = f"name='{tenant_id}' and mimeType='application/vnd.google-apps.folder' and '{self.root_folder_id}' in parents and trashed=false"
+            results = self.service.files().list(
+                q=query,
+                spaces='drive',
+                fields='files(id, name)'
+            ).execute()
+            
+            files = results.get('files', [])
+            
+            if files:
+                return files[0]['id']
+            
+            # Create new folder if it doesn't exist
+            folder_metadata = {
+                'name': tenant_id,
+                'mimeType': 'application/vnd.google-apps.folder',
+                'parents': [self.root_folder_id]
+            }
+            
+            folder = self.service.files().create(
+                body=folder_metadata,
+                fields='id'
+            ).execute()
+            
+            return folder['id']
+            
+        except Exception as e:
+            print(f"Error getting/creating tenant folder: {e}")
+            raise
+        
+    def list_files(self, file_types: Optional[List[str]] = None, tenant_id: str = None) -> List[dict]:
+        """
+        List files in Google Drive, filtered by tenant and file types
         
         Args:
             file_types: Optional list of file MIME types to filter by
+            tenant_id: The tenant ID to filter files by
             
         Returns:
             List of file metadata dictionaries
@@ -56,10 +103,14 @@ class GoogleDriveLoader:
         if not self.service:
             self.authenticate()
             
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+            
         query_parts = []
         
-        if folder_id:
-            query_parts.append(f"'{folder_id}' in parents")
+        # Get tenant folder ID
+        tenant_folder_id = self.get_tenant_folder_id(tenant_id)
+        query_parts.append(f"'{tenant_folder_id}' in parents")
         
         if file_types:
             mime_types = [f"mimeType='{mime_type}'" for mime_type in file_types]
@@ -166,13 +217,14 @@ class GoogleDriveLoader:
             
         return all_chunks
     
-    def save_to_google_drive(self, file_content: io.BytesIO, file_name: Optional[str] = None) -> dict:
+    def save_to_google_drive(self, file_content: io.BytesIO, file_name: Optional[str] = None, tenant_id: str = None) -> dict:
         """
         Save a file to Google Drive folder
         
         Args:
             file_content: BytesIO object containing the file content
             file_name: file name to save
+            tenant_id: The tenant ID to save the file for
         
         Returns:
             dict: File metadata including download link
@@ -180,10 +232,16 @@ class GoogleDriveLoader:
         try:
             if not self.service:
                 self.authenticate()
+                
+            if not tenant_id:
+                raise ValueError("tenant_id is required")
+                
+            # Get tenant folder ID
+            tenant_folder_id = self.get_tenant_folder_id(tenant_id)
             
             file_metadata = {
                 'name': file_name if file_name else os.path.basename(file_name),
-                'parents': [folder_id]
+                'parents': [tenant_folder_id]
             }
             
             media = MediaIoBaseUpload(

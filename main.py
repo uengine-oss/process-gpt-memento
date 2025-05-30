@@ -85,11 +85,11 @@ def process_google_drive(request: ProcessRequest):
         else:
             tenant_id = request.tenant_id
 
-        # Get list of files from Google Drive
-        files = drive_loader.list_files(supported_mime_types)
+        # Get list of files from Google Drive for specific tenant
+        files = drive_loader.list_files(supported_mime_types, tenant_id=tenant_id)
         
         if not files:
-            return {"message": "No documents found in Google Drive folder"}
+            return {"message": f"No documents found in Google Drive folder for tenant {tenant_id}"}
             
         rag = RAGChain()
         
@@ -100,7 +100,7 @@ def process_google_drive(request: ProcessRequest):
         new_files = [f for f in files if f['id'] not in processed_files]
         
         if not new_files:
-            return {"message": "No new documents to process"}
+            return {"message": f"No new documents to process for tenant {tenant_id}"}
             
         # Process only new files
         all_documents = []
@@ -126,11 +126,11 @@ def process_google_drive(request: ProcessRequest):
                     tenant_id,
                     [f['name'] for f in new_files]
                 )
-                return {"message": f"Successfully processed {len(new_files)} new documents"}
+                return {"message": f"Successfully processed {len(new_files)} new documents for tenant {tenant_id}"}
             else:
                 raise HTTPException(status_code=500, detail="Failed to process and store documents")
         else:
-            return {"message": "No new content to process"}
+            return {"message": f"No new content to process for tenant {tenant_id}"}
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -203,13 +203,16 @@ async def answer_query(
 @app.post("/save-to-drive")
 async def save_to_drive(
     file: UploadFile = File(...),
-    file_name: str = Form(...)
+    file_name: str = Form(...),
+    tenant_id: str = Form(...)
 ):
     """
     Save a file to Google Drive
     
     Args:
         file: The file to upload
+        file_name: Name of the file
+        tenant_id: ID of the tenant
     """
     try:
         content = await file.read()
@@ -218,7 +221,7 @@ async def save_to_drive(
         file_content = io.BytesIO(content)
         
         drive_loader = GoogleDriveLoader()
-        result = drive_loader.save_to_google_drive(file_content, file_name)
+        result = drive_loader.save_to_google_drive(file_content, file_name, tenant_id)
         return result
             
     except Exception as e:
