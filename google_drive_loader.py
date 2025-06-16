@@ -4,119 +4,48 @@ Google Drive document loader and processor
 import os
 import io
 from typing import List, Optional
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload, MediaIoBaseUpload
+import asyncio
 
 from document_loader import DocumentProcessor
-
-SCOPES = [
-    'https://www.googleapis.com/auth/drive.readonly',
-    'https://www.googleapis.com/auth/drive.file'
-]
-
-folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 
 class GoogleDriveLoader:
     """Handles loading and processing of documents from Google Drive"""
     
-    def __init__(self, credentials_path: str = None):
+    def __init__(self, drive_service):
         """
         Initialize the Google Drive loader
         
         Args:
-            credentials_path: Path to the service account credentials JSON file
+            drive_service: Authenticated Google Drive service instance
         """
-        self.credentials_path = credentials_path or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        self.service = None
+        self.service = drive_service
         self.document_loader = DocumentProcessor()
-        self.root_folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
         
-    def authenticate(self) -> None:
-        """Authenticate with Google Drive API using service account"""
-        try:
-            credentials = service_account.Credentials.from_service_account_file(
-                self.credentials_path,
-                scopes=SCOPES
-            )
-            self.service = build('drive', 'v3', credentials=credentials)
-        except Exception as e:
-            print(f"Error authenticating with Google Drive: {e}")
-            raise
-        
-    def get_tenant_folder_id(self, tenant_id: str) -> str:
+    async def list_files(self, file_types: Optional[List[str]] = None, folder_id: Optional[str] = None) -> List[dict]:
         """
-        Get or create a folder for a specific tenant
-        
-        Args:
-            tenant_id: The tenant ID
-            
-        Returns:
-            The folder ID for the tenant
-        """
-        if not self.service:
-            self.authenticate()
-            
-        try:
-            # Search for existing tenant folder
-            query = f"name='{tenant_id}' and mimeType='application/vnd.google-apps.folder' and '{self.root_folder_id}' in parents and trashed=false"
-            results = self.service.files().list(
-                q=query,
-                spaces='drive',
-                fields='files(id, name)'
-            ).execute()
-            
-            files = results.get('files', [])
-            
-            if files:
-                return files[0]['id']
-            
-            # Create new folder if it doesn't exist
-            folder_metadata = {
-                'name': tenant_id,
-                'mimeType': 'application/vnd.google-apps.folder',
-                'parents': [self.root_folder_id]
-            }
-            
-            folder = self.service.files().create(
-                body=folder_metadata,
-                fields='id'
-            ).execute()
-            
-            return folder['id']
-            
-        except Exception as e:
-            print(f"Error getting/creating tenant folder: {e}")
-            raise
-        
-    def list_files(self, file_types: Optional[List[str]] = None, tenant_id: str = None) -> List[dict]:
-        """
-        List files in Google Drive, filtered by tenant and file types
+        List files in Google Drive, filtered by file types and folder
         
         Args:
             file_types: Optional list of file MIME types to filter by
-            tenant_id: The tenant ID to filter files by
+            folder_id: Optional Google Drive folder ID
             
         Returns:
             List of file metadata dictionaries
         """
-        if not self.service:
-            self.authenticate()
-            
-        if not tenant_id:
-            raise ValueError("tenant_id is required")
-            
         query_parts = []
-        
-        # Get tenant folder ID
-        tenant_folder_id = self.get_tenant_folder_id(tenant_id)
-        query_parts.append(f"'{tenant_folder_id}' in parents")
         
         if file_types:
             mime_types = [f"mimeType='{mime_type}'" for mime_type in file_types]
             query_parts.append(f"({' or '.join(mime_types)})")
             
-        query_parts.append("trashed=false")
+        if folder_id:
+            query_parts.append(f"trashed=false and '{folder_id}' in parents")
+        else:
+            query_parts.append("trashed=false")
+        
         query = " and ".join(query_parts)
         
         results = []
@@ -124,7 +53,8 @@ class GoogleDriveLoader:
         
         while True:
             try:
-                response = self.service.files().list(
+                response = await asyncio.to_thread(
+                    self.service.files().list,
                     q=query,
                     spaces='drive',
                     fields='nextPageToken, files(id, name, mimeType)',
@@ -143,7 +73,7 @@ class GoogleDriveLoader:
                 
         return results
         
-    def download_and_process_file(self, file_id: str, file_name: str) -> List[str]:
+    async def download_and_process_file(self, file_id: str, file_name: str) -> List[str]:
         """
         Download a file from Google Drive and process it using DocumentLoader
         
@@ -154,9 +84,6 @@ class GoogleDriveLoader:
         Returns:
             List of processed text chunks
         """
-        if not self.service:
-            self.authenticate()
-            
         try:
             request = self.service.files().get_media(fileId=file_id)
             fh = io.BytesIO()
@@ -164,13 +91,17 @@ class GoogleDriveLoader:
             done = False
             
             while not done:
-                status, done = downloader.next_chunk()
+                status, done = await asyncio.to_thread(downloader.next_chunk)
                 
             fh.seek(0)
             
             # Process the file directly from memory
             print(f"Processing file: {file_name}")
-            chunks = self.document_loader.load_document(fh, file_name)
+            chunks = await asyncio.to_thread(
+                self.document_loader.load_document,
+                fh,
+                file_name
+            )
             
             if chunks is None:
                 print(f"Warning: No content extracted from {file_name}")
@@ -183,65 +114,20 @@ class GoogleDriveLoader:
             print(f"Error downloading and processing file {file_name}: {e}")
             return []
             
-    def process_folder(self, file_types: Optional[List[str]] = None) -> List[str]:
+    async def save_to_google_drive(self, file_content: io.BytesIO, file_name: Optional[str] = None) -> dict:
         """
-        Process all files in a Google Drive folder
-        
-        Args:
-            file_types: Optional list of file MIME types to filter by
-            
-        Returns:
-            List of all processed text chunks from all files
-        """
-        if file_types is None:
-            file_types = [
-                'application/vnd.google-apps.document',  # Google Docs
-                'application/vnd.google-apps.spreadsheet',  # Google Sheets
-                'application/vnd.google-apps.presentation',  # Google Slides
-                'application/pdf',  # PDF
-                'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # DOCX
-                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',  # XLSX
-                'application/vnd.openxmlformats-officedocument.presentationml.presentation',  # PPTX
-                'text/plain',  # TXT
-                'application/vnd.google-apps.folder'  # Google Drive 폴더
-            ]
-            
-        files = self.list_files(file_types)
-        all_chunks = []
-        
-        for file in files:
-            print(f"Processing file: {file['name']} (ID: {file['id']})")
-            chunks = self.download_and_process_file(file['id'], file['name'])
-            if chunks is not None:
-                all_chunks.extend(chunks)
-            
-        return all_chunks
-    
-    def save_to_google_drive(self, file_content: io.BytesIO, file_name: Optional[str] = None, tenant_id: str = None) -> dict:
-        """
-        Save a file to Google Drive folder
+        Save a file to Google Drive
         
         Args:
             file_content: BytesIO object containing the file content
             file_name: file name to save
-            tenant_id: The tenant ID to save the file for
         
         Returns:
             dict: File metadata including download link
         """
         try:
-            if not self.service:
-                self.authenticate()
-                
-            if not tenant_id:
-                raise ValueError("tenant_id is required")
-                
-            # Get tenant folder ID
-            tenant_folder_id = self.get_tenant_folder_id(tenant_id)
-            
             file_metadata = {
-                'name': file_name if file_name else os.path.basename(file_name),
-                'parents': [tenant_folder_id]
+                'name': file_name if file_name else os.path.basename(file_name)
             }
             
             media = MediaIoBaseUpload(
@@ -250,7 +136,8 @@ class GoogleDriveLoader:
                 resumable=True
             )
             
-            file = self.service.files().create(
+            file = await asyncio.to_thread(
+                self.service.files().create,
                 body=file_metadata,
                 media_body=media,
                 fields='id, name, webViewLink, webContentLink'

@@ -6,6 +6,7 @@ from supabase import create_client
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores.supabase import SupabaseVectorStore
 from langchain.schema import Document
+import asyncio
 
 class VectorStoreManager:
     def __init__(self):
@@ -46,31 +47,29 @@ class VectorStoreManager:
         )
         print("Supabase vector store initialized successfully")
     
-    def add_documents(self, documents: List[Document], tenant_id: str) -> bool:
-        """Add documents to the vector store."""
+    async def add_documents(self, documents: List[Document], tenant_id: str) -> bool:
+        """Add documents to the vector store asynchronously."""
         try:
             print(f"Adding {len(documents)} documents to vector store...")
-            # Add UUID to each document's metadata
+            return await asyncio.to_thread(self._add_documents_sync, documents, tenant_id)
+        except Exception as e:
+            print(f"Error adding documents to vector store: {e}")
+            return False
+
+    def _add_documents_sync(self, documents: List[Document], tenant_id: str) -> bool:
+        try:
             for doc in documents:
-                # print(f"Document: {doc}")
                 if doc.metadata is None:
                     doc.metadata = {}
-                
                 if 'id' not in doc.metadata:
                     doc.metadata['id'] = str(uuid.uuid4())
                 if 'type' not in doc.metadata:
                     doc.metadata['type'] = "upload_file"
                 if 'tenant_id' not in doc.metadata:
                     doc.metadata['tenant_id'] = tenant_id
-                # print(f"Document content: {new_doc.page_content[:100]}...")
-                # print(f"Document metadata: {new_doc.metadata}")
-
-            # Get embeddings for documents
             texts = [doc.page_content for doc in documents]
             metadatas = [doc.metadata for doc in documents]
             embeddings = self.embeddings.embed_documents(texts)
-
-            # Insert documents into Supabase
             for i, (text, metadata, embedding) in enumerate(zip(texts, metadatas, embeddings)):
                 try:
                     self.supabase.table("documents").insert({
@@ -83,28 +82,29 @@ class VectorStoreManager:
                 except Exception as e:
                     print(f"Error inserting document {i+1}: {e}")
                     continue
-
-            # print("Documents added successfully")
             return True
         except Exception as e:
             print(f"Error adding documents to vector store: {e}")
             return False
-    
-    def similarity_search(self, query: str, filter: Optional[Dict[str, Any]] = None) -> List[Document]:
-        """Search for similar documents."""
+
+    async def similarity_search(self, query: str, filter: Optional[Dict[str, Any]] = None) -> List[Document]:
+        """Search for similar documents asynchronously."""
         try:
             print(f"Searching for documents similar to query: {query}")
+            return await asyncio.to_thread(self._similarity_search_sync, query, filter)
+        except Exception as e:
+            print(f"Error searching documents: {e}")
+            return []
+
+    def _similarity_search_sync(self, query: str, filter: Optional[Dict[str, Any]] = None) -> List[Document]:
+        try:
             if filter:
                 print(f"Using filter: {filter}")
                 if 'type' not in filter:
                     filter['type'] = "upload_file"
             else:
                 filter = {"type": "upload_file"}
-
-            # Get query embedding
             query_embedding = self.embeddings.embed_query(query)
-
-            # Execute match_documents function
             response = self.supabase.rpc(
                 'match_documents',
                 {
@@ -113,9 +113,6 @@ class VectorStoreManager:
                     'match_count': 5
                 }
             ).execute()
-
-            # print(f"Search response: {response}")
-            
             results = []
             for match in response.data:
                 doc = Document(
@@ -123,7 +120,6 @@ class VectorStoreManager:
                     metadata=match['metadata']
                 )
                 results.append(doc)
-
             print(f"Found {len(results)} similar documents")
             return results
         except Exception as e:

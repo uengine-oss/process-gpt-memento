@@ -6,6 +6,7 @@ import io
 from typing import List, Optional, Dict, Any
 from supabase import create_client, Client
 from document_loader import DocumentProcessor
+import asyncio
 
 from dotenv import load_dotenv
 
@@ -24,7 +25,7 @@ class SupabaseStorageLoader:
         )
         self.document_processor = DocumentProcessor()
         
-    def download_and_process_file(self, file_path: str, metadata: Optional[dict] = None) -> List[dict]:
+    async def download_and_process_file(self, file_path: str, metadata: Optional[dict] = None) -> List[dict]:
         """
         Download and process a file from Supabase Storage
         
@@ -42,15 +43,18 @@ class SupabaseStorageLoader:
             original_filename = metadata.get('original_filename', os.path.basename(file_path)) if metadata else os.path.basename(file_path)
             
             # Download the file
-            response = self.supabase.storage.from_("files").download(file_path)
+            response = await asyncio.to_thread(
+                self.supabase.storage.from_("files").download,
+                file_path
+            )
             
             # Create a BytesIO object from the response
             file_content = io.BytesIO(response)
             
             # Process the file using DocumentProcessor
-            documents = self.document_processor.load_document(file_content, original_filename)
+            documents = await self.document_processor.load_document(file_content, original_filename)
             if documents:
-                documents = self.document_processor.process_documents(documents, metadata or {})
+                documents = await self.document_processor.process_documents(documents, metadata or {})
             
             # Add storage metadata
             for doc in documents:

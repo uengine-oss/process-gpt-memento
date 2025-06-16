@@ -6,6 +6,7 @@ from langchain.chains.retrieval_qa.base import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 from vector_store import VectorStoreManager
+import asyncio
 
 class RAGChain:
     def __init__(self):
@@ -64,11 +65,30 @@ class RAGChain:
             return 'ko'
         return 'en'
 
-    def answer(self, query: str, filter: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Answer a query using the RAG chain."""
+    async def retrieve(self, query: str, filter: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Retrieve documents from the vector store."""
         try:
             print(f"\nProcessing query: {query}")
             
+            docs = await self.vector_store.similarity_search(query, filter=filter)
+            
+            if not docs:
+                return {
+                    "source_documents": []
+                }
+            
+            return {
+                "source_documents": docs
+            }
+        except Exception as e:
+            print(f"Error in retrieve: {e}")
+            return {
+                "source_documents": []
+            }
+        
+    async def answer(self, query: str, filter: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Answer a query using the RAG chain."""
+        try:
             # Detect language
             lang = self.detect_language(query)
             print(f"Detected language: {lang}")
@@ -80,16 +100,6 @@ class RAGChain:
                 input_variables=["context", "question"]
             )
 
-            # First try direct similarity search
-            docs = self.vector_store.similarity_search(query, filter=filter)
-            
-            if not docs:
-                return {
-                    "answer": "I don't have enough information to answer that question." if lang == 'en' else "질문에 답변하기에 충분한 정보가 없습니다.",
-                    "source_documents": []
-                }
-
-            # Create chain with language-specific prompt
             chain = RetrievalQA.from_chain_type(
                 llm=self.llm,
                 chain_type="stuff",
@@ -100,11 +110,12 @@ class RAGChain:
                 }
             )
 
-            # Run the chain
             print("Running RetrievalQA chain...")
-            result = chain.invoke({"query": query})
+            result = await asyncio.to_thread(
+                chain,
+                {"query": query}
+            )
             
-            # Extract answer and sources
             answer = result.get("result", "I don't have enough information to answer that question." if lang == 'en' else "질문에 답변하기에 충분한 정보가 없습니다.")
             source_documents = result.get("source_documents", [])
             
@@ -122,30 +133,32 @@ class RAGChain:
                 "sources": []
             }
     
-    def process_and_store_documents(self, documents: list[Document], tenant_id: str) -> bool:
+    async def process_and_store_documents(self, documents: list[Document], tenant_id: str) -> bool:
         """Process and store documents in the vector store."""
         try:
             print(f"\nProcessing {len(documents)} documents...")
-            return self.vector_store.add_documents(documents, tenant_id)
+            return await self.vector_store.add_documents(documents, tenant_id)
         except Exception as e:
             print(f"Error in process_and_store_documents: {e}")
             return False
 
-    def get_processed_files(self, tenant_id: str) -> List[str]:
+    async def get_processed_files(self, tenant_id: str) -> List[str]:
         """Get list of already processed files for a tenant"""
         try:
             print(f"Getting processed files for tenant: {tenant_id}")
-            result = self.supabase.table('processed_files') \
-                .select('file_id') \
-                .eq('tenant_id', tenant_id) \
-                .execute()
+            result = await asyncio.to_thread(
+                self.supabase.table('processed_files')
+                .select('file_id')
+                .eq('tenant_id', tenant_id)
+                .execute
+            )
             
             return [row['file_id'] for row in result.data]
         except Exception as e:
             print(f"Error getting processed files: {e}")
             return []
 
-    def save_processed_files(self, file_ids: List[str], tenant_id: str, file_names: List[str] = None) -> bool:
+    async def save_processed_files(self, file_ids: List[str], tenant_id: str, file_names: List[str] = None) -> bool:
         """Save list of processed files"""
         try:
             # Prepare data for batch insert
@@ -158,26 +171,67 @@ class RAGChain:
                 })
             
             # Batch insert
-            self.supabase.table('processed_files') \
-                .insert(data) \
-                .execute()
+            await asyncio.to_thread(
+                self.supabase.table('processed_files')
+                .insert(data)
+                .execute
+            )
             
             return True
         except Exception as e:
             print(f"Error saving processed files: {e}")
             return False
 
-    def delete_processed_file(self, file_id: str, tenant_id: str) -> bool:
+    async def delete_processed_file(self, file_id: str, tenant_id: str) -> bool:
         """Delete a processed file record"""
         try:
-            self.supabase.table('processed_files') \
-                .delete() \
-                .eq('file_id', file_id) \
-                .eq('tenant_id', tenant_id) \
-                .execute()
+            await asyncio.to_thread(
+                self.supabase.table('processed_files')
+                .delete()
+                .eq('file_id', file_id)
+                .eq('tenant_id', tenant_id)
+                .execute
+            )
             return True
         except Exception as e:
             print(f"Error deleting processed file: {e}")
+            return False
+
+    async def process_database_records(self, records: List[Dict[str, Any]], tenant_id: str, options: Optional[Dict[str, Any]] = None) -> bool:
+        """Process database records and store them in the vector store."""
+        try:
+            print(f"\nProcessing {len(records)} database records...")
+            
+            documents = []
+            for record in records:
+                if 'output' not in record:
+                    print(f"Warning: Record {record.get('id', 'unknown')} has no 'output' column")
+                    continue
+                    
+                output_json = record['output']
+                # Convert dictionary to formatted string
+                output_text = "\n".join([f"{key}: {value}" for key, value in output_json.items()])
+                
+                metadata = {
+                    "tenant_id": tenant_id,
+                    "source_type": "database",
+                    "created_at": record.get('created_at', ''),
+                    "updated_at": record.get('updated_at', ''),
+                    **options
+                }
+                
+                # Create Document object
+                doc = Document(
+                    page_content=output_text,
+                    metadata=metadata
+                )
+                documents.append(doc)
+            
+            # Store documents in vector store
+            return await self.vector_store.add_documents(documents, tenant_id)
+            
+        except Exception as e:
+            print(f"Error in process_database_records: {e}")
             return False
 
 # Example usage
