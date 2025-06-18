@@ -299,6 +299,15 @@ async def save_to_drive(
         file_content = io.BytesIO(content)
         
         drive_service = await get_google_drive_service(current_user)
+        
+        # Check if we got an auth URL instead of a service
+        if isinstance(drive_service, dict) and "auth_url" in drive_service:
+            raise HTTPException(
+                status_code=401, 
+                detail="Google Drive authentication required. Please complete OAuth flow first.",
+                headers={"X-Auth-URL": drive_service["auth_url"]}
+            )
+        
         drive_loader = GoogleDriveLoader(drive_service)
         result = await drive_loader.save_to_google_drive(file_content, file_name)
         return result
