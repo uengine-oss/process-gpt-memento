@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2AuthorizationCodeBearer
 from pydantic import BaseModel
@@ -12,7 +12,7 @@ from document_loader import DocumentProcessor
 from google_drive_loader import GoogleDriveLoader
 from supabase_storage_loader import SupabaseStorageLoader
 from rag_chain import RAGChain
-from auth import get_current_user, get_google_drive_service, handle_oauth_callback
+from auth import get_current_user
 
 app = FastAPI(title="Memento Service API", description="API for document processing and querying")
 
@@ -118,8 +118,8 @@ async def process_documents(request: ProcessRequest, current_user: Dict[str, Any
 async def process_google_drive(request: ProcessRequest, current_user: Dict[str, Any]):
     """Process documents from Google Drive folder"""
     try:
-        drive_service = await get_google_drive_service(current_user)
-        drive_loader = GoogleDriveLoader(drive_service)
+        # Use database-based authentication
+        drive_loader = GoogleDriveLoader(tenant_id=current_user.app_metadata['tenant_id'])
         
         supported_mime_types = [
             'application/vnd.google-apps.document',
@@ -136,7 +136,7 @@ async def process_google_drive(request: ProcessRequest, current_user: Dict[str, 
         files = await drive_loader.list_files(supported_mime_types)
         
         if not files:
-            return {"message": f"No documents found in Google Drive folder for user {current_user['email']}"}
+            return {"message": f"No documents found in Google Drive folder for user {current_user.email}"}
             
         rag = RAGChain()
         
@@ -147,7 +147,7 @@ async def process_google_drive(request: ProcessRequest, current_user: Dict[str, 
         new_files = [f for f in files if f['id'] not in processed_files]
         
         if not new_files:
-            return {"message": f"No new documents to process for user {current_user['email']}"}
+            return {"message": f"No new documents to process for user {current_user.email}"}
             
         # Process only new files
         all_documents = []
@@ -178,7 +178,7 @@ async def process_google_drive(request: ProcessRequest, current_user: Dict[str, 
             else:
                 raise HTTPException(status_code=500, detail="Failed to process and store documents")
         else:
-            return {"message": f"No new content to process for user {current_user['email']}"}
+            return {"message": f"No new content to process for user {current_user.email}"}
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -298,32 +298,12 @@ async def save_to_drive(
         # Create a BytesIO object from the content
         file_content = io.BytesIO(content)
         
-        drive_service = await get_google_drive_service(current_user)
-        
-        # Check if we got an auth URL instead of a service
-        if isinstance(drive_service, dict) and "auth_url" in drive_service:
-            raise HTTPException(
-                status_code=401, 
-                detail="Google Drive authentication required. Please complete OAuth flow first.",
-                headers={"X-Auth-URL": drive_service["auth_url"]}
-            )
-        
-        drive_loader = GoogleDriveLoader(drive_service)
+        # Use database-based authentication
+        drive_loader = GoogleDriveLoader(tenant_id=current_user.app_metadata['tenant_id'])
+            
         result = await drive_loader.save_to_google_drive(file_content, file_name)
         return result
             
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/oauth/google")
-async def oauth_google(
-    code: str,
-    current_user: Dict[str, Any] = Depends(get_current_user)
-):
-    """Handle OAuth callback and get Google Drive service"""
-    try:
-        drive_service = await handle_oauth_callback(code, current_user)
-        return {"message": "Successfully authenticated with Google Drive"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
