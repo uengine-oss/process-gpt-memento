@@ -14,6 +14,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import json
 from langchain.schema import Document
+from datetime import datetime
 
 from document_loader import DocumentProcessor
 
@@ -27,7 +28,7 @@ SCOPES = [
 class GoogleDriveLoader:
     """Handles loading and processing of documents from Google Drive"""
     
-    def __init__(self, drive_service=None, token_path: str = 'token.json', tenant_id: Optional[str] = None):
+    def __init__(self, drive_service=None, token_path: str = 'token.json', tenant_id: Optional[str] = None, user_email: Optional[str] = None):
         """
         Initialize the Google Drive loader
         
@@ -35,12 +36,14 @@ class GoogleDriveLoader:
             drive_service: Optional authenticated Google Drive service instance
             token_path: Path to save/load the token.json file (used when drive_service is None)
             tenant_id: Tenant ID to get OAuth settings from database
+            user_email: User email to get user-specific tokens from database
         """
         self.token_path = token_path
         self.credentials = None
         self.service = drive_service
         self.document_loader = DocumentProcessor()
         self.tenant_id = tenant_id
+        self.user_email = user_email
         
         # Initialize Supabase client if tenant_id is provided
         if tenant_id:
@@ -57,10 +60,25 @@ class GoogleDriveLoader:
             raise ValueError("tenant_id is required to get OAuth settings from database")
             
         try:
+            # First try to get user-specific tokens if user_email is provided
+            if self.user_email:
+                response = self.supabase.table("tenant_oauth") \
+                    .select("*") \
+                    .eq("tenant_id", self.tenant_id) \
+                    .eq("provider", "google") \
+                    .eq("user_email", self.user_email) \
+                    .single() \
+                    .execute()
+                
+                if response.data:
+                    return response.data
+            
+            # Fallback to tenant-level settings (no user_email)
             response = self.supabase.table("tenant_oauth") \
                 .select("*") \
                 .eq("tenant_id", self.tenant_id) \
                 .eq("provider", "google") \
+                .is_("user_email", "null") \
                 .single() \
                 .execute()
             
@@ -92,7 +110,7 @@ class GoogleDriveLoader:
             return None
         
     async def authenticate(self) -> None:
-        """Authenticate with Google Drive API using database settings"""
+        """Authenticate with Google Drive API using user-specific tokens"""
         if self.service:
             return  # Already authenticated
             
@@ -100,35 +118,114 @@ class GoogleDriveLoader:
             raise ValueError("tenant_id is required for database-based authentication")
             
         try:
-            # Get OAuth settings from database
-            oauth_settings = await self.get_tenant_oauth_settings()
+            # First, try to use user-specific tokens if user_email is provided
+            if self.user_email and self.supabase:
+                try:
+                    # Get user's Google credentials from users table
+                    response = self.supabase.table("users") \
+                        .select("google_credentials") \
+                        .eq("email", self.user_email) \
+                        .eq("tenant_id", self.tenant_id) \
+                        .single() \
+                        .execute()
+                    
+                    if response.data and response.data.get('google_credentials'):
+                        token_data = json.loads(response.data['google_credentials'])
+                        
+                        # Check if token is expired
+                        from datetime import datetime, timezone
+                        if token_data.get('expiry'):
+                            expiry = datetime.fromisoformat(token_data['expiry'])
+                            if datetime.now(timezone.utc) > expiry:
+                                # Token expired, try to refresh
+                                if token_data.get('refresh_token'):
+                                    from google.oauth2.credentials import Credentials
+                                    from google.auth.transport.requests import Request
+                                    
+                                    # Get client settings for refresh
+                                    client_response = self.supabase.table("tenant_oauth") \
+                                        .select("client_id, client_secret") \
+                                        .eq("tenant_id", self.tenant_id) \
+                                        .eq("provider", "google") \
+                                        .single() \
+                                        .execute()
+                                    
+                                    if client_response.data:
+                                        creds = Credentials(
+                                            token=token_data['access_token'],
+                                            refresh_token=token_data['refresh_token'],
+                                            token_uri="https://oauth2.googleapis.com/token",
+                                            client_id=client_response.data['client_id'],
+                                            client_secret=client_response.data['client_secret'],
+                                            scopes=token_data.get('scopes', SCOPES)
+                                        )
+                                        
+                                        if creds.expired and creds.refresh_token:
+                                            creds.refresh(Request())
+                                            
+                                            # Update token in database
+                                            updated_token_data = {
+                                                "access_token": creds.token,
+                                                "refresh_token": token_data.get('refresh_token'),
+                                                "token_type": token_data.get('token_type', 'Bearer'),
+                                                "expires_in": token_data.get('expires_in'),
+                                                "scopes": token_data.get('scopes', SCOPES)
+                                            }
+                                            
+                                            if creds.expiry:
+                                                updated_token_data["expiry"] = creds.expiry.isoformat()
+                                            
+                                            self.supabase.table("users") \
+                                                .update({
+                                                    "google_credentials": json.dumps(updated_token_data),
+                                                    "google_credentials_updated_at": datetime.now(timezone.utc).isoformat()
+                                                }) \
+                                                .eq("email", self.user_email) \
+                                                .eq("tenant_id", self.tenant_id) \
+                                                .execute()
+                                        
+                                        self.credentials = creds
+                                        self.service = build('drive', 'v3', credentials=self.credentials)
+                                        print(f"Successfully authenticated using user token for {self.user_email}")
+                                        return
+                                    else:
+                                        print(f"Client settings not found for tenant {self.tenant_id}")
+                                else:
+                                    print(f"Token expired and no refresh token available for {self.user_email}")
+                            else:
+                                # Token is still valid
+                                from google.oauth2.credentials import Credentials
+                                
+                                self.credentials = Credentials(
+                                    token=token_data['access_token'],
+                                    refresh_token=token_data.get('refresh_token'),
+                                    token_uri="https://oauth2.googleapis.com/token",
+                                    scopes=token_data.get('scopes', SCOPES)
+                                )
+                                
+                                self.service = build('drive', 'v3', credentials=self.credentials)
+                                print(f"Successfully authenticated using user token for {self.user_email}")
+                                return
+                        else:
+                            # No expiry info, assume token is valid
+                            from google.oauth2.credentials import Credentials
+                            
+                            self.credentials = Credentials(
+                                token=token_data['access_token'],
+                                refresh_token=token_data.get('refresh_token'),
+                                token_uri="https://oauth2.googleapis.com/token",
+                                scopes=token_data.get('scopes', SCOPES)
+                            )
+                            
+                            self.service = build('drive', 'v3', credentials=self.credentials)
+                            print(f"Successfully authenticated using user token for {self.user_email}")
+                            return
+                                
+                except Exception as e:
+                    print(f"User token authentication failed: {e}, falling back to other methods")
             
-            # Check if we have stored credentials
-            if os.path.exists(self.token_path):
-                self.credentials = Credentials.from_authorized_user_file(self.token_path, SCOPES)
-                
-            if not self.credentials or not self.credentials.valid:
-                if self.credentials and self.credentials.expired and self.credentials.refresh_token:
-                    self.credentials.refresh(Request())
-                else:
-                    # Create client config from database settings
-                    client_config = {
-                        "web": {
-                            "client_id": oauth_settings["client_id"],
-                            "client_secret": oauth_settings["client_secret"],
-                            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                            "token_uri": "https://oauth2.googleapis.com/token",
-                            "redirect_uri": oauth_settings.get("redirect_uri", "http://localhost:8080")
-                        }
-                    }
-                    
-                    flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-                    self.credentials = flow.run_local_server(port=0)
-                    
-                with open(self.token_path, 'w') as token:
-                    token.write(self.credentials.to_json())
-                    
-            self.service = build('drive', 'v3', credentials=self.credentials)
+            # Fallback: raise error if no user token available
+            raise ValueError(f"No valid Google credentials found for user {self.user_email}. Please authenticate with Google first.")
             
         except Exception as e:
             raise ValueError(f"Authentication failed: {str(e)}")
@@ -317,6 +414,13 @@ class GoogleDriveLoader:
                 'download_link': file['webContentLink']
             }
             
+        except ValueError as e:
+            # Re-raise authentication errors
+            if "No valid Google credentials found" in str(e) or "Authentication failed" in str(e):
+                raise e
+            else:
+                print(f"Error in save_to_google_drive: {e}")
+                raise
         except Exception as e:
             print(f"Error in save_to_google_drive: {e}")
             raise
