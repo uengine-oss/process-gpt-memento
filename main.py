@@ -67,6 +67,7 @@ class GoogleOAuthCallbackRequest(BaseModel):
     code: str
     state: str  # This should be the tenant_id
     scope: Optional[str] = None
+    user_email: Optional[str] = None  # The email to associate with Google credentials
 
 @app.get("/auth/google/url")
 async def get_google_auth_url(tenant_id: str):
@@ -458,11 +459,12 @@ async def save_google_token(request: GoogleTokenRequest):
     """Save Google OAuth token to user's google_credentials column"""
     try:
         # Check if user exists first
-        user_check = supabase.table("users").select("id, email").eq("email", request.user_email).eq("tenant_id", request.tenant_id).single().execute()
+        user_check = supabase.table("users").select("id, email, tenant_id").eq("email", request.user_email).eq("tenant_id", request.tenant_id).single().execute()
         
-        if not user_check.data:
+        user_info = user_check.data
+        if not user_info:
             raise HTTPException(status_code=404, detail=f"User {request.user_email} not found in tenant {request.tenant_id}")
-        
+
         # Prepare token data as JSON
         token_data = {
             "access_token": request.access_token,
@@ -483,9 +485,12 @@ async def save_google_token(request: GoogleTokenRequest):
         
         # Update user's google_credentials
         response = supabase.table("users").upsert({
+            "id": user_info['id'],
+            "email": user_info['email'],
+            "tenant_id": user_info['tenant_id'],
             "google_credentials": json.dumps(token_data),
             "google_credentials_updated_at": datetime.now(timezone.utc).isoformat()
-        }).eq("email", request.user_email).eq("tenant_id", request.tenant_id).execute()
+        }).execute()
         
         if not response.data:
             raise HTTPException(status_code=500, detail="Failed to update user credentials")
@@ -551,48 +556,12 @@ async def google_oauth_callback(request: GoogleOAuthCallbackRequest):
                     detail=f"Token response missing access_token: {token_info}"
                 )
         
-        # Get user info from Google to get email
-        user_info_url = "https://www.googleapis.com/oauth2/v2/userinfo"
-        headers = {'Authorization': f"Bearer {token_info['access_token']}"}
-        
-        async with httpx.AsyncClient() as client:
-            user_response = await client.get(user_info_url, headers=headers)
-
-            if user_response.status_code != 200:
-                # Try alternative approach - use ID token if available
-                if 'id_token' in token_info:
-                    try:
-                        import jwt
-                        # Decode ID token (without verification for now)
-                        id_token_data = jwt.decode(token_info['id_token'], options={"verify_signature": False})
-                        user_info = {
-                            'email': id_token_data.get('email'),
-                            'name': id_token_data.get('name'),
-                            'picture': id_token_data.get('picture')
-                        }
-                    except Exception as jwt_error:
-                        raise HTTPException(
-                            status_code=400, 
-                            detail=f"Failed to get user info: {user_response.text}"
-                        )
-                else:
-                    raise HTTPException(
-                        status_code=400, 
-                        detail=f"Failed to get user info: {user_response.text}"
-                    )
-            else:
-                user_info = user_response.json()
-        
-        if not user_info.get('email'):
-            raise HTTPException(
-                status_code=400,
-                detail="User email not found in user info"
-            )
+        user_email = request.user_email
         
         # Save token using existing endpoint
         token_request = GoogleTokenRequest(
             tenant_id=tenant_id,
-            user_email=user_info['email'],
+            user_email=user_email,
             access_token=token_info['access_token'],
             refresh_token=token_info.get('refresh_token'),
             expires_in=token_info.get('expires_in'),
@@ -605,8 +574,9 @@ async def google_oauth_callback(request: GoogleOAuthCallbackRequest):
         
         return {
             "message": "Google OAuth completed successfully",
-            "user_email": user_info['email'],
-            "tenant_id": tenant_id
+            "user_email": user_email,
+            "tenant_id": tenant_id,
+            "token_saved": True
         }
         
     except Exception as e:
