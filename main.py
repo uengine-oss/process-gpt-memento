@@ -385,14 +385,14 @@ async def process_database_records(request: ProcessRequest):
 @app.get("/query")
 async def answer_query(
     query: str,
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    tenant_id: str
 ):
     """Answer a query using the RAG system"""
     try:
         rag = RAGChain()
         
         metadata_filter = {
-            "tenant_id": current_user.app_metadata['tenant_id']
+            "tenant_id": tenant_id
         }
 
         result = await rag.answer(query, metadata_filter)
