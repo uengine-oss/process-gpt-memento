@@ -21,7 +21,7 @@ class RAGChain:
         # Initialize ChatOpenAI with debugging
         print("Initializing ChatOpenAI...")
         self.llm = ChatOpenAI(
-            model_name="gpt-3.5-turbo",
+            model_name="gpt-4o",  # Vision API를 지원하는 모델로 변경
             temperature=0,
             api_key=openai_api_key
         )
@@ -134,10 +134,34 @@ class RAGChain:
             }
     
     async def process_and_store_documents(self, documents: list[Document], tenant_id: str) -> bool:
-        """Process and store documents in the vector store."""
+        """Process and store documents in the vector store with integrated image analysis."""
         try:
             print(f"\nProcessing {len(documents)} documents...")
+            
+            # 이미지 분석을 먼저 수행
+            for doc in documents:
+                if 'extracted_images' in doc.metadata and doc.metadata['extracted_images']:
+                    print(f"Analyzing {len(doc.metadata['extracted_images'])} images in document")
+                    
+                    # 이미지 분석 수행
+                    analyzed_images = await self.analyze_images_with_llm(doc.metadata['extracted_images'])
+                    
+                    # 분석 결과를 문서 메타데이터에 추가
+                    doc.metadata['image_analysis'] = analyzed_images
+                    
+                    # 이미지 설명을 문서 내용에 추가 (검색 가능하도록)
+                    image_descriptions = []
+                    for img_analysis in analyzed_images:
+                        if img_analysis.get('analysis'):
+                            image_descriptions.append(f"이미지 {img_analysis['image_id']}: {img_analysis['analysis']}")
+                    
+                    if image_descriptions:
+                        doc.page_content += "\n\n[이미지 내용]\n" + "\n".join(image_descriptions)
+                        print(f"Added {len(image_descriptions)} image descriptions to document content")
+            
+            # 벡터 저장소에 저장 (이미지 분석 완료된 상태)
             return await self.vector_store.add_documents(documents, tenant_id)
+            
         except Exception as e:
             print(f"Error in process_and_store_documents: {e}")
             return False
@@ -233,6 +257,55 @@ class RAGChain:
         except Exception as e:
             print(f"Error in process_database_records: {e}")
             return False
+
+    async def analyze_images_with_llm(self, images_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """추출된 이미지를 LLM으로 분석 - 원본 데이터 직접 사용"""
+        analyzed_images = []
+        
+        for image_info in images_data:
+            try:
+                # base64로 인코딩된 원본 이미지 데이터를 직접 사용
+                image_data_base64 = image_info.get('image_data_base64')
+                if not image_data_base64:
+                    print(f"Skipping image {image_info.get('image_id')}: No base64 data found")
+                    continue
+                
+                # 이미지 형식 감지0
+                image_format = image_info.get('metadata', {}).get('format', 'png')
+                mime_type = f"image/{image_format.lower()}"
+                
+                # OpenAI Vision API에 직접 전달
+                response = await self.llm.ainvoke([
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "이 이미지를 자세히 분석하고 설명해주세요. 문서의 일부라면 텍스트 내용, 차트, 그래프, 이미지 등을 포함하여 설명해주세요."
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{image_data_base64}"
+                                }
+                            }
+                        ]
+                    }
+                ])
+                
+                analyzed_images.append({
+                    'image_id': image_info['image_id'],
+                    'analysis': response.content,
+                    'metadata': image_info['metadata']
+                })
+                
+                print(f"Successfully analyzed image {image_info.get('image_id')}")
+                
+            except Exception as e:
+                print(f"Error analyzing image {image_info.get('image_id')}: {e}")
+                continue
+        
+        return analyzed_images
 
 # Example usage
 if __name__ == "__main__":

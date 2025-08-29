@@ -25,7 +25,7 @@ class SupabaseStorageLoader:
         )
         self.document_processor = DocumentProcessor()
         
-    async def download_and_process_file(self, file_path: str, metadata: Optional[dict] = None) -> List[dict]:
+    async def download_and_process_file(self, file_path: str, metadata: Optional[dict] = None, tenant_id: Optional[str] = None) -> List[dict]:
         """
         Download and process a file from Supabase Storage
         

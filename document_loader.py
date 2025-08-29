@@ -39,14 +39,35 @@ class DocumentProcessor:
                 content = content.decode('utf-8-sig')
                 documents = [Document(page_content=content)]
             elif file_extension == '.docx':
-                loader = UnstructuredWordDocumentLoader(file_content, mode="single")
-                documents = await asyncio.to_thread(loader.load)
+                # Save BytesIO to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp:
+                    await asyncio.to_thread(tmp.write, file_content.read())
+                    tmp_path = tmp.name
+                try:
+                    loader = UnstructuredWordDocumentLoader(tmp_path, mode="single")
+                    documents = await asyncio.to_thread(loader.load)
+                finally:
+                    await asyncio.to_thread(os.unlink, tmp_path)
             elif file_extension == '.pptx':
-                loader = UnstructuredPowerPointLoader(file_content, mode="single")
-                documents = await asyncio.to_thread(loader.load)
+                # Save BytesIO to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as tmp:
+                    await asyncio.to_thread(tmp.write, file_content.read())
+                    tmp_path = tmp.name
+                try:
+                    loader = UnstructuredPowerPointLoader(tmp_path, mode="single")
+                    documents = await asyncio.to_thread(loader.load)
+                finally:
+                    await asyncio.to_thread(os.unlink, tmp_path)
             elif file_extension == '.xlsx':
-                loader = UnstructuredExcelLoader(file_content, mode="single")
-                documents = await asyncio.to_thread(loader.load)
+                # Save BytesIO to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
+                    await asyncio.to_thread(tmp.write, file_content.read())
+                    tmp_path = tmp.name
+                try:
+                    loader = UnstructuredExcelLoader(tmp_path, mode="single")
+                    documents = await asyncio.to_thread(loader.load)
+                finally:
+                    await asyncio.to_thread(os.unlink, tmp_path)
             elif file_extension == '.pdf':
                 # Save BytesIO to temporary file
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:

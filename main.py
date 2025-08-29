@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Req
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2AuthorizationCodeBearer
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import os
 import io
 import asyncio
@@ -17,7 +17,6 @@ from document_loader import DocumentProcessor
 from google_drive_loader import GoogleDriveLoader
 from supabase_storage_loader import SupabaseStorageLoader
 from rag_chain import RAGChain
-from auth import get_current_user
 
 app = FastAPI(title="Memento Service API", description="API for document processing and querying")
 
@@ -41,6 +40,7 @@ supabase: Client = create_client(
 
 class ProcessRequest(BaseModel):
     storage_type: str = "drive"
+    tenant_id: str
     input_dir: Optional[str] = None
     folder_path: Optional[str] = None
     file_path: Optional[str] = None
@@ -49,6 +49,7 @@ class ProcessRequest(BaseModel):
 
 class RetrieveRequest(BaseModel):
     query: str
+    tenant_id: str
     options: Optional[dict] = None
 
 class GoogleOAuthRequest(BaseModel):
@@ -56,7 +57,6 @@ class GoogleOAuthRequest(BaseModel):
 
 class GoogleTokenRequest(BaseModel):
     tenant_id: str
-    user_email: str
     access_token: str
     refresh_token: Optional[str] = None
     expires_in: Optional[int] = None
@@ -67,7 +67,6 @@ class GoogleOAuthCallbackRequest(BaseModel):
     code: str
     state: str  # This should be the tenant_id
     scope: Optional[str] = None
-    user_email: Optional[str] = None  # The email to associate with Google credentials
 
 @app.get("/auth/google/url")
 async def get_google_auth_url(tenant_id: str):
@@ -77,9 +76,9 @@ async def get_google_auth_url(tenant_id: str):
         response = supabase.table("tenant_oauth") \
             .select("*") \
             .eq("tenant_id", tenant_id) \
-            .eq("provider", "google") \
             .single() \
             .execute()
+
         
         if not response.data:
             raise HTTPException(status_code=404, detail="OAuth settings not found for tenant")
@@ -100,7 +99,7 @@ async def get_google_auth_url(tenant_id: str):
             'response_type': 'code',
             'access_type': 'offline',
             'prompt': 'consent',
-            'state': tenant_id  # Use tenant_id as state
+            'state': tenant_id
         }
         
         auth_url = f"https://accounts.google.com/o/oauth2/auth?{urlencode(params)}"
@@ -114,15 +113,11 @@ async def get_google_auth_url(tenant_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/auth/google/status")
-async def get_google_auth_status(
-    tenant_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user)
-):
-    """Check if user has valid Google OAuth tokens"""
+async def get_google_auth_status(tenant_id: str):
+    """Check if tenant has valid Google OAuth tokens"""
     try:
-        response = supabase.table("users") \
+        response = supabase.table("tenant_oauth") \
             .select("google_credentials, google_credentials_updated_at") \
-            .eq("email", current_user.email) \
             .eq("tenant_id", tenant_id) \
             .single() \
             .execute()
@@ -141,7 +136,7 @@ async def get_google_auth_status(
         
         return {
             "authenticated": True,
-            "user_email": current_user.email,
+            "tenant_id": tenant_id,
             "expires_at": token_data.get('expiry'),
             "updated_at": response.data.get('google_credentials_updated_at')
         }
@@ -150,9 +145,7 @@ async def get_google_auth_status(
         return {"authenticated": False, "message": str(e)}
 
 @app.post("/retrieve")
-async def retrieve(
-    request: RetrieveRequest, 
-):
+async def retrieve(request: RetrieveRequest):
     try:
         query_text = request.query
 
@@ -162,7 +155,7 @@ async def retrieve(
         rag = RAGChain()
         
         metadata_filter = {
-            "tenant_id": request.options.get('tenant_id')
+            "tenant_id": request.tenant_id
         }
 
         result = await rag.retrieve(query_text, metadata_filter)
@@ -179,24 +172,20 @@ async def retrieve(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/process")
-async def process(
-    request: ProcessRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user)
-):
+async def process(request: ProcessRequest):
     if request.storage_type == "local":
-        return await process_documents(request, current_user)
+        return await process_documents(request)
     elif request.storage_type == "drive":
-        return await process_google_drive(request, current_user)
+        return await process_google_drive(request)
     elif request.storage_type == "storage":
-        return await process_supabase_storage(request, current_user)
+        return await process_supabase_storage(request)
 
 @app.post("/process/database")
 async def process_database(request: ProcessRequest):
     return await process_database_records(request)
 
-async def process_documents(request: ProcessRequest, current_user: Dict[str, Any]):
+async def process_documents(request: ProcessRequest):
     """Process documents from the input directory"""
     if not os.path.exists(request.input_dir):
         raise HTTPException(status_code=404, detail=f"Directory {request.input_dir} does not exist")
@@ -213,7 +202,7 @@ async def process_documents(request: ProcessRequest, current_user: Dict[str, Any
             return {"message": "No documents found to process"}
 
         rag = RAGChain()
-        success = await rag.process_and_store_documents(documents, current_user.app_metadata['tenant_id'])
+        success = await rag.process_and_store_documents(documents, request.tenant_id)
         
         if success:
             return {"message": "Successfully processed and stored documents"}
@@ -223,14 +212,11 @@ async def process_documents(request: ProcessRequest, current_user: Dict[str, Any
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-async def process_google_drive(request: ProcessRequest, current_user: Dict[str, Any]):
+async def process_google_drive(request: ProcessRequest):
     """Process documents from Google Drive folder"""
     try:
-        # Use user-specific authentication
-        drive_loader = GoogleDriveLoader(
-            tenant_id=current_user.app_metadata['tenant_id'],
-            user_email=current_user.email
-        )
+        # Use tenant-level authentication
+        drive_loader = GoogleDriveLoader(tenant_id=request.tenant_id)
         
         supported_mime_types = [
             'application/vnd.google-apps.document',
@@ -243,77 +229,121 @@ async def process_google_drive(request: ProcessRequest, current_user: Dict[str, 
             'text/plain'
         ]
 
-        try:
-            # Get list of files from Google Drive
-            files = await drive_loader.list_files(supported_mime_types)
-        except ValueError as e:
-            # Authentication error - return login URL
-            if "No valid Google credentials found" in str(e) or "Authentication failed" in str(e):
-                auth_response = create_auth_error_response(
-                    current_user.app_metadata['tenant_id'],
-                    current_user.email,
-                    "Google Drive authentication required to process documents"
-                )
-                return JSONResponse(
-                    status_code=401,
-                    content=auth_response
-                )
-            else:
-                raise e
-        
-        if not files:
-            return {"message": f"No documents found in Google Drive folder for user {current_user.email}"}
-            
-        rag = RAGChain()
-        
-        # Get list of already processed files for this user
-        processed_files = await rag.get_processed_files(current_user.app_metadata['tenant_id'])
-        
-        # Filter out already processed files
-        new_files = [f for f in files if f['id'] not in processed_files]
-        
-        if not new_files:
-            return {"message": f"No new documents to process for user {current_user.email}"}
-            
-        # Process only new files
-        all_documents = []
-        for file in new_files:
+        # Check if specific file_path is provided
+        if hasattr(request, 'file_path') and request.file_path:
+            # Process only the specified file
             try:
-                documents = await drive_loader.download_and_process_file(file['id'], file['name'])
-                if documents:
-                    # Update metadata for each document
-                    for doc in documents:
-                        doc.metadata.update({
-                            'file_id': file['id'],
-                            'file_name': file['name'],
-                            'tenant_id': current_user.app_metadata['tenant_id'],
-                            'user_id': current_user.id,
-                            'storage_type': 'drive'
-                        })
-                    all_documents.extend(documents)
+                # Assuming file_path contains the file ID
+                file_id = request.file_path
+                # Get file info (you might need to implement this method)
+                file_info = await drive_loader.get_file_info(file_id)
+                if not file_info:
+                    raise HTTPException(status_code=404, detail=f"File with ID {file_id} not found")
+                
+                # Check if file is already processed
+                rag = RAGChain()
+                processed_files = await rag.get_processed_files(request.tenant_id)
+                
+                if file_id in processed_files:
+                    return {"message": f"File {file_id} has already been processed for tenant {request.tenant_id}"}
+                
+                # Process the specific file
+                documents = await drive_loader.download_and_process_file(file_id, file_info['name'], request.tenant_id)
+                if not documents:
+                    return {"message": f"No content extracted from file {file_id}"}
+                
+                # Update metadata for each document
+                for doc in documents:
+                    doc.metadata.update({
+                        'file_id': file_id,
+                        'file_name': file_info['name'],
+                        'tenant_id': request.tenant_id,
+                        'storage_type': 'drive'
+                    })
+                
+                # Process and store the document
+                success = await rag.process_and_store_documents(documents, request.tenant_id)
+                if success:
+                    # Save the processed file
+                    await rag.save_processed_files([file_id], request.tenant_id, [file_info['name']])
+                    return {"message": f"Successfully processed file {file_id}"}
+                else:
+                    raise HTTPException(status_code=500, detail="Failed to process and store document")
+                    
             except Exception as e:
-                # Skip files that can't be processed
-                continue
+                raise HTTPException(status_code=500, detail=f"Error processing file {file_id}: {str(e)}")
         
-        if all_documents:
-            success = await rag.process_and_store_documents(all_documents, current_user.app_metadata['tenant_id'])
-            if success:
-                # Save the list of processed files
-                await rag.save_processed_files(
-                    [f['id'] for f in new_files],
-                    current_user.app_metadata['tenant_id'],
-                    [f['name'] for f in new_files]
-                )
-                return {"message": f"Successfully processed {len(new_files)} new documents"}
-            else:
-                raise HTTPException(status_code=500, detail="Failed to process and store documents")
         else:
-            return {"message": f"No new content to process for user {current_user.email}"}
+            # Original logic: process all new files
+            try:
+                # Get list of files from Google Drive
+                files = await drive_loader.list_files(supported_mime_types)
+            except ValueError as e:
+                # Authentication error - return login URL
+                if "No valid Google credentials found" in str(e) or "Authentication failed" in str(e):
+                    auth_response = create_auth_error_response(
+                        request.tenant_id,
+                        "Google Drive authentication required to process documents"
+                    )
+                    return JSONResponse(
+                        status_code=401,
+                        content=auth_response
+                    )
+                else:
+                    raise e
             
+            if not files:
+                return {"message": f"No documents found in Google Drive folder for tenant {request.tenant_id}"}
+                
+            rag = RAGChain()
+            
+            # Get list of already processed files for this tenant
+            processed_files = await rag.get_processed_files(request.tenant_id)
+            
+            # Filter out already processed files
+            new_files = [f for f in files if f['id'] not in processed_files]
+            
+            if not new_files:
+                return {"message": f"No new documents to process for tenant {request.tenant_id}"}
+                
+            # Process only new files
+            all_documents = []
+            for file in new_files:
+                try:
+                    documents = await drive_loader.download_and_process_file(file['id'], file['name'], request.tenant_id)
+                    if documents:
+                        # Update metadata for each document
+                        for doc in documents:
+                            doc.metadata.update({
+                                'file_id': file['id'],
+                                'file_name': file['name'],
+                                'tenant_id': request.tenant_id,
+                                'storage_type': 'drive'
+                            })
+                        all_documents.extend(documents)
+                except Exception as e:
+                    # Skip files that can't be processed
+                    continue
+            
+            if all_documents:
+                success = await rag.process_and_store_documents(all_documents, request.tenant_id)
+                if success:
+                    # Save the list of processed files
+                    await rag.save_processed_files(
+                        [f['id'] for f in new_files],
+                        request.tenant_id,
+                        [f['name'] for f in new_files]
+                    )
+                    return {"message": f"Successfully processed {len(new_files)} new documents"}
+                else:
+                    raise HTTPException(status_code=500, detail="Failed to process and store documents")
+            else:
+                return {"message": f"No new content to process for tenant {request.tenant_id}"}
+                
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-async def process_supabase_storage(request: ProcessRequest, current_user: Dict[str, Any]):
+async def process_supabase_storage(request: ProcessRequest):
     """Process a single file from Supabase Storage"""
 
     try:
@@ -330,17 +360,17 @@ async def process_supabase_storage(request: ProcessRequest, current_user: Dict[s
         documents = await storage_loader.download_and_process_file(
             request.file_path,
             metadata={
-                "tenant_id": current_user.app_metadata['tenant_id'],
-                "user_id": current_user.id,
+                "tenant_id": request.tenant_id,
                 "original_filename": original_filename
-            }
+            },
+            tenant_id=request.tenant_id
         )
         
         if not documents:
             return {"message": "No content found in the file"}
         
         rag = RAGChain()
-        success = await rag.process_and_store_documents(documents, current_user.app_metadata['tenant_id'])
+        success = await rag.process_and_store_documents(documents, request.tenant_id)
         
         if success:
             return {"message": "Successfully processed and stored the file"}
@@ -372,7 +402,7 @@ async def process_database_records(request: ProcessRequest):
             raise HTTPException(status_code=404, detail="No documents found in the database")
 
         rag = RAGChain()
-        tenant_id = request.options.get('tenant_id')
+        tenant_id = request.tenant_id
         success = await rag.process_database_records(result.data, tenant_id, request.options)
         
         if success:
@@ -412,7 +442,8 @@ async def answer_query(
 async def save_to_drive(
     file: UploadFile = File(...),
     file_name: str = Form(...),
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    tenant_id: str = Form(...),
+    folder_path: Optional[str] = Form(None)
 ):
     """
     Save a file to Google Drive
@@ -420,6 +451,8 @@ async def save_to_drive(
     Args:
         file: The file to upload
         file_name: Name of the file
+        tenant_id: Tenant ID for authentication
+        folder_path: Optional folder path like "프로세스 정의/년/월/일/인스턴스/source/" (creates folders if they don't exist)
     """
     try:
         content = await file.read()
@@ -427,21 +460,17 @@ async def save_to_drive(
         # Create a BytesIO object from the content
         file_content = io.BytesIO(content)
         
-        # Use user-specific authentication
-        drive_loader = GoogleDriveLoader(
-            tenant_id=current_user.app_metadata['tenant_id'],
-            user_email=current_user.email
-        )
+        # Use tenant-level authentication
+        drive_loader = GoogleDriveLoader(tenant_id=tenant_id)
         
         try:
-            result = await drive_loader.save_to_google_drive(file_content, file_name)
+            result = await drive_loader.save_to_google_drive(file_content, file_name, folder_path=folder_path)
             return result
         except ValueError as e:
             # Authentication error - return login URL
             if "No valid Google credentials found" in str(e) or "Authentication failed" in str(e):
                 auth_response = create_auth_error_response(
-                    current_user.app_metadata['tenant_id'],
-                    current_user.email,
+                    tenant_id,
                     "Google Drive authentication required to upload files"
                 )
                 return JSONResponse(
@@ -456,14 +485,17 @@ async def save_to_drive(
 
 @app.post("/auth/google/save-token")
 async def save_google_token(request: GoogleTokenRequest):
-    """Save Google OAuth token to user's google_credentials column"""
+    """Save Google OAuth token to tenant's google_credentials column"""
     try:
-        # Check if user exists first
-        user_check = supabase.table("users").select("id, email, tenant_id").eq("email", request.user_email).eq("tenant_id", request.tenant_id).single().execute()
+        # Check if tenant_oauth record exists
+        tenant_check = supabase.table("tenant_oauth") \
+            .select("tenant_id") \
+            .eq("tenant_id", request.tenant_id) \
+            .single() \
+            .execute()
         
-        user_info = user_check.data
-        if not user_info:
-            raise HTTPException(status_code=404, detail=f"User {request.user_email} not found in tenant {request.tenant_id}")
+        if not tenant_check.data:
+            raise HTTPException(status_code=404, detail=f"Tenant OAuth settings not found for tenant {request.tenant_id}")
 
         # Prepare token data as JSON
         token_data = {
@@ -483,21 +515,20 @@ async def save_google_token(request: GoogleTokenRequest):
             expiry = datetime.now(timezone.utc) + timedelta(seconds=request.expires_in)
             token_data["expiry"] = expiry.isoformat()
         
-        # Update user's google_credentials
-        response = supabase.table("users").upsert({
-            "id": user_info['id'],
-            "email": user_info['email'],
-            "tenant_id": user_info['tenant_id'],
-            "google_credentials": json.dumps(token_data),
-            "google_credentials_updated_at": datetime.now(timezone.utc).isoformat()
-        }).execute()
+        # Update tenant's google_credentials
+        response = supabase.table("tenant_oauth") \
+            .update({
+                "google_credentials": json.dumps(token_data),
+                "google_credentials_updated_at": datetime.now(timezone.utc).isoformat()
+            }) \
+            .eq("tenant_id", request.tenant_id) \
+            .execute()
         
         if not response.data:
-            raise HTTPException(status_code=500, detail="Failed to update user credentials")
+            raise HTTPException(status_code=500, detail="Failed to update tenant credentials")
 
         return {
             "message": "Google token saved successfully",
-            "user_email": request.user_email,
             "tenant_id": request.tenant_id
         }
 
@@ -519,7 +550,6 @@ async def google_oauth_callback(request: GoogleOAuthCallbackRequest):
         response = supabase.table("tenant_oauth") \
             .select("*") \
             .eq("tenant_id", tenant_id) \
-            .eq("provider", "google") \
             .single() \
             .execute()
         
@@ -556,12 +586,9 @@ async def google_oauth_callback(request: GoogleOAuthCallbackRequest):
                     detail=f"Token response missing access_token: {token_info}"
                 )
         
-        user_email = request.user_email
-        
         # Save token using existing endpoint
         token_request = GoogleTokenRequest(
             tenant_id=tenant_id,
-            user_email=user_email,
             access_token=token_info['access_token'],
             refresh_token=token_info.get('refresh_token'),
             expires_in=token_info.get('expires_in'),
@@ -574,7 +601,6 @@ async def google_oauth_callback(request: GoogleOAuthCallbackRequest):
         
         return {
             "message": "Google OAuth completed successfully",
-            "user_email": user_email,
             "tenant_id": tenant_id,
             "token_saved": True
         }
@@ -582,14 +608,13 @@ async def google_oauth_callback(request: GoogleOAuthCallbackRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-def create_auth_error_response(tenant_id: str, user_email: str, error_message: str = "Authentication required"):
+def create_auth_error_response(tenant_id: str, error_message: str = "Authentication required"):
     """Create a standardized auth error response with login URL"""
     try:
         # Get OAuth settings to create login URL
         response = supabase.table("tenant_oauth") \
             .select("*") \
             .eq("tenant_id", tenant_id) \
-            .eq("provider", "google") \
             .single() \
             .execute()
         
@@ -619,8 +644,7 @@ def create_auth_error_response(tenant_id: str, user_email: str, error_message: s
                 "error": "authentication_required",
                 "message": error_message,
                 "auth_url": auth_url,
-                "tenant_id": tenant_id,
-                "user_email": user_email
+                "tenant_id": tenant_id
             }
         else:
             return {
@@ -648,4 +672,7 @@ http POST http://localhost:8005/process/database storage_type="database" options
 
 - 질의
 http GET http://localhost:8005/query?query="프로젝트 A의 예산이 얼마 나왔지?"
+
+- 검색
+http POST http://localhost:8005/retrieve query="교육" tenant_id="localhost"
 """
