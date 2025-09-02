@@ -602,10 +602,7 @@ class GoogleDriveLoader:
                             # 이미지 메타데이터 생성 (원본 데이터 포함)
                             image_metadata = {
                                 'format': file_extension[1:],
-                                'size': len(image_data),
-                                'source_path': image_path,
-                                'width': None,  # 필요시 PIL로 크기 확인
-                                'height': None
+                                'source_path': image_path
                             }
                             
                             extracted_images.append({
@@ -654,7 +651,6 @@ class GoogleDriveLoader:
                             
                             # 이미지 데이터 추출
                             image_data = pptx_zip.read(image_path)
-                            print(f"Image data size: {len(image_data)} bytes")
                             
                             # 파일 확장자 추출
                             file_extension = Path(image_path).suffix.lower()
@@ -692,7 +688,6 @@ class GoogleDriveLoader:
                             # 이미지 메타데이터 생성 (원본 데이터 포함)
                             image_metadata = {
                                 'format': file_extension[1:],  # 확장자에서 점 제거
-                                'size': len(image_data),
                                 'source_path': image_path
                             }
                             
@@ -724,7 +719,6 @@ class GoogleDriveLoader:
         extracted_images = []
         
         print(f"Starting image extraction for file: {file_name}")
-        print(f"File size: {len(file_content)} bytes")
         
         # 파일 확장자 확인
         file_extension = Path(file_name).suffix.lower()

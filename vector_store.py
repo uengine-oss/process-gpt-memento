@@ -138,8 +138,7 @@ class VectorStoreManager:
                         "download_url": image.get('download_url', ''),
                         "metadata": image.get('metadata', {}),
                         "analysis_text": analysis_text if analysis_text else "",
-                        "base64_data": base64_data,
-                        "created_at": None  # 기본값 사용
+                        "base64_data": base64_data
                     }
                     
                     # 이미지 임베딩이 있으면 별도로 저장 (documents 테이블에)
