@@ -229,9 +229,11 @@ async def process_output(request: ProcessOutputRequest):
                     })
 
         if len(reports) > 0:
-            for docx_bytes in reports:
+            for report in reports:
+                file_name = report.get('file_name')
+                file_content = report.get('file_content')
                 upload_meta = await drive_loader.save_to_google_drive(
-                    file_content=io.BytesIO(docx_bytes),
+                    file_content=file_content,
                     file_name=file_name,
                     folder_path=folder_path
                 )

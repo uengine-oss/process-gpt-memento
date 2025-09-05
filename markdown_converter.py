@@ -310,20 +310,16 @@ def _create_html_template(html_content: str, title: str,
 </body>
 </html>"""
 
-def convert_markdown_to_docx(markdown_text: str, file_name: Optional[str] = None,
-                            output_path: Optional[str] = None,
-                            image_format: str = 'png') -> Union[str, bytes]:
+def convert_markdown_to_docx(markdown_text: str, image_format: str = 'png') -> bytes:
     """
     마크다운 텍스트를 DOCX로 변환 (한글 지원 개선)
     
     Args:
         markdown_text: 변환할 마크다운 텍스트
-        file_name: 출력 파일 이름 (None이면 루트 경로에 저장하고 바이트 반환)
-        output_path: 출력 파일 경로 (None이면 루트 경로에 저장하고 바이트 반환)
         image_format: 이미지 형식 ('png', 'svg', 'pdf')
     
     Returns:
-        파일 경로 또는 바이트 데이터
+        바이트 데이터
     """
     if not DOCX_AVAILABLE:
         raise ImportError("python-docx is required for DOCX conversion. Install with: pip install python-docx")
@@ -362,27 +358,11 @@ def convert_markdown_to_docx(markdown_text: str, file_name: Optional[str] = None
         # 마크다운 파싱 및 DOCX 생성
         _parse_markdown_to_docx(doc, processed_content)
         
-        # 문서 저장
-        if output_path:
-            if file_name:
-                output_path = os.path.join(output_path, file_name)
-            doc.save(output_path)
-            return output_path
-        else:
-            # 루트 경로에 기본 파일명으로 저장
-            from datetime import datetime
-            if file_name:
-                default_filename = file_name
-            else:
-                default_filename = f"converted_document_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
-            root_path = os.path.join(os.getcwd(), default_filename)
-            doc.save(root_path)
-            
-            # 바이트로도 반환
-            from io import BytesIO
-            buffer = BytesIO()
-            doc.save(buffer)
-            return buffer.getvalue()
+        # 바이트로 반환
+        from io import BytesIO
+        buffer = BytesIO()
+        doc.save(buffer)
+        return buffer.getvalue()
 
 def _set_korean_font(doc):
     """한글 폰트 설정"""

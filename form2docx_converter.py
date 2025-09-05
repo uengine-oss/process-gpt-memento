@@ -1,4 +1,3 @@
-import io
 from bs4 import BeautifulSoup
 from docx import Document
 
@@ -54,10 +53,10 @@ def form_to_docx(html: str, values: dict) -> bytes:
                 value_cells[i].text = value
 
     # docx → bytes 변환
-    file_stream = io.BytesIO()
-    doc.save(file_stream)
-    file_stream.seek(0)
-    return file_stream.read()
+    from io import BytesIO
+    buffer = BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue()
 
 
 def extract_value(field, key, values):
