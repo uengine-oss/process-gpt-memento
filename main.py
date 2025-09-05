@@ -249,6 +249,11 @@ async def process_output(request: ProcessOutputRequest):
                 folder_path=folder_path
             )
             uploads.append(upload_meta)
+            try:
+                output_url = upload_meta.get('web_view_link')
+                supabase.table("todolist").update({"output_url": output_url}).eq("id", workitem_id).execute()
+            except Exception as e:
+                print(f"Error saving output url: {e}")
 
         if len(uploads) > 0:
             # Process generated DOCX bytes directly into vector store
