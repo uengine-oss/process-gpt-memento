@@ -19,6 +19,7 @@ from supabase_storage_loader import SupabaseStorageLoader
 from rag_chain import RAGChain
 
 from markdown_converter import convert_markdown_to_docx
+from form2docx_converter import form_to_docx
 
 
 app = FastAPI(title="Memento Service API", description="API for document processing and querying")
@@ -74,7 +75,6 @@ class GoogleOAuthCallbackRequest(BaseModel):
 class ProcessOutputRequest(BaseModel):
     workitem_id: str
     tenant_id: Optional[str] = None
-    covert_from: Optional[str] = "form"
 
 @app.get("/auth/google/url")
 async def get_google_auth_url(tenant_id: str):
@@ -200,6 +200,7 @@ async def process_output(request: ProcessOutputRequest):
         
         form_definition = supabase.table("form_def").select("*").eq("id", form_id).eq("tenant_id", tenant_id).single().execute()
         fields_json = form_definition.data.get("fields_json", {})
+        form_html = form_definition.data.get("html", "")
         
         # Build Drive folder path: {proc_def_id}/{year}/{month}/{day}/{proc_inst_id}/output/
         proc_def_id = workitem_data.get("proc_def_id")
@@ -211,54 +212,76 @@ async def process_output(request: ProcessOutputRequest):
         day = f"{today.day:02d}"
         folder_path = f"{proc_def_id}/{year}/{month}/{day}/{proc_inst_id}/output/"
 
-        covert_from = request.covert_from
+        reports = []
         uploads = []
         drive_loader = GoogleDriveLoader(tenant_id=tenant_id)
-        if covert_from == "form":
-            print(form_value)
-            # 폼을 docx 파일로 변환
-        else:
-            reports = []
-            for field in fields_json:
-                if field.get("type") == "report" or field.get("type") == "slide":
-                    field_id = field.get("key")
-                    if form_value.get(field_id):
-                        field_name = field.get("text")
-                        file_name = f"{activity_name}_{field_name}.docx"
-                        docx_bytes = convert_markdown_to_docx(form_value.get(field_id), file_name)
-                        reports.append(docx_bytes)
-                        upload_meta = await drive_loader.save_to_google_drive(
-                            io.BytesIO(docx_bytes),
-                            file_name=file_name,
-                            folder_path=folder_path
-                        )
-                        uploads.append(upload_meta)
-
-                        # Process generated DOCX bytes directly into vector store
-                        try:
-                            rag = RAGChain()
-                            uploaded_file_id = upload_meta.get('file_id')
-                            uploaded_file_name = upload_meta.get('file_name', file_name)
-                            processor = DocumentProcessor()
-                            docs = await processor.load_document(io.BytesIO(docx_bytes), uploaded_file_name)
-                            if docs:
-                                chunks = await processor.process_documents(docs)
-                                for doc in chunks:
-                                    doc.metadata.update({
-                                        'file_id': uploaded_file_id,
-                                        'file_name': uploaded_file_name,
-                                        'tenant_id': tenant_id,
-                                        'storage_type': 'drive',
-                                        'source_type': 'process_output',
-                                        'activity_name': activity_name,
-                                        'workitem_id': workitem_id
-                                    })
-                                success = await rag.process_and_store_documents(chunks, tenant_id)
-                                if success and uploaded_file_id:
-                                    await rag.save_processed_files([uploaded_file_id], tenant_id, [uploaded_file_name])
-                        except Exception as e:
-                            print(f"RAG processing after upload failed: {str(e)}")
         
+        for field in fields_json:
+            if field.get("type") == "report" or field.get("type") == "slide":
+                field_id = field.get("key")
+                if form_value.get(field_id):
+                    field_name = field.get("text")
+                    file_name = f"{activity_name}_{field_name}.docx"
+                    docx_bytes = convert_markdown_to_docx(form_value.get(field_id), file_name)
+                    reports.append({
+                        'file_content': io.BytesIO(docx_bytes),
+                        'file_name': file_name
+                    })
+
+        if len(reports) > 0:
+            for docx_bytes in reports:
+                upload_meta = await drive_loader.save_to_google_drive(
+                    file_content=io.BytesIO(docx_bytes),
+                    file_name=file_name,
+                    folder_path=folder_path
+                )
+                uploads.append(upload_meta)
+        else:
+            file_name = f"{activity_name}.docx"
+            docx_bytes = form_to_docx(form_html, output)
+            reports.append({
+                'file_content': io.BytesIO(docx_bytes),
+                'file_name': file_name
+            })
+            upload_meta = await drive_loader.save_to_google_drive(
+                file_content=io.BytesIO(docx_bytes),
+                file_name=file_name,
+                folder_path=folder_path
+            )
+            uploads.append(upload_meta)
+
+        if len(uploads) > 0:
+            # Process generated DOCX bytes directly into vector store
+            try:
+                rag = RAGChain()
+                for upload_meta in uploads:
+                    uploaded_file_id = upload_meta.get('file_id')
+                    uploaded_file_name = upload_meta.get('file_name', file_name)
+                    
+                    report_meta = next((report for report in reports if report.get('file_name') == uploaded_file_name), None)
+                    if report_meta:
+                        processor = DocumentProcessor()
+                        docs = await processor.load_document(report_meta.get('file_content'), uploaded_file_name)
+                        if docs:
+                            chunks = await processor.process_documents(docs)
+                            for doc in chunks:
+                                doc.metadata.update({
+                                    'file_id': uploaded_file_id,
+                                    'file_name': uploaded_file_name,
+                                    'tenant_id': tenant_id,
+                                    'storage_type': 'drive',
+                                    'source_type': 'process_output',
+                                    'activity_name': activity_name,
+                                    'workitem_id': workitem_id
+                                })
+
+                            success = await rag.process_and_store_documents(chunks, tenant_id)
+                            if success and uploaded_file_id:
+                                await rag.save_processed_files([uploaded_file_id], tenant_id, [uploaded_file_name])
+
+            except Exception as e:
+                print(f"RAG processing after upload failed: {str(e)}")
+    
         print("success process output")
         return {
             "message": "success process output",
@@ -770,12 +793,11 @@ http POST http://localhost:8005/process storage_type="drive"
 http POST http://localhost:8005/process/database storage_type="database" options='{"proc_inst_id": "handover_process_definition.dae522ed-f93d-4f0c-b473-f1d79dbcf709", "activity_id": "plan_handover_schedule", "tenant_id": "localhost"}'
 
 - 질의
-http GET http://localhost:8005/query?query="프로젝트 A의 예산이 얼마 나왔지?"
+http GET http://localhost:8005/query query=="프로젝트 A의 예산이 얼마 나왔지?" tenant_id==localhost
 
 - 검색
 http POST http://localhost:8005/retrieve query="교육" tenant_id="localhost"
 
 - 산출물 처리
-http POST http://localhost:8005/process-output workitem_id="6bcf39ae-69c2-48cc-8f64-810683e6bbea" tenant_id="localhost" covert_from="report"
-http POST http://localhost:8005/process-output workitem_id="f90e7c5d-bcd6-48eb-8b03-d947d3cdd863" covert_from="slide"
+http POST http://localhost:8005/process-output workitem_id="bee83324-dc87-4f25-b7e2-e8e4ed5a3d8e" tenant_id="localhost"
 """
