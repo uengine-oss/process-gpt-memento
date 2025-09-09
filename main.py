@@ -134,7 +134,10 @@ async def get_google_auth_status(tenant_id: str):
             return {"authenticated": False, "message": "No Google credentials found"}
         
         # Parse token data
-        token_data = json.loads(response.data['google_credentials'])
+        if type(response.data['google_credentials']) == str:
+            token_data = json.loads(response.data['google_credentials'])
+        else:
+            token_data = response.data['google_credentials']
         
         # Check if token is expired
         if token_data.get('expiry'):

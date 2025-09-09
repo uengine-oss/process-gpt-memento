@@ -52,6 +52,14 @@ GOOGLE_CLIENT_SECRET=your_google_client_secret
 ### 3. 데이터베이스 설정
 Supabase에서 다음 테이블들이 필요합니다:
 
+### 4. Supabase Storage 설정
+이미지 처리를 위해 Supabase Storage에 퍼블릭 버킷을 설정해야 합니다:
+
+1. **Supabase 대시보드**에서 Storage 섹션으로 이동
+2. **새 버킷 생성**: `files` 이름으로 버킷 생성
+3. **퍼블릭 액세스 설정**: 버킷을 퍼블릭으로 설정하여 이미지 URL 접근 가능
+4. **RLS 정책 설정**: 필요에 따라 Row Level Security 정책 구성
+
 ```sql
 -- 문서 테이블
 CREATE TABLE documents (
@@ -68,8 +76,8 @@ CREATE TABLE document_images (
     tenant_id TEXT,
     image_id TEXT,
     image_url TEXT,
-    download_url TEXT,
-    metadata JSONB
+    metadata JSONB,
+    created_at timestamp with time zone null default now()
 );
 
 -- 처리된 파일 추적 테이블
@@ -108,8 +116,8 @@ python test_image_extraction.py
 
 1. **문서 업로드**: PDF, DOCX, PPTX 파일을 Google Drive에 업로드
 2. **이미지 추출**: 문서 내 이미지를 자동으로 감지하고 추출
-3. **Google Drive 저장**: 추출된 이미지를 Google Drive에 저장
-4. **AI 분석**: OpenAI Vision API로 이미지 내용을 텍스트로 변환
+3. **Supabase Storage 업로드**: 추출된 이미지를 Supabase Storage 퍼블릭 버킷에 업로드
+4. **AI 분석**: OpenAI Vision API로 이미지 URL을 통해 이미지 내용을 텍스트로 변환
 5. **벡터 저장**: 텍스트 + 이미지 설명을 통합하여 벡터 저장소에 저장
 6. **통합 검색**: 텍스트와 이미지 내용을 모두 포함한 검색 가능
 

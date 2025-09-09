@@ -70,3 +70,44 @@ class SupabaseStorageLoader:
             print(f"Error processing file {file_path}: {e}")
             return []
 
+    async def upload_image_to_storage(self, image_data: bytes, image_name: str, folder_path: str = "extracted_images") -> dict:
+        """
+        Upload an image to Supabase Storage public bucket
+        
+        Args:
+            image_data: Image data as bytes
+            image_name: Name of the image file
+            folder_path: Folder path in storage (default: "extracted_images")
+            
+        Returns:
+            Dictionary with upload information including public URL
+        """
+        try:
+            # Create full path for the image
+            full_path = f"{folder_path}/{image_name}"
+            
+            # Upload to Supabase Storage
+            response = await asyncio.to_thread(
+                self.supabase.storage.from_("files").upload,
+                full_path,
+                image_data,
+                {"content-type": "image/png"}  # Adjust based on image type
+            )
+            
+            if response.get('error'):
+                raise Exception(f"Upload failed: {response['error']}")
+            
+            # Get public URL
+            public_url_response = self.supabase.storage.from_("files").get_public_url(full_path)
+            public_url = public_url_response.get('publicURL', '') if isinstance(public_url_response, dict) else str(public_url_response)
+            
+            return {
+                'file_id': response.get('id'),
+                'file_name': image_name,
+                'public_url': public_url
+            }
+            
+        except Exception as e:
+            print(f"Error uploading image to storage: {e}")
+            raise
+

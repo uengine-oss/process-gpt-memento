@@ -139,6 +139,18 @@ class RAGChain:
             print(f"\nProcessing {len(documents)} documents...")
             
             # 이미지 분석을 먼저 수행
+            await self.process_document_images(documents)
+            
+            # 벡터 저장소에 저장 (이미지 분석 완료된 상태)
+            return await self.vector_store.add_documents(documents, tenant_id)
+            
+        except Exception as e:
+            print(f"Error in process_and_store_documents: {e}")
+            return False
+
+    async def process_document_images(self, documents: list[Document]) -> None:
+        """문서들의 이미지를 분석하고 내용에 추가하는 별도 함수"""
+        try:
             for doc in documents:
                 if 'extracted_images' in doc.metadata and doc.metadata['extracted_images']:
                     print(f"Analyzing {len(doc.metadata['extracted_images'])} images in document")
@@ -158,13 +170,10 @@ class RAGChain:
                     if image_descriptions:
                         doc.page_content += "\n\n[이미지 내용]\n" + "\n".join(image_descriptions)
                         print(f"Added {len(image_descriptions)} image descriptions to document content")
-            
-            # 벡터 저장소에 저장 (이미지 분석 완료된 상태)
-            return await self.vector_store.add_documents(documents, tenant_id)
-            
+                        
         except Exception as e:
-            print(f"Error in process_and_store_documents: {e}")
-            return False
+            print(f"Error in process_document_images: {e}")
+            raise
 
     async def get_processed_files(self, tenant_id: str) -> List[str]:
         """Get list of already processed files for a tenant"""
@@ -259,22 +268,22 @@ class RAGChain:
             return False
 
     async def analyze_images_with_llm(self, images_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """추출된 이미지를 LLM으로 분석 - 원본 데이터 직접 사용"""
+        """추출된 이미지를 LLM으로 분석 - URL 사용 버전"""
         analyzed_images = []
         
         for image_info in images_data:
             try:
-                # base64로 인코딩된 원본 이미지 데이터를 직접 사용
-                image_data_base64 = image_info.get('image_data_base64')
-                if not image_data_base64:
-                    print(f"Skipping image {image_info.get('image_id')}: No base64 data found")
+                # Supabase Storage에서 업로드된 이미지의 URL 사용
+                image_url = image_info.get('image_url')
+                if not image_url:
+                    print(f"Skipping image {image_info.get('image_id')}: No image URL found")
                     continue
                 
-                # 이미지 형식 감지0
+                # 이미지 형식 감지
                 image_format = image_info.get('metadata', {}).get('format', 'png')
                 mime_type = f"image/{image_format.lower()}"
                 
-                # OpenAI Vision API에 직접 전달
+                # OpenAI Vision API에 URL 전달
                 response = await self.llm.ainvoke([
                     {
                         "role": "user",
@@ -286,7 +295,7 @@ class RAGChain:
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": f"data:{mime_type};base64,{image_data_base64}"
+                                    "url": image_url
                                 }
                             }
                         ]
@@ -296,10 +305,11 @@ class RAGChain:
                 analyzed_images.append({
                     'image_id': image_info['image_id'],
                     'analysis': response.content,
-                    'metadata': image_info['metadata']
+                    'metadata': image_info['metadata'],
+                    'image_url': image_url
                 })
                 
-                print(f"Successfully analyzed image {image_info.get('image_id')}")
+                print(f"Successfully analyzed image {image_info.get('image_id')} from URL: {image_url}")
                 
             except Exception as e:
                 print(f"Error analyzing image {image_info.get('image_id')}: {e}")

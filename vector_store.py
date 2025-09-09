@@ -102,7 +102,7 @@ class VectorStoreManager:
             return False
 
     async def _save_image_metadata(self, images: List[Dict], document_id: str, tenant_id: str, image_analysis: List[Dict]):
-        """이미지 메타데이터를 별도 테이블에 저장하고 이미지 분석 결과도 임베딩하여 저장"""
+        """이미지 메타데이터를 별도 테이블에 저장하고 이미지 분석 결과도 임베딩하여 저장 - URL 기반 버전"""
         try:
             # 이미지 분석 결과를 image_id로 매핑
             analysis_map = {analysis['image_id']: analysis for analysis in image_analysis}
@@ -115,10 +115,7 @@ class VectorStoreManager:
                     # 이미지 분석 결과 가져오기
                     analysis_result = analysis_map.get(image_id, {})
                     analysis_text = analysis_result.get('analysis', '')
-                    
-                    # base64 인코딩된 원본 이미지 데이터 (이미지 추출 시 포함된 경우)
-                    base64_data = image.get('image_data_base64', '')
-                    
+
                     # 이미지 분석 텍스트가 있으면 임베딩 생성
                     image_embedding = None
                     if analysis_text:
@@ -128,17 +125,14 @@ class VectorStoreManager:
                         except Exception as embed_error:
                             print(f"Error generating embedding for image {image_id}: {embed_error}")
                     
-                    # 이미지 메타데이터 저장 (불필요한 필드 제거)
+                    # 이미지 메타데이터 저장 (URL 기반, base64 데이터 제거)
                     image_data = {
                         "id": str(uuid.uuid4()),
                         "document_id": document_id,
                         "tenant_id": tenant_id,
                         "image_id": image_id,
                         "image_url": image.get('image_url', ''),
-                        "download_url": image.get('download_url', ''),
-                        "metadata": image.get('metadata', {}),
-                        "analysis_text": analysis_text if analysis_text else "",
-                        "base64_data": base64_data
+                        "metadata": image.get('metadata', {})
                     }
                     
                     # 이미지 임베딩이 있으면 별도로 저장 (documents 테이블에)
@@ -154,6 +148,7 @@ class VectorStoreManager:
                                 "tenant_id": tenant_id,
                                 "source": "image_extraction",
                                 "file_name": f"{image_name}",
+                                "image_url": image.get('image_url', '')
                             },
                             "embedding": image_embedding
                         }
