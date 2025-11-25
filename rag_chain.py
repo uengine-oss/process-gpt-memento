@@ -152,11 +152,32 @@ class RAGChain:
         """문서들의 이미지를 분석하고 내용에 추가하는 별도 함수"""
         try:
             for doc in documents:
+                images_to_analyze = []
+                
+                # 문서에서 추출된 이미지들 (extracted_images)
                 if 'extracted_images' in doc.metadata and doc.metadata['extracted_images']:
-                    print(f"Analyzing {len(doc.metadata['extracted_images'])} images in document")
+                    images_to_analyze.extend(doc.metadata['extracted_images'])
+                
+                # 단일 이미지 파일인 경우 (image_url이 있지만 extracted_images는 없음)
+                if 'image_url' in doc.metadata and doc.metadata.get('image_url'):
+                    # extracted_images에 포함되지 않은 단일 이미지 파일
+                    if not ('extracted_images' in doc.metadata and doc.metadata['extracted_images']):
+                        image_info = {
+                            'image_id': doc.metadata.get('file_id', doc.metadata.get('file_name', 'unknown')),
+                            'image_url': doc.metadata['image_url'],
+                            'metadata': {
+                                'format': doc.metadata.get('file_type', 'png'),
+                                'source_path': doc.metadata.get('file_name', 'unknown'),
+                                'image_index': 0
+                            }
+                        }
+                        images_to_analyze.append(image_info)
+                
+                if images_to_analyze:
+                    print(f"Analyzing {len(images_to_analyze)} images in document")
                     
                     # 이미지 분석 수행
-                    analyzed_images = await self.analyze_images_with_llm(doc.metadata['extracted_images'])
+                    analyzed_images = await self.analyze_images_with_llm(images_to_analyze)
                     
                     # 분석 결과를 문서 메타데이터에 추가
                     doc.metadata['image_analysis'] = analyzed_images
@@ -268,7 +289,11 @@ class RAGChain:
             return False
 
     async def analyze_images_with_llm(self, images_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """추출된 이미지를 LLM으로 분석 - URL 사용 버전"""
+        """추출된 이미지를 LLM으로 분석 - URL 또는 base64 사용"""
+        import base64
+        import httpx
+        from urllib.parse import urlparse
+        
         analyzed_images = []
         
         for image_info in images_data:
@@ -283,24 +308,63 @@ class RAGChain:
                 image_format = image_info.get('metadata', {}).get('format', 'png')
                 mime_type = f"image/{image_format.lower()}"
                 
-                # OpenAI Vision API에 URL 전달
-                response = await self.llm.ainvoke([
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "이 이미지를 자세히 분석하고 설명해주세요. 문서의 일부라면 텍스트 내용, 차트, 그래프, 이미지 등을 포함하여 설명해주세요."
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": image_url
+                # URL이 localhost인지 확인
+                parsed_url = urlparse(image_url)
+                is_localhost = parsed_url.hostname in ['localhost', '127.0.0.1', '0.0.0.0'] or (
+                    parsed_url.hostname and 'localhost' in parsed_url.hostname
+                )
+                
+                # 이미지 콘텐츠 준비
+                if is_localhost:
+                    # localhost인 경우 base64 인코딩 사용
+                    print(f"Downloading image from localhost URL: {image_url}")
+                    async with httpx.AsyncClient() as client:
+                        image_response = await client.get(image_url)
+                        image_response.raise_for_status()
+                        image_bytes = image_response.content
+                    
+                    # base64 인코딩
+                    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+                    image_data_url = f"data:{mime_type};base64,{image_base64}"
+                    
+                    # OpenAI Vision API에 base64 데이터 전달
+                    response = await self.llm.ainvoke([
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "이 이미지를 자세히 분석하고 설명해주세요. 문서의 일부라면 텍스트 내용, 차트, 그래프, 이미지 등을 포함하여 설명해주세요."
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": image_data_url
+                                    }
                                 }
-                            }
-                        ]
-                    }
-                ])
+                            ]
+                        }
+                    ])
+                else:
+                    # localhost가 아닌 경우 URL 사용
+                    print(f"Using image URL: {image_url}")
+                    response = await self.llm.ainvoke([
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "이 이미지를 자세히 분석하고 설명해주세요. 문서의 일부라면 텍스트 내용, 차트, 그래프, 이미지 등을 포함하여 설명해주세요."
+                                },
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": image_url
+                                    }
+                                }
+                            ]
+                        }
+                    ])
                 
                 analyzed_images.append({
                     'image_id': image_info['image_id'],

@@ -70,14 +70,14 @@ class SupabaseStorageLoader:
             print(f"Error processing file {file_path}: {e}")
             return []
 
-    async def upload_image_to_storage(self, image_data: bytes, image_name: str, folder_path: str = "extracted_images") -> dict:
+    async def upload_image_to_storage(self, image_data: bytes, image_name: str, folder_path: str = "uploads") -> dict:
         """
         Upload an image to Supabase Storage public bucket
         
         Args:
             image_data: Image data as bytes
             image_name: Name of the image file
-            folder_path: Folder path in storage (default: "extracted_images")
+            folder_path: Folder path in storage (default: "uploads")
             
         Returns:
             Dictionary with upload information including public URL
@@ -94,20 +94,75 @@ class SupabaseStorageLoader:
                 {"content-type": "image/png"}  # Adjust based on image type
             )
             
-            if response.get('error'):
-                raise Exception(f"Upload failed: {response['error']}")
+            if not response.path:
+                raise Exception(f"Upload failed: {response}")
             
             # Get public URL
             public_url_response = self.supabase.storage.from_("files").get_public_url(full_path)
             public_url = public_url_response.get('publicURL', '') if isinstance(public_url_response, dict) else str(public_url_response)
             
             return {
-                'file_id': response.get('id'),
+                'file_id': response.path,
                 'file_name': image_name,
                 'public_url': public_url
             }
             
         except Exception as e:
             print(f"Error uploading image to storage: {e}")
+            raise
+
+    async def upload_file_to_storage(self, file_content: bytes, file_name: str, folder_path: str = "files", content_type: Optional[str] = None) -> dict:
+        """
+        Upload a file to Supabase Storage
+        
+        Args:
+            file_content: File content as bytes
+            file_name: Name of the file
+            folder_path: Folder path in storage (default: "files")
+            content_type: MIME type of the file (optional, will be inferred if not provided)
+            
+        Returns:
+            Dictionary with upload information including file path and public URL
+        """
+        try:
+            import mimetypes
+            import uuid
+            
+            # Generate unique file name to avoid conflicts
+            file_extension = os.path.splitext(file_name)[1]
+            unique_file_name = f"{uuid.uuid4()}{file_extension}"
+            full_path = f"{folder_path}/{unique_file_name}"
+            
+            # Determine content type
+            if not content_type:
+                content_type, _ = mimetypes.guess_type(file_name)
+                if not content_type:
+                    content_type = "application/octet-stream"
+            
+            # Upload to Supabase Storage
+            response = await asyncio.to_thread(
+                self.supabase.storage.from_("files").upload,
+                full_path,
+                file_content,
+                {"content-type": content_type}
+            )
+            
+            if not response.path:
+                raise Exception(f"Upload failed: {response}")
+            
+            # Get public URL
+            public_url_response = self.supabase.storage.from_("files").get_public_url(full_path)
+            public_url = public_url_response.get('publicURL', '') if isinstance(public_url_response, dict) else str(public_url_response)
+            
+            return {
+                'file_path': full_path,
+                'file_name': file_name,
+                'original_file_name': file_name,
+                'public_url': public_url,
+                'content_type': content_type
+            }
+            
+        except Exception as e:
+            print(f"Error uploading file to storage: {e}")
             raise
 

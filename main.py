@@ -17,9 +17,13 @@ from document_loader import DocumentProcessor
 from google_drive_loader import GoogleDriveLoader
 from supabase_storage_loader import SupabaseStorageLoader
 from rag_chain import RAGChain
+from image_storage_utils import ImageStorageUtils
 
 from markdown_converter import convert_markdown_to_docx
 from form2docx_converter import form_to_docx
+from langchain.schema import Document
+from pathlib import Path
+from googleapiclient.http import MediaIoBaseDownload
 
 
 app = FastAPI(title="Memento Service API", description="API for document processing and querying")
@@ -54,6 +58,7 @@ class ProcessRequest(BaseModel):
 class RetrieveRequest(BaseModel):
     query: str
     tenant_id: str
+    proc_inst_id: Optional[str] = None
     options: Optional[dict] = None
 
 class GoogleOAuthRequest(BaseModel):
@@ -75,6 +80,61 @@ class GoogleOAuthCallbackRequest(BaseModel):
 class ProcessOutputRequest(BaseModel):
     workitem_id: str
     tenant_id: Optional[str] = None
+
+class UploadRequest(BaseModel):
+    tenant_id: str
+    options: Optional[dict] = None
+
+async def process_image_file(file_content: bytes, file_name: str, file_id: str, tenant_id: str, proc_inst_id: Optional[str] = None, storage_type: str = 'storage') -> Optional[List[Document]]:
+    """이미지 파일을 처리하여 Document 객체로 변환"""
+    try:
+        from image_storage_utils import ImageStorageUtils
+        
+        # 파일 확장자 확인
+        file_extension = Path(file_name).suffix.lower()
+        image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']
+        
+        if file_extension not in image_extensions:
+            print(f"Unsupported image file type: {file_extension}")
+            return None
+        
+        # Supabase Storage에 이미지 업로드 (단일 이미지 업로드)
+        storage_utils = ImageStorageUtils()
+        upload_result = await storage_utils.upload_image_to_storage(
+            file_content,
+            file_name
+        )
+        
+        if not upload_result:
+            print(f"Failed to upload image {file_name}")
+            return None
+        
+        # Document 객체 생성
+        metadata = {
+            'file_id': file_id,
+            'file_name': file_name,
+            'tenant_id': tenant_id,
+            'storage_type': storage_type,
+            'image_count': 1,
+            'source': file_name,
+            'file_type': file_extension[1:],
+            'image_url': upload_result.get('public_url')
+        }
+        
+        # 인스턴스 아이디가 있으면 메타데이터에 추가
+        if proc_inst_id:
+            metadata['proc_inst_id'] = proc_inst_id
+        
+        doc = Document(
+            page_content="",  # 이미지 분석 후 내용이 추가됨
+            metadata=metadata
+        )
+        
+        return [doc]
+        
+    except Exception as e:
+        print(f"Error processing image file {file_name}: {e}")
+        return None
 
 @app.get("/auth/google/url")
 async def get_google_auth_url(tenant_id: str):
@@ -155,21 +215,23 @@ async def get_google_auth_status(tenant_id: str):
     except Exception as e:
         return {"authenticated": False, "message": str(e)}
 
-@app.post("/retrieve")
-async def retrieve(request: RetrieveRequest):
+@app.get("/retrieve")
+async def retrieve(query: str, tenant_id: str, proc_inst_id: Optional[str] = None):
     try:
-        query_text = request.query
-
-        if not query_text:
-            raise HTTPException(status_code=400, detail="query is required")
+        if proc_inst_id:
+            metadata_filter = {
+                "tenant_id": tenant_id,
+                "proc_inst_id": proc_inst_id
+            }
+        else:
+            metadata_filter = {
+                "tenant_id": tenant_id,
+                "source_type": "process_output"
+            }
 
         rag = RAGChain()
-        
-        metadata_filter = {
-            "tenant_id": request.tenant_id
-        }
 
-        result = await rag.retrieve(query_text, metadata_filter)
+        result = await rag.retrieve(query, metadata_filter)
         docs = result["source_documents"]
 
         return {
@@ -275,7 +337,7 @@ async def process_output(request: ProcessOutputRequest):
                         if docs:
                             chunks = await processor.process_documents(docs)
                             for doc in chunks:
-                                doc.metadata.update({
+                                metadata = {
                                     'file_id': uploaded_file_id,
                                     'file_name': uploaded_file_name,
                                     'tenant_id': tenant_id,
@@ -283,7 +345,10 @@ async def process_output(request: ProcessOutputRequest):
                                     'source_type': 'process_output',
                                     'activity_name': activity_name,
                                     'workitem_id': workitem_id
-                                })
+                                }
+                                if proc_inst_id:
+                                    metadata['proc_inst_id'] = proc_inst_id
+                                doc.metadata.update(metadata)
 
                             success = await rag.process_and_store_documents(chunks, tenant_id)
                             if success and uploaded_file_id:
@@ -322,17 +387,54 @@ async def process_documents(request: ProcessRequest):
     
     try:
         processor = DocumentProcessor()
-        documents = await asyncio.to_thread(
-            processor.process_directory,
-            request.input_dir,
-            {"storage_type": request.storage_type}
-        )
+        all_documents = []
+        
+        # Extract proc_inst_id from options if provided
+        proc_inst_id = None
+        if request.options and request.options.get("proc_inst_id"):
+            proc_inst_id = request.options.get("proc_inst_id")
+        
+        # Image extensions
+        image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']
+        
+        # Process all files in directory
+        for root, _, files in os.walk(request.input_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                file_extension = Path(file).suffix.lower()
+                
+                if file_extension in image_extensions:
+                    # Process image file
+                    with open(file_path, 'rb') as f:
+                        file_content = f.read()
+                    
+                    # Use file path as file_id (sanitized)
+                    file_id = file_path.replace(os.sep, '_').replace('/', '_').replace('\\', '_')
+                    
+                    image_docs = await process_image_file(file_content, file, file_id, request.tenant_id, proc_inst_id, storage_type='local')
+                    if image_docs:
+                        all_documents.extend(image_docs)
+                else:
+                    # Process document file
+                    with open(file_path, 'rb') as f:
+                        file_content = f.read()
+                    
+                    file_io = io.BytesIO(file_content)
+                    docs = await processor.load_document(file_io, file_path)
+                    if docs:
+                        chunks = await processor.process_documents(docs, {"storage_type": request.storage_type})
+                        all_documents.extend(chunks)
 
-        if not documents:
+        if not all_documents:
             return {"message": "No documents found to process"}
+        
+        # Update metadata for each document
+        for doc in all_documents:
+            if proc_inst_id:
+                doc.metadata['proc_inst_id'] = proc_inst_id
 
         rag = RAGChain()
-        success = await rag.process_and_store_documents(documents, request.tenant_id)
+        success = await rag.process_and_store_documents(all_documents, request.tenant_id)
         
         if success:
             return {"message": "Successfully processed and stored documents"}
@@ -348,6 +450,9 @@ async def process_google_drive(request: ProcessRequest):
         # Use tenant-level authentication
         drive_loader = GoogleDriveLoader(tenant_id=request.tenant_id)
         
+        if request.options and request.options.get("proc_inst_id"):
+            proc_inst_id = request.options.get("proc_inst_id")
+        
         supported_mime_types = [
             'application/vnd.google-apps.document',
             'application/vnd.google-apps.spreadsheet',
@@ -356,7 +461,21 @@ async def process_google_drive(request: ProcessRequest):
             'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-            'text/plain'
+            'text/plain',
+            'image/jpeg',
+            'image/png',
+            'image/gif',
+            'image/bmp',
+            'image/webp'
+        ]
+        
+        # 이미지 MIME 타입 목록
+        image_mime_types = [
+            'image/jpeg',
+            'image/png',
+            'image/gif',
+            'image/bmp',
+            'image/webp'
         ]
 
         # Check if specific file_path is provided
@@ -377,19 +496,43 @@ async def process_google_drive(request: ProcessRequest):
                 if file_id in processed_files:
                     return {"message": f"File {file_id} has already been processed for tenant {request.tenant_id}"}
                 
-                # Process the specific file
-                documents = await drive_loader.download_and_process_file(file_id, file_info['name'], request.tenant_id)
-                if not documents:
-                    return {"message": f"No content extracted from file {file_id}"}
+                # Check if file is an image
+                file_mime_type = file_info.get('mimeType', '')
+                is_image = file_mime_type in image_mime_types
+                
+                if is_image:
+                    # Process image file
+                    request_media = drive_loader.service.files().get_media(fileId=file_id)
+                    fh = io.BytesIO()
+                    downloader = MediaIoBaseDownload(fh, request_media)
+                    done = False
+                    
+                    while not done:
+                        status, done = await asyncio.to_thread(downloader.next_chunk)
+                    
+                    fh.seek(0)
+                    file_content = fh.read()
+                    
+                    documents = await process_image_file(file_content, file_info['name'], file_id, request.tenant_id, proc_inst_id, storage_type='drive')
+                    if not documents:
+                        return {"message": f"No content extracted from image file {file_id}"}
+                else:
+                    # Process document file
+                    documents = await drive_loader.download_and_process_file(file_id, file_info['name'], request.tenant_id)
+                    if not documents:
+                        return {"message": f"No content extracted from file {file_id}"}
                 
                 # Update metadata for each document
                 for doc in documents:
-                    doc.metadata.update({
+                    metadata = {
                         'file_id': file_id,
                         'file_name': file_info['name'],
                         'tenant_id': request.tenant_id,
                         'storage_type': 'drive'
-                    })
+                    }
+                    if proc_inst_id:
+                        metadata['proc_inst_id'] = proc_inst_id
+                    doc.metadata.update(metadata)
                 
                 # Process and store the document
                 success = await rag.process_and_store_documents(documents, request.tenant_id)
@@ -440,19 +583,44 @@ async def process_google_drive(request: ProcessRequest):
             all_documents = []
             for file in new_files:
                 try:
-                    documents = await drive_loader.download_and_process_file(file['id'], file['name'], request.tenant_id)
+                    # Check if file is an image
+                    file_mime_type = file.get('mimeType', '')
+                    is_image = file_mime_type in image_mime_types
+                    
+                    if is_image:
+                        # Process image file
+                        request_media = drive_loader.service.files().get_media(fileId=file['id'])
+                        fh = io.BytesIO()
+                        downloader = MediaIoBaseDownload(fh, request_media)
+                        done = False
+                        
+                        while not done:
+                            status, done = await asyncio.to_thread(downloader.next_chunk)
+                        
+                        fh.seek(0)
+                        file_content = fh.read()
+                        
+                        documents = await process_image_file(file_content, file['name'], file['id'], request.tenant_id, proc_inst_id, storage_type='drive')
+                    else:
+                        # Process document file
+                        documents = await drive_loader.download_and_process_file(file['id'], file['name'], request.tenant_id)
+                    
                     if documents:
                         # Update metadata for each document
                         for doc in documents:
-                            doc.metadata.update({
+                            metadata = {
                                 'file_id': file['id'],
                                 'file_name': file['name'],
                                 'tenant_id': request.tenant_id,
                                 'storage_type': 'drive'
-                            })
+                            }
+                            if proc_inst_id:
+                                metadata['proc_inst_id'] = proc_inst_id
+                            doc.metadata.update(metadata)
                         all_documents.extend(documents)
                 except Exception as e:
                     # Skip files that can't be processed
+                    print(f"Error processing file {file.get('name', 'unknown')}: {e}")
                     continue
             
             if all_documents:
@@ -484,20 +652,49 @@ async def process_supabase_storage(request: ProcessRequest):
         if not original_filename:
             original_filename = os.path.basename(request.file_path)
         
+        # Extract proc_inst_id from options if provided
+        proc_inst_id = None
+        if request.options and request.options.get("proc_inst_id"):
+            proc_inst_id = request.options.get("proc_inst_id")
+        
+        # Check if file is an image
+        file_extension = Path(original_filename).suffix.lower()
+        image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']
+        is_image = file_extension in image_extensions
+        
         storage_loader = SupabaseStorageLoader()
         
-        # Process single file
-        documents = await storage_loader.download_and_process_file(
-            request.file_path,
-            metadata={
-                "tenant_id": request.tenant_id,
-                "original_filename": original_filename
-            },
-            tenant_id=request.tenant_id
-        )
+        if is_image:
+            # Download image file
+            response = await asyncio.to_thread(
+                storage_loader.supabase.storage.from_("files").download,
+                request.file_path
+            )
+            file_content = response if isinstance(response, bytes) else response.read() if hasattr(response, 'read') else bytes(response)
+            
+            # Use file_path as file_id (or generate one)
+            file_id = request.file_path.replace('/', '_').replace('\\', '_')
+            
+            # Process image file
+            documents = await process_image_file(file_content, original_filename, file_id, request.tenant_id, proc_inst_id, storage_type='storage')
+        else:
+            # Process document file
+            documents = await storage_loader.download_and_process_file(
+                request.file_path,
+                metadata={
+                    "tenant_id": request.tenant_id,
+                    "original_filename": original_filename
+                },
+                tenant_id=request.tenant_id
+            )
         
         if not documents:
             return {"message": "No content found in the file"}
+        
+        # Update metadata for each document
+        for doc in documents:
+            if proc_inst_id:
+                doc.metadata['proc_inst_id'] = proc_inst_id
         
         rag = RAGChain()
         success = await rag.process_and_store_documents(documents, request.tenant_id)
@@ -565,6 +762,125 @@ async def answer_query(
             }
         }
         
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/save-to-storage")
+async def save_to_storage(
+    file: UploadFile = File(...),
+    tenant_id: str = Form(...),
+    options: Optional[str] = Form(None)  # JSON string
+):
+    """
+    Upload a file to Supabase Storage and process it
+    
+    Flow:
+    1. Upload file to Supabase Storage
+    2. Process the file (extract content, images, etc.)
+    3. Store in vector database
+    
+    Args:
+        file: The file to upload
+        tenant_id: Tenant ID
+        options: Optional JSON string with additional options (e.g., {"proc_inst_id": "..."})
+    
+    Returns:
+        Dictionary with file_path, file_name, public_url, and processed status
+    """
+    try:
+        import json
+        
+        # Parse options if provided
+        proc_inst_id = None
+        if options:
+            try:
+                options_dict = json.loads(options)
+                proc_inst_id = options_dict.get("proc_inst_id")
+            except json.JSONDecodeError:
+                pass
+        
+        # Read file content
+        file_content = await file.read()
+        file_name = file.filename or "unknown"
+        
+        # Upload to Supabase Storage
+        storage_loader = SupabaseStorageLoader()
+        upload_result = await storage_loader.upload_file_to_storage(
+            file_content,
+            file_name,
+            folder_path="files"
+        )
+        
+        storage_file_path = upload_result['file_path']
+        
+        # Check if file is an image
+        file_extension = Path(file_name).suffix.lower()
+        image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']
+        is_image = file_extension in image_extensions
+        
+        # Process the file
+        if is_image:
+            # Process image file
+            file_id = storage_file_path.replace('/', '_').replace('\\', '_')
+            documents = await process_image_file(
+                file_content, 
+                file_name, 
+                file_id, 
+                tenant_id, 
+                proc_inst_id,
+                storage_type='storage'
+            )
+        else:
+            # Process document file
+            file_io = io.BytesIO(file_content)
+            processor = DocumentProcessor()
+            docs = await processor.load_document(file_io, file_name)
+            
+            if not docs:
+                raise HTTPException(status_code=400, detail="Failed to load document")
+            
+            # Process documents
+            documents = await processor.process_documents(docs, {
+                "storage_type": "storage",
+                "file_path": storage_file_path,
+                "file_name": file_name,
+                "tenant_id": tenant_id
+            })
+            
+            # Update metadata
+            for doc in documents:
+                doc.metadata.update({
+                    'file_id': storage_file_path,
+                    'file_name': file_name,
+                    'tenant_id': tenant_id,
+                    'storage_type': 'storage'
+                })
+                if proc_inst_id:
+                    doc.metadata['proc_inst_id'] = proc_inst_id
+        
+        if not documents:
+            raise HTTPException(status_code=400, detail="No content extracted from file")
+        
+        # Store in vector database
+        rag = RAGChain()
+        success = await rag.process_and_store_documents(documents, tenant_id)
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to process and store documents")
+        
+        # Save processed file info
+        await rag.save_processed_files([storage_file_path], tenant_id, [file_name])
+        
+        return {
+            "message": "File uploaded, processed, and stored successfully",
+            "file_path": storage_file_path,
+            "file_name": file_name,
+            "public_url": upload_result.get('public_url'),
+            "processed": True
+        }
+        
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

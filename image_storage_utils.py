@@ -29,15 +29,26 @@ class ImageStorageUtils:
             Dictionary with upload information including public URL
         """
         try:
-            # Create full path for the image
-            full_path = f"{folder_path}/{image_name}"
+            import uuid
+            import mimetypes
+            
+            # Generate unique file name to avoid conflicts
+            file_extension = os.path.splitext(image_name)[1] or '.png'
+            unique_file_name = f"{uuid.uuid4()}{file_extension}"
+            full_path = f"{folder_path}/{unique_file_name}"
+            
+            # Determine content type based on file extension
+            content_type, _ = mimetypes.guess_type(image_name)
+            if not content_type:
+                # Default to image/png if cannot determine
+                content_type = "image/png"
             
             # Upload to Supabase Storage
             response = await asyncio.to_thread(
                 self.supabase.storage.from_("files").upload,
                 full_path,
                 image_data,
-                {"content-type": "image/png"}  # Adjust based on image type
+                {"content-type": content_type}
             )
             
             if not response.path:
