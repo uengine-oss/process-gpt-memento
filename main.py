@@ -85,7 +85,7 @@ class UploadRequest(BaseModel):
     tenant_id: str
     options: Optional[dict] = None
 
-async def process_image_file(file_content: bytes, file_name: str, file_id: str, tenant_id: str, proc_inst_id: Optional[str] = None, storage_type: str = 'storage') -> Optional[List[Document]]:
+async def process_image_file(file_content: bytes, file_name: str, file_id: str, tenant_id: str, proc_inst_id: Optional[str] = None, storage_type: str = 'storage', storage_file_path: Optional[str] = None, public_url: Optional[str] = None) -> Optional[List[Document]]:
     """이미지 파일을 처리하여 Document 객체로 변환"""
     try:
         from image_storage_utils import ImageStorageUtils
@@ -98,16 +98,23 @@ async def process_image_file(file_content: bytes, file_name: str, file_id: str, 
             print(f"Unsupported image file type: {file_extension}")
             return None
         
-        # Supabase Storage에 이미지 업로드 (단일 이미지 업로드)
-        storage_utils = ImageStorageUtils()
-        upload_result = await storage_utils.upload_image_to_storage(
-            file_content,
-            file_name
-        )
-        
-        if not upload_result:
-            print(f"Failed to upload image {file_name}")
-            return None
+        # 이미 저장된 파일 경로가 있으면 재사용, 없으면 새로 업로드
+        if storage_file_path and public_url:
+            # 이미 저장된 파일을 사용
+            image_url = public_url
+        else:
+            # Supabase Storage에 이미지 업로드 (단일 이미지 업로드)
+            storage_utils = ImageStorageUtils()
+            upload_result = await storage_utils.upload_image_to_storage(
+                file_content,
+                file_name
+            )
+            
+            if not upload_result:
+                print(f"Failed to upload image {file_name}")
+                return None
+            
+            image_url = upload_result.get('public_url')
         
         # Document 객체 생성
         metadata = {
@@ -118,7 +125,7 @@ async def process_image_file(file_content: bytes, file_name: str, file_id: str, 
             'image_count': 1,
             'source': file_name,
             'file_type': file_extension[1:],
-            'image_url': upload_result.get('public_url')
+            'image_url': image_url
         }
         
         # 인스턴스 아이디가 있으면 메타데이터에 추가
@@ -821,6 +828,7 @@ async def save_to_storage(
         # Process the file
         if is_image:
             # Process image file
+            # 이미 files 폴더에 저장했으므로, process_image_file에서는 다시 저장하지 않고 기존 경로 사용
             file_id = storage_file_path.replace('/', '_').replace('\\', '_')
             documents = await process_image_file(
                 file_content, 
@@ -828,12 +836,35 @@ async def save_to_storage(
                 file_id, 
                 tenant_id, 
                 proc_inst_id,
-                storage_type='storage'
+                storage_type='storage',
+                storage_file_path=storage_file_path,
+                public_url=upload_result.get('public_url')
             )
         else:
             # Process document file
             file_io = io.BytesIO(file_content)
             processor = DocumentProcessor()
+            
+            # Extract images from document if supported
+            file_id_for_images = storage_file_path.replace('/', '_').replace('\\', '_')
+            extracted_images = await processor.extract_images_from_document(
+                file_content,
+                file_name,
+                file_id_for_images
+            )
+            
+            # Upload extracted images to storage
+            if extracted_images:
+                from image_storage_utils import ImageStorageUtils
+                storage_utils = ImageStorageUtils()
+                uploaded_images = await storage_utils.upload_images_batch(
+                    extracted_images,
+                    tenant_id,
+                    file_id_for_images
+                )
+                # Store image URLs in metadata for later use
+                image_urls = [img.get('image_url') for img in uploaded_images if img.get('image_url')]
+            
             docs = await processor.load_document(file_io, file_name)
             
             if not docs:
