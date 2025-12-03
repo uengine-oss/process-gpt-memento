@@ -825,6 +825,9 @@ async def save_to_storage(
         image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']
         is_image = file_extension in image_extensions
         
+        # Track if images were extracted and uploaded (for image-only PDFs)
+        has_uploaded_images = False
+        
         # Process the file
         if is_image:
             # Process image file
@@ -864,6 +867,7 @@ async def save_to_storage(
                 )
                 # Store image URLs in metadata for later use
                 image_urls = [img.get('image_url') for img in uploaded_images if img.get('image_url')]
+                has_uploaded_images = len(uploaded_images) > 0
             
             docs = await processor.load_document(file_io, file_name)
             
@@ -889,7 +893,9 @@ async def save_to_storage(
                 if proc_inst_id:
                     doc.metadata['proc_inst_id'] = proc_inst_id
         
-        if not documents:
+        # Only raise exception if no documents AND no images were extracted
+        # If images were extracted and uploaded, it's valid even if documents is empty
+        if not documents and not has_uploaded_images:
             raise HTTPException(status_code=400, detail="No content extracted from file")
         
         # Store in vector database
