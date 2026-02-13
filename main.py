@@ -24,6 +24,7 @@ from form2docx_converter import form_to_docx
 from langchain.schema import Document
 from pathlib import Path
 from googleapiclient.http import MediaIoBaseDownload
+import uuid
 
 
 app = FastAPI(title="Memento Service API", description="API for document processing and querying")
@@ -45,6 +46,10 @@ supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_KEY")
 )
+
+# Drive folder indexing job state (in-memory)
+drive_jobs: Dict[str, dict] = {}
+tenant_active_job: Dict[str, str] = {}
 
 class ProcessRequest(BaseModel):
     storage_type: str = "drive"
@@ -383,6 +388,34 @@ async def process(request: ProcessRequest):
     elif request.storage_type == "storage":
         return await process_supabase_storage(request)
 
+@app.get("/process/drive/status")
+async def get_drive_indexing_status(tenant_id: str):
+    """Get Drive folder indexing job status for polling."""
+    job_id = tenant_active_job.get(tenant_id)
+    if job_id and job_id in drive_jobs:
+        job = drive_jobs[job_id]
+        return {
+            "job_id": job_id,
+            "status": job["status"],
+            "total": job["total"],
+            "processed": job["processed"],
+            "failed": job["failed"],
+            "results": job.get("results"),
+            "error": job.get("error"),
+        }
+    for jid, job in drive_jobs.items():
+        if job.get("tenant_id") == tenant_id and job.get("status") in ("completed", "failed"):
+            return {
+                "job_id": jid,
+                "status": job["status"],
+                "total": job["total"],
+                "processed": job["processed"],
+                "failed": job["failed"],
+                "results": job.get("results"),
+                "error": job.get("error"),
+            }
+    return {"status": "idle"}
+
 @app.post("/process/database")
 async def process_database(request: ProcessRequest):
     return await process_database_records(request)
@@ -451,61 +484,161 @@ async def process_documents(request: ProcessRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+SUPPORTED_MIME_TYPES = [
+    'application/vnd.google-apps.document',
+    'application/vnd.google-apps.spreadsheet',
+    'application/vnd.google-apps.presentation',
+    'application/pdf',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'application/x-hwp',
+    'application/haansofthwp',
+    'application/vnd.hancom.hwp',
+    'application/vnd.hancom.hwpx',
+    'text/plain',
+    'image/jpeg',
+    'image/png',
+    'image/gif',
+    'image/bmp',
+    'image/webp'
+]
+
+IMAGE_MIME_TYPES = [
+    'image/jpeg',
+    'image/png',
+    'image/gif',
+    'image/bmp',
+    'image/webp'
+]
+
+async def _run_drive_folder_async(
+    job_id: str,
+    tenant_id: str,
+    new_files: List[dict],
+    proc_inst_id: Optional[str] = None
+) -> None:
+    """Background task: process unprocessed files in Drive folder, update drive_jobs."""
+    drive_jobs[job_id] = {
+        "tenant_id": tenant_id,
+        "status": "running",
+        "total": len(new_files),
+        "processed": 0,
+        "failed": 0,
+        "results": [],
+        "error": None,
+        "created_at": datetime.now().isoformat()
+    }
+    tenant_active_job[tenant_id] = job_id
+
+    try:
+        drive_loader = GoogleDriveLoader(tenant_id=tenant_id)
+        await drive_loader.authenticate()
+        rag = RAGChain()
+        successful_file_ids = []
+        successful_file_names = []
+        all_documents = []
+
+        for file in new_files:
+            try:
+                file_mime_type = file.get('mimeType', '')
+                is_image = file_mime_type in IMAGE_MIME_TYPES
+
+                if is_image:
+                    request_media = drive_loader.service.files().get_media(fileId=file['id'])
+                    fh = io.BytesIO()
+                    downloader = MediaIoBaseDownload(fh, request_media)
+                    done = False
+                    while not done:
+                        status, done = await asyncio.to_thread(downloader.next_chunk)
+                    fh.seek(0)
+                    file_content = fh.read()
+                    documents = await process_image_file(
+                        file_content, file['name'], file['id'], tenant_id, proc_inst_id, storage_type='drive'
+                    )
+                else:
+                    documents = await drive_loader.download_and_process_file(
+                        file['id'], file['name'], tenant_id
+                    )
+
+                if documents:
+                    for doc in documents:
+                        metadata = {
+                            'file_id': file['id'],
+                            'file_name': file['name'],
+                            'tenant_id': tenant_id,
+                            'storage_type': 'drive'
+                        }
+                        if proc_inst_id:
+                            metadata['proc_inst_id'] = proc_inst_id
+                        doc.metadata.update(metadata)
+                    all_documents.extend(documents)
+                    successful_file_ids.append(file['id'])
+                    successful_file_names.append(file['name'])
+                    drive_jobs[job_id]["results"].append({
+                        "file_id": file['id'],
+                        "file_name": file['name'],
+                        "success": True
+                    })
+                    drive_jobs[job_id]["processed"] += 1
+                else:
+                    drive_jobs[job_id]["results"].append({
+                        "file_id": file['id'],
+                        "file_name": file['name'],
+                        "success": False,
+                        "error": "No content extracted"
+                    })
+                    drive_jobs[job_id]["failed"] += 1
+            except Exception as e:
+                drive_jobs[job_id]["results"].append({
+                    "file_id": file['id'],
+                    "file_name": file.get('name', 'unknown'),
+                    "success": False,
+                    "error": str(e)
+                })
+                drive_jobs[job_id]["failed"] += 1
+                print(f"Error processing file {file.get('name', 'unknown')}: {e}")
+
+        if all_documents:
+            success = await rag.process_and_store_documents(all_documents, tenant_id)
+            if success and successful_file_ids:
+                await rag.save_processed_files(
+                    successful_file_ids,
+                    tenant_id,
+                    successful_file_names
+                )
+
+        drive_jobs[job_id]["status"] = "completed"
+    except Exception as e:
+        drive_jobs[job_id]["status"] = "failed"
+        drive_jobs[job_id]["error"] = str(e)
+        print(f"Drive folder indexing failed: {e}")
+    finally:
+        tenant_active_job.pop(tenant_id, None)
+
 async def process_google_drive(request: ProcessRequest):
     """Process documents from Google Drive folder"""
     try:
-        # Use tenant-level authentication
         drive_loader = GoogleDriveLoader(tenant_id=request.tenant_id)
-        
-        if request.options and request.options.get("proc_inst_id"):
-            proc_inst_id = request.options.get("proc_inst_id")
-        
-        supported_mime_types = [
-            'application/vnd.google-apps.document',
-            'application/vnd.google-apps.spreadsheet',
-            'application/vnd.google-apps.presentation',
-            'application/pdf',
-            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-            'text/plain',
-            'image/jpeg',
-            'image/png',
-            'image/gif',
-            'image/bmp',
-            'image/webp'
-        ]
-        
-        # 이미지 MIME 타입 목록
-        image_mime_types = [
-            'image/jpeg',
-            'image/png',
-            'image/gif',
-            'image/bmp',
-            'image/webp'
-        ]
+        proc_inst_id = request.options.get("proc_inst_id") if request.options else None
 
         # Check if specific file_path is provided
         if hasattr(request, 'file_path') and request.file_path:
-            # Process only the specified file
+            # Process only the specified file (synchronous)
             try:
-                # Assuming file_path contains the file ID
                 file_id = request.file_path
-                # Get file info (you might need to implement this method)
                 file_info = await drive_loader.get_file_info(file_id)
                 if not file_info:
                     raise HTTPException(status_code=404, detail=f"File with ID {file_id} not found")
                 
-                # Check if file is already processed
                 rag = RAGChain()
                 processed_files = await rag.get_processed_files(request.tenant_id)
                 
                 if file_id in processed_files:
                     return {"message": f"File {file_id} has already been processed for tenant {request.tenant_id}"}
                 
-                # Check if file is an image
                 file_mime_type = file_info.get('mimeType', '')
-                is_image = file_mime_type in image_mime_types
+                is_image = file_mime_type in IMAGE_MIME_TYPES
                 
                 if is_image:
                     # Process image file
@@ -554,96 +687,39 @@ async def process_google_drive(request: ProcessRequest):
                 raise HTTPException(status_code=500, detail=f"Error processing file {file_id}: {str(e)}")
         
         else:
-            # Original logic: process all new files
+            # Async folder indexing: process all unprocessed files in background
             try:
-                # Get list of files from Google Drive
-                files = await drive_loader.list_files(supported_mime_types)
+                files = await drive_loader.list_files(SUPPORTED_MIME_TYPES)
             except ValueError as e:
-                # Authentication error - return login URL
                 if "No valid Google credentials found" in str(e) or "Authentication failed" in str(e):
                     auth_response = create_auth_error_response(
                         request.tenant_id,
                         "Google Drive authentication required to process documents"
                     )
-                    return JSONResponse(
-                        status_code=401,
-                        content=auth_response
-                    )
-                else:
-                    raise e
-            
+                    return JSONResponse(status_code=401, content=auth_response)
+                raise e
+
             if not files:
                 return {"message": f"No documents found in Google Drive folder for tenant {request.tenant_id}"}
-                
+
             rag = RAGChain()
-            
-            # Get list of already processed files for this tenant
             processed_files = await rag.get_processed_files(request.tenant_id)
-            
-            # Filter out already processed files
             new_files = [f for f in files if f['id'] not in processed_files]
-            
+
             if not new_files:
                 return {"message": f"No new documents to process for tenant {request.tenant_id}"}
-                
-            # Process only new files
-            all_documents = []
-            for file in new_files:
-                try:
-                    # Check if file is an image
-                    file_mime_type = file.get('mimeType', '')
-                    is_image = file_mime_type in image_mime_types
-                    
-                    if is_image:
-                        # Process image file
-                        request_media = drive_loader.service.files().get_media(fileId=file['id'])
-                        fh = io.BytesIO()
-                        downloader = MediaIoBaseDownload(fh, request_media)
-                        done = False
-                        
-                        while not done:
-                            status, done = await asyncio.to_thread(downloader.next_chunk)
-                        
-                        fh.seek(0)
-                        file_content = fh.read()
-                        
-                        documents = await process_image_file(file_content, file['name'], file['id'], request.tenant_id, proc_inst_id, storage_type='drive')
-                    else:
-                        # Process document file
-                        documents = await drive_loader.download_and_process_file(file['id'], file['name'], request.tenant_id)
-                    
-                    if documents:
-                        # Update metadata for each document
-                        for doc in documents:
-                            metadata = {
-                                'file_id': file['id'],
-                                'file_name': file['name'],
-                                'tenant_id': request.tenant_id,
-                                'storage_type': 'drive'
-                            }
-                            if proc_inst_id:
-                                metadata['proc_inst_id'] = proc_inst_id
-                            doc.metadata.update(metadata)
-                        all_documents.extend(documents)
-                except Exception as e:
-                    # Skip files that can't be processed
-                    print(f"Error processing file {file.get('name', 'unknown')}: {e}")
-                    continue
-            
-            if all_documents:
-                success = await rag.process_and_store_documents(all_documents, request.tenant_id)
-                if success:
-                    # Save the list of processed files
-                    await rag.save_processed_files(
-                        [f['id'] for f in new_files],
-                        request.tenant_id,
-                        [f['name'] for f in new_files]
-                    )
-                    return {"message": f"Successfully processed {len(new_files)} new documents"}
-                else:
-                    raise HTTPException(status_code=500, detail="Failed to process and store documents")
-            else:
-                return {"message": f"No new content to process for tenant {request.tenant_id}"}
+
+            job_id = str(uuid.uuid4())
+            asyncio.create_task(_run_drive_folder_async(
+                job_id=job_id,
+                tenant_id=request.tenant_id,
+                new_files=new_files,
+                proc_inst_id=proc_inst_id
+            ))
+            return JSONResponse(
+                status_code=202,
+                content={"job_id": job_id, "message": "인덱싱이 시작되었습니다"}
+            )
                 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

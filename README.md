@@ -129,6 +129,8 @@ python test_image_extraction.py
 | DOCX | ✅ | ✅ | JPG, PNG, GIF |
 | PPTX | ✅ | ✅ | JPG, PNG, GIF |
 | TXT | ✅ | ❌ | - |
+| HWP | ✅ | ❌ | - |
+| HWPX | ✅ | ❌ | - |
 
 ## 문제 해결
 

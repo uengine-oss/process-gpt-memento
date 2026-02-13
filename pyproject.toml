@@ -62,6 +62,7 @@ dependencies = [
     "pandas==2.2.1",
     "pillow==10.0.1",
     "process-gpt-llm-factory==1.0.1",
+    "extract-hwp>=0.1.0",
     "pydantic==2.7.4",
     "pyjwt>=2.8.0",
     "pymupdf==1.23.8",

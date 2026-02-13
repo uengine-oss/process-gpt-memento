@@ -25,6 +25,7 @@ setuptools = "==39.1.0"
 requests = "*"
 pymupdf = "*"
 docx = "*"
+extract-hwp = ">=0.1.0"
 
 [dev-packages]
 
