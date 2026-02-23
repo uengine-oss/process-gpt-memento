@@ -43,12 +43,6 @@ class VectorStoreManager:
             processed_documents = []
             
             for doc in documents:
-                print(f"Processing document: {doc.metadata.get('file_name', 'unknown')}")
-                
-                # 이미지 분석이 이미 완료되었으므로 추가 처리 불필요
-                if 'extracted_images' in doc.metadata and doc.metadata['extracted_images']:
-                    print(f"Found {len(doc.metadata['extracted_images'])} extracted images (analysis already completed)")
-                
                 # 메타데이터 업데이트
                 doc.metadata.update({
                     'tenant_id': tenant_id,
@@ -61,7 +55,6 @@ class VectorStoreManager:
                     doc.metadata['source'] = "Unknown"
                     
                 processed_documents.append(doc)
-                print(f"Document processed successfully. Content length: {len(doc.page_content)}")
             
             print(f"Generating embeddings for {len(processed_documents)} documents...")
             texts = [doc.page_content for doc in processed_documents]
@@ -82,101 +75,96 @@ class VectorStoreManager:
                     print(f"Error inserting document {i+1}: {e}")
                     continue
             
-            # 문서 저장 후 이미지 정보 저장 (이미지 분석 결과도 임베딩하여 저장)
-            for doc in processed_documents:
-                if 'extracted_images' in doc.metadata and doc.metadata['extracted_images']:
-                    doc_id = doc.metadata.get('id')
-                    print(f"Saving image metadata to database for document: {doc_id}")
-                    
-                    # 이미지 분석 결과가 이미 메타데이터에 포함되어 있음
-                    await self._save_image_metadata(
-                        doc.metadata['extracted_images'], 
-                        doc_id, 
-                        tenant_id,
-                        doc.metadata.get('image_analysis', [])
-                    )
-            
+            # 이미지 메타데이터: image_analysis가 있는 청크만 처리 (해당 페이지 청크에만 이미지 있음)
+            await self._save_image_metadata_once(processed_documents, tenant_id)
+
             return True
         except Exception as e:
             print(f"Error adding documents to vector store: {e}")
             return False
 
-    async def _save_image_metadata(self, images: List[Dict], document_id: str, tenant_id: str, image_analysis: List[Dict]):
-        """이미지 메타데이터를 별도 테이블에 저장하고 이미지 분석 결과도 임베딩하여 저장 - URL 기반 버전"""
+    async def _save_image_metadata_once(
+        self, processed_documents: List[Document], tenant_id: str
+    ) -> None:
+        """이미지 메타데이터를 고유 이미지당 1회만 저장 (image_analysis가 있는 청크만 처리)"""
         try:
-            # 이미지 분석 결과를 image_id로 매핑
-            analysis_map = {analysis['image_id']: analysis for analysis in image_analysis}
-            
-            for image in images:
-                try:
-                    image_id = image.get('image_id', 'unknown')
-                    image_name = image.get('image_name', 'unknown')
-                    
-                    # 이미지 분석 결과 가져오기
-                    analysis_result = analysis_map.get(image_id, {})
-                    analysis_text = analysis_result.get('analysis', '')
+            # 이미 저장한 image_id (임베딩 중복 방지)
+            saved_embedding_ids: set = set()
+            total_images_saved = 0
 
-                    # 이미지 분석 텍스트가 있으면 임베딩 생성
-                    image_embedding = None
-                    if analysis_text:
+            for doc in processed_documents:
+                image_analysis = doc.metadata.get('image_analysis') or []
+                if not image_analysis:
+                    continue
+
+                doc_id = doc.metadata.get('id')
+                # extracted_images에서 image_id -> 전체 이미지 정보 매핑
+                extracted_map = {
+                    img.get('image_id'): img
+                    for img in (doc.metadata.get('extracted_images') or [])
+                }
+
+                for analysis in image_analysis:
+                    image_id = analysis.get('image_id')
+                    if not image_id:
+                        continue
+                    image_info = extracted_map.get(image_id)
+                    if not image_info:
+                        continue
+
+                    analysis_text = analysis.get('analysis', '')
+                    image_name = image_info.get('image_name', image_id)
+
+                    # 임베딩: 고유 image_id당 1회만 생성
+                    if analysis_text and image_id not in saved_embedding_ids:
                         try:
                             image_embedding = self.embeddings.embed_query(analysis_text)
-                            print(f"Generated embedding for image {image_id}")
-                        except Exception as embed_error:
-                            print(f"Error generating embedding for image {image_id}: {embed_error}")
-                    
-                    # 이미지 메타데이터 저장 (URL 기반, base64 데이터 제거)
+                            saved_embedding_ids.add(image_id)
+                            image_doc_data = {
+                                "id": str(uuid.uuid4()),
+                                "content": analysis_text,
+                                "metadata": {
+                                    "type": "image_analysis",
+                                    "image_id": image_id,
+                                    "document_id": doc_id,
+                                    "tenant_id": tenant_id,
+                                    "source": "image_extraction",
+                                    "file_name": str(image_name),
+                                    "image_url": image_info.get('image_url', ''),
+                                },
+                                "embedding": image_embedding,
+                            }
+                            self.supabase.table("documents").insert(image_doc_data).execute()
+                        except Exception as e:
+                            print(f"Error generating embedding for image {image_id}: {e}")
+
+                    # document_images 테이블에 저장 (청크-이미지 매핑)
                     image_data = {
                         "id": str(uuid.uuid4()),
-                        "document_id": document_id,
+                        "document_id": doc_id,
                         "tenant_id": tenant_id,
                         "image_id": image_id,
-                        "image_url": image.get('image_url', ''),
-                        "metadata": image.get('metadata', {})
+                        "image_url": image_info.get('image_url', ''),
+                        "metadata": image_info.get('metadata', {}),
                     }
-                    
-                    # 이미지 임베딩이 있으면 별도로 저장 (documents 테이블에)
-                    if image_embedding:
-                        # 이미지 분석 결과를 별도 문서로 저장하여 검색 가능하게 함
-                        image_doc_data = {
-                            "id": str(uuid.uuid4()),
-                            "content": analysis_text,
-                            "metadata": {
-                                "type": "image_analysis",
-                                "image_id": image_id,
-                                "document_id": document_id,
-                                "tenant_id": tenant_id,
-                                "source": "image_extraction",
-                                "file_name": f"{image_name}",
-                                "image_url": image.get('image_url', '')
-                            },
-                            "embedding": image_embedding
-                        }
-                        
-                        # 이미지 분석 결과를 documents 테이블에 저장
-                        self.supabase.table("documents").insert(image_doc_data).execute()
-                        print(f"Saved image analysis embedding for image: {image_id}")
-
-                    # document_images 테이블에 이미지 메타데이터 저장
                     self.supabase.table("document_images").insert(image_data).execute()
-                    print(f"Successfully saved image metadata for image: {image_id}")
-                    
-                except Exception as img_error:
-                    print(f"Error saving metadata for individual image {image.get('image_id', 'unknown')}: {img_error}")
-                    continue
-        except Exception as e:
-            print(f"Error in _save_image_metadata: {e}")
+                    total_images_saved += 1
 
-    async def similarity_search(self, query: str, filter: Optional[Dict[str, Any]] = None) -> List[Document]:
+            if total_images_saved:
+                print(f"Saved image metadata: {total_images_saved} chunk-image link(s), {len(saved_embedding_ids)} unique image embedding(s)")
+        except Exception as e:
+            print(f"Error in _save_image_metadata_once: {e}")
+
+    async def similarity_search(self, query: str, filter: Optional[Dict[str, Any]] = None, top_k: int = 5) -> List[Document]:
         """Search for similar documents asynchronously."""
         try:
             print(f"Searching for documents similar to query: {query}")
-            return await asyncio.to_thread(self._similarity_search_sync, query, filter)
+            return await asyncio.to_thread(self._similarity_search_sync, query, filter, top_k)
         except Exception as e:
             print(f"Error searching documents: {e}")
             return []
 
-    def _similarity_search_sync(self, query: str, filter: Optional[Dict[str, Any]] = None) -> List[Document]:
+    def _similarity_search_sync(self, query: str, filter: Optional[Dict[str, Any]] = None, top_k: int = 5) -> List[Document]:
         try:
             if not filter:
                 filter = {}
@@ -186,7 +174,7 @@ class VectorStoreManager:
                 {
                     'query_embedding': query_embedding,
                     'filter': filter,
-                    'match_count': 5
+                    'match_count': top_k
                 }
             ).execute()
             results = []
@@ -201,7 +189,104 @@ class VectorStoreManager:
         except Exception as e:
             print(f"Error searching documents: {e}")
             return []
-    
-    def get_retriever(self, **kwargs):
+
+    def get_retriever(self, top_k: int = 5, **kwargs):
         """Get a retriever for the vector store."""
-        return self.vector_store.as_retriever(search_kwargs={"k": 5}) 
+        return self.vector_store.as_retriever(search_kwargs={"k": top_k})
+
+    async def get_chunks_by_indices(
+        self,
+        tenant_id: str,
+        file_name: str,
+        chunk_indices: List[int],
+    ) -> List[Document]:
+        """Supabase documents 테이블에서 chunk_index 리스트로 청크를 직접 조회한다."""
+        try:
+            return await asyncio.to_thread(
+                self._get_chunks_by_indices_sync, tenant_id, file_name, chunk_indices
+            )
+        except Exception as e:
+            print(f"Error fetching chunks by indices: {e}")
+            return []
+
+    def _get_chunks_by_indices_sync(
+        self,
+        tenant_id: str,
+        file_name: str,
+        chunk_indices: List[int],
+    ) -> List[Document]:
+        """chunk_indices가 비어있거나 조회 실패 시 빈 리스트를 반환한다.
+
+        Supabase PostgREST는 JSONB 경로(metadata->>) + .in_() 조합이 불안정하므로
+        해당 문서의 모든 청크를 가져온 뒤 Python에서 필터링한다.
+        """
+        if not chunk_indices:
+            return []
+        target_set = {int(i) for i in chunk_indices}
+        try:
+            response = (
+                self.supabase.table("documents")
+                .select("content, metadata")
+                .eq("metadata->>tenant_id", tenant_id)
+                .eq("metadata->>file_name", file_name)
+                .execute()
+            )
+            results = []
+            for row in response.data or []:
+                meta = row.get("metadata") or {}
+                if meta.get("type") == "image_analysis":
+                    continue
+                try:
+                    idx = int(meta.get("chunk_index", -1))
+                except (TypeError, ValueError):
+                    idx = -1
+                if idx in target_set:
+                    results.append(Document(
+                        page_content=row.get("content") or "",
+                        metadata=meta,
+                    ))
+            print(f"Fetched {len(results)} chunks by indices for {file_name}")
+            return results
+        except Exception as e:
+            print(f"Error in _get_chunks_by_indices_sync: {e}")
+            return []
+
+    async def get_all_chunks_metadata(
+        self, tenant_id: str, file_name: str
+    ) -> List[Dict[str, Any]]:
+        """특정 문서의 모든 청크 메타데이터(chunk_index, section_title, page_number 등)를 반환한다."""
+        try:
+            return await asyncio.to_thread(
+                self._get_all_chunks_metadata_sync, tenant_id, file_name
+            )
+        except Exception as e:
+            print(f"Error fetching chunks metadata: {e}")
+            return []
+
+    def _get_all_chunks_metadata_sync(
+        self, tenant_id: str, file_name: str
+    ) -> List[Dict[str, Any]]:
+        try:
+            response = (
+                self.supabase.table("documents")
+                .select("metadata")
+                .eq("metadata->>tenant_id", tenant_id)
+                .eq("metadata->>file_name", file_name)
+                .order("metadata->>chunk_index")
+                .execute()
+            )
+            results = []
+            for row in response.data or []:
+                meta = row["metadata"] or {}
+                if meta.get("type") == "image_analysis":
+                    continue
+                results.append({
+                    "chunk_index": meta.get("chunk_index"),
+                    "section_title": meta.get("section_title") or meta.get("content", "")[:50],
+                    "page_number": meta.get("page_number") or meta.get("page"),
+                    "content_length": meta.get("content_length"),
+                })
+            return results
+        except Exception as e:
+            print(f"Error in _get_all_chunks_metadata_sync: {e}")
+            return []

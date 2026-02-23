@@ -3,6 +3,7 @@ Document loader and processor
 """
 import os
 import re
+import docx
 import uuid
 import tempfile
 import asyncio
@@ -10,8 +11,10 @@ import io
 import zipfile
 from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
+from pydantic import BaseModel
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from openai import OpenAI
 from langchain_community.document_loaders import (
     UnstructuredWordDocumentLoader,
     UnstructuredPowerPointLoader,
@@ -21,6 +24,11 @@ from langchain_community.document_loaders import (
     TextLoader
 )
 import fitz  # PyMuPDF for PDF image extraction
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
 
 # Allow loading vendored extract_hwp when the installed extract-hwp package has no module (PyPI 0.1.0 packaging bug)
 _vendor_dir = Path(__file__).resolve().parent / "vendor"
@@ -94,6 +102,197 @@ class DocumentProcessor:
             length_function=len,
             is_separator_regex=False
         )
+        self._openai_client: Optional[OpenAI] = None
+
+    def _get_openai_client(self) -> OpenAI:
+        if self._openai_client is None:
+            self._openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        return self._openai_client
+
+    async def _generate_section_title_single(
+        self, content: str, semaphore: asyncio.Semaphore
+    ) -> str:
+        """청크 1개의 section_title을 Structured Output으로 생성한다."""
+
+        class _TitleResponse(BaseModel):
+            title: str
+
+        snippet = content[:300].replace("\n", " ")
+        async with semaphore:
+            try:
+                client = self._get_openai_client()
+                response = await asyncio.to_thread(
+                    client.beta.chat.completions.parse,
+                    model="gpt-4o-mini",
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            "다음 문서 내용에 어울리는 소제목(10자 이내)을 생성하세요.\n\n"
+                            f"{snippet}"
+                        ),
+                    }],
+                    response_format=_TitleResponse,
+                    temperature=0,
+                    max_tokens=50,
+                )
+                parsed = response.choices[0].message.parsed
+                return parsed.title.strip() if parsed else ""
+            except Exception as e:
+                print(f"section_title 생성 실패: {e}")
+                return ""
+
+    async def _generate_section_titles(self, chunks: List[Document]) -> List[str]:
+        """청크별 section_title을 병렬로 생성한다 (Structured Output 사용).
+
+        동시 요청 수를 semaphore로 제한해 rate limit를 방지한다.
+        """
+        semaphore = asyncio.Semaphore(10)
+        tasks = [
+            self._generate_section_title_single(chunk.page_content or "", semaphore)
+            for chunk in chunks
+        ]
+        return list(await asyncio.gather(*tasks))
+
+    def _load_docx_with_python_docx(self, tmp_path: str, file_name: str) -> List[Document]:
+        """DOCX 텍스트 추출 paragraph + table 셀 텍스트."""
+        if docx is None:
+            raise RuntimeError("python-docx is not installed")
+        doc = docx.Document(tmp_path)
+        parts = []
+        for p in doc.paragraphs:
+            if p.text.strip():
+                parts.append(p.text)
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell.text.strip():
+                        parts.append(cell.text)
+        text = "\n\n".join(parts) if parts else ""
+        return [Document(page_content=text)]
+
+    @staticmethod
+    def _table_to_markdown(table: List[List[Any]]) -> str:
+        """표를 마크다운 형식으로 변환"""
+        if not table or len(table) == 0:
+            return ""
+        markdown = []
+        header = table[0]
+        markdown.append("| " + " | ".join(str(cell) if cell is not None and cell != "" else "" for cell in header) + " |")
+        markdown.append("| " + " | ".join(["---"] * len(header)) + " |")
+        for row in table[1:]:
+            markdown.append("| " + " | ".join(str(cell) if cell is not None and cell != "" else "" for cell in row) + " |")
+        return "\n".join(markdown)
+
+    @staticmethod
+    def _get_text_blocks_outside_tables(page: Any, table_bboxes: List[tuple]) -> List[Dict[str, Any]]:
+        """표 영역을 제외하고 y좌표별 텍스트 블록 추출 (pdfplumber Page 사용)"""
+        def word_in_bbox(word: Dict, bbox: tuple) -> bool:
+            x0, top, x1, bottom = bbox
+            h_mid = (word["x0"] + word["x1"]) / 2
+            v_mid = (word["top"] + word["bottom"]) / 2
+            return x0 <= h_mid <= x1 and top <= v_mid <= bottom
+
+        try:
+            all_words = page.extract_words()
+        except Exception:
+            return []
+        words = [w for w in all_words if not any(word_in_bbox(w, bbox) for bbox in table_bboxes)]
+        if not words:
+            return []
+
+        lines: Dict[float, List[tuple]] = {}
+        for word in words:
+            y = round(word["top"], 1)
+            if y not in lines:
+                lines[y] = []
+            lines[y].append((word["x0"], word.get("text", "")))
+
+        text_blocks = []
+        current_block: List[tuple] = []
+        prev_y = None
+        for y in sorted(lines.keys()):
+            line_words = sorted(lines[y], key=lambda x: x[0])
+            line_text = " ".join(w[1] for w in line_words)
+            if prev_y is not None and (y - prev_y) > 20:
+                if current_block:
+                    text_blocks.append({
+                        "type": "text",
+                        "y": current_block[0][0],
+                        "content": "\n".join(line[1] for line in current_block),
+                    })
+                current_block = []
+            current_block.append((y, line_text))
+            prev_y = y
+        if current_block:
+            text_blocks.append({
+                "type": "text",
+                "y": current_block[0][0],
+                "content": "\n".join(line[1] for line in current_block),
+            })
+        return text_blocks
+
+    def _load_pdf_with_pdfplumber(self, tmp_path: str, file_name: str) -> List[Document]:
+        """pdfplumber로 PDF 파싱: 표, 텍스트, 이미지 플레이스홀더를 y좌표 순서대로 결합"""
+        documents = []
+        with pdfplumber.open(tmp_path) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                elements: List[Dict[str, Any]] = []
+                tables = page.find_tables()
+                for table in tables:
+                    try:
+                        extracted = table.extract()
+                        if extracted:
+                            elements.append({
+                                "type": "table",
+                                "y": table.bbox[1],
+                                "content": extracted,
+                            })
+                    except Exception:
+                        continue
+                table_bboxes = [t.bbox for t in tables]
+                text_blocks = self._get_text_blocks_outside_tables(page, table_bboxes)
+                elements.extend(text_blocks)
+
+                # 이미지 플레이스홀더를 y좌표 기준으로 텍스트/표 사이에 삽입
+                try:
+                    for img_index, img in enumerate(page.images):
+                        top = img.get("top")
+                        if top is not None:
+                            elements.append({
+                                "type": "image_placeholder",
+                                "y": top,
+                                "image_index": img_index,
+                                "page_num_1based": page_num + 1,
+                            })
+                except Exception:
+                    pass
+
+                elements.sort(key=lambda x: x["y"])
+
+                parts = []
+                for elem in elements:
+                    if elem["type"] == "text":
+                        if elem.get("content"):
+                            parts.append(elem["content"])
+                    elif elem["type"] == "table":
+                        md = self._table_to_markdown(elem.get("content"))
+                        if md:
+                            parts.append(md)
+                    elif elem["type"] == "image_placeholder":
+                        parts.append(
+                            f"__IMAGE_PLACEHOLDER_p{elem['page_num_1based']}_i{elem['image_index']}__"
+                        )
+
+                page_content = "\n\n".join(parts) if parts else ""
+                doc = Document(
+                    page_content=page_content,
+                    metadata={
+                        "source": file_name,
+                        "page": page_num,
+                    },
+                )
+                documents.append(doc)
+        return documents
 
     async def load_document(self, file_content: bytes, file_name: str) -> Optional[List[Document]]:
         """Async: Load a document from memory (BytesIO object)."""
@@ -110,8 +309,11 @@ class DocumentProcessor:
                     await asyncio.to_thread(tmp.write, file_content.read())
                     tmp_path = tmp.name
                 try:
-                    loader = UnstructuredWordDocumentLoader(tmp_path, mode="single")
-                    documents = await asyncio.to_thread(loader.load)
+                    documents = await asyncio.to_thread(
+                        self._load_docx_with_python_docx,
+                        tmp_path,
+                        file_name
+                    )
                 finally:
                     await asyncio.to_thread(os.unlink, tmp_path)
             elif file_extension == '.pptx':
@@ -135,13 +337,13 @@ class DocumentProcessor:
                 finally:
                     await asyncio.to_thread(os.unlink, tmp_path)
             elif file_extension == '.pdf':
-                # Save BytesIO to temporary file
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
                     await asyncio.to_thread(tmp.write, file_content.read())
                     tmp_path = tmp.name
                 try:
-                    loader = PyPDFLoader(tmp_path)
-                    documents = await asyncio.to_thread(loader.load)
+                    documents = await asyncio.to_thread(
+                        self._load_pdf_with_pdfplumber, tmp_path, file_name
+                    )
                 finally:
                     await asyncio.to_thread(os.unlink, tmp_path)
             elif file_extension in ('.hwp', '.hwpx'):
@@ -190,16 +392,30 @@ class DocumentProcessor:
             
             # Split documents into chunks
             chunks = await asyncio.to_thread(self.text_splitter.split_documents, documents)
-            
+
             # Add chunk information to metadata
             for i, chunk in enumerate(chunks):
-                chunk_id = str(uuid.uuid4())  # Generate a unique ID for each chunk
+                chunk_id = str(uuid.uuid4())
                 chunk.metadata.update({
                     "chunk_id": chunk_id,
                     "chunk_index": i,
-                    "total_chunks": len(chunks)
+                    "total_chunks": len(chunks),
+                    "content_length": len(chunk.page_content or ""),
                 })
-            
+                # PDF 등: 0-based page가 있으면 1-based page_number 추가 (이미지 page_number와 일치)
+                if "page" in chunk.metadata and chunk.metadata["page"] is not None:
+                    try:
+                        chunk.metadata["page_number"] = int(chunk.metadata["page"]) + 1
+                    except (TypeError, ValueError):
+                        pass
+
+            # LLM으로 각 청크에 section_title 생성
+            print(f"Generating section_title for {len(chunks)} chunks...")
+            section_titles = await self._generate_section_titles(chunks)
+            for chunk, title in zip(chunks, section_titles):
+                if title:
+                    chunk.metadata["section_title"] = title
+
             return chunks
         except Exception as e:
             print(f"Error processing documents: {e}")

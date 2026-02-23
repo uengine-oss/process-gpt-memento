@@ -65,6 +65,7 @@ dependencies = [
     "extract-hwp>=0.1.0",
     "pydantic==2.7.4",
     "pyjwt>=2.8.0",
+    "pdfplumber>=0.10.0",
     "pymupdf==1.23.8",
     "pypdf==4.0.1",
     "python-dateutil==2.8.2",

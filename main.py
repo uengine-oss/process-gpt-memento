@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Request, Response
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2AuthorizationCodeBearer
 from pydantic import BaseModel
@@ -228,12 +228,22 @@ async def get_google_auth_status(tenant_id: str):
         return {"authenticated": False, "message": str(e)}
 
 @app.get("/retrieve")
-async def retrieve(query: str, tenant_id: str, proc_inst_id: Optional[str] = None):
+async def retrieve(
+    query: str,
+    tenant_id: str,
+    proc_inst_id: Optional[str] = None,
+    all_docs: bool = False,
+    top_k: int = Query(default=5, ge=1, le=100),
+):
     try:
         if proc_inst_id:
             metadata_filter = {
                 "tenant_id": tenant_id,
                 "proc_inst_id": proc_inst_id
+            }
+        elif all_docs:
+            metadata_filter = {
+                "tenant_id": tenant_id
             }
         else:
             metadata_filter = {
@@ -243,7 +253,7 @@ async def retrieve(query: str, tenant_id: str, proc_inst_id: Optional[str] = Non
 
         rag = RAGChain()
 
-        result = await rag.retrieve(query, metadata_filter)
+        result = await rag.retrieve(query, metadata_filter, top_k=top_k)
         docs = result["source_documents"]
 
         return {
@@ -254,6 +264,49 @@ async def retrieve(query: str, tenant_id: str, proc_inst_id: Optional[str] = Non
             }
         }
         
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/documents/chunks-metadata")
+async def get_chunks_metadata(tenant_id: str, file_name: str):
+    """특정 문서의 모든 청크 메타데이터(chunk_index, section_title, page_number 등)를 반환한다."""
+    try:
+        from vector_store import VectorStoreManager
+        vsm = VectorStoreManager()
+        chunks = await vsm.get_all_chunks_metadata(tenant_id=tenant_id, file_name=file_name)
+        return {
+            "file_name": file_name,
+            "total_chunks": len(chunks),
+            "chunks": chunks,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class RetrieveByIndicesRequest(BaseModel):
+    tenant_id: str
+    file_name: str
+    chunk_indices: List[int]
+
+
+@app.post("/retrieve-by-indices")
+async def retrieve_by_indices(request: RetrieveByIndicesRequest):
+    """LLM이 선택한 chunk_index 리스트로 청크를 직접 조회한다."""
+    try:
+        from vector_store import VectorStoreManager
+        vsm = VectorStoreManager()
+        docs = await vsm.get_chunks_by_indices(
+            tenant_id=request.tenant_id,
+            file_name=request.file_name,
+            chunk_indices=request.chunk_indices,
+        )
+        return {
+            "response": [
+                {"page_content": doc.page_content, "metadata": doc.metadata}
+                for doc in docs
+            ]
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -494,6 +547,8 @@ SUPPORTED_MIME_TYPES = [
     'application/vnd.openxmlformats-officedocument.presentationml.presentation',
     'application/x-hwp',
     'application/haansofthwp',
+    'application/haansoftpdf',
+    'application/haansoftdocx',
     'application/vnd.hancom.hwp',
     'application/vnd.hancom.hwpx',
     'text/plain',

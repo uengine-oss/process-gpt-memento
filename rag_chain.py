@@ -1,4 +1,5 @@
 import os
+import re
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -65,12 +66,12 @@ class RAGChain:
             return 'ko'
         return 'en'
 
-    async def retrieve(self, query: str, filter: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def retrieve(self, query: str, filter: Optional[Dict[str, Any]] = None, top_k: int = 5) -> Dict[str, Any]:
         """Retrieve documents from the vector store."""
         try:
             print(f"\nProcessing query: {query}")
             
-            docs = await self.vector_store.similarity_search(query, filter=filter)
+            docs = await self.vector_store.similarity_search(query, filter=filter, top_k=top_k)
             
             if not docs:
                 return {
@@ -148,19 +149,45 @@ class RAGChain:
             print(f"Error in process_and_store_documents: {e}")
             return False
 
-    async def process_document_images(self, documents: list[Document]) -> None:
-        """문서들의 이미지를 분석하고 내용에 추가하는 별도 함수"""
+    def _image_index_from_id(self, image_id: str) -> Optional[int]:
+        """image_id에서 페이지 내 이미지 인덱스 추출 (예: xxx_page12_img0 -> 0)"""
+        if not image_id or "_img" not in image_id:
+            return None
         try:
+            part = image_id.split("_img")[-1]
+            return int(part)
+        except (IndexError, ValueError):
+            return None
+
+    def _get_image_page_number(self, image_info: Dict[str, Any]) -> Optional[int]:
+        """이미지 메타데이터에서 페이지 번호 추출 (1-based). PDF: page_number, image_id 내 page 도 활용."""
+        meta = image_info.get('metadata') or {}
+        if meta.get('page_number') is not None:
+            return int(meta['page_number'])
+        # image_id 형식: {file_id}_page{num}_img{idx} (PDF)
+        image_id = image_info.get('image_id', '')
+        if '_page' in image_id:
+            try:
+                part = image_id.split('_page')[1]
+                page_str = part.split('_')[0]
+                return int(page_str)
+            except (IndexError, ValueError):
+                pass
+        return None
+
+    async def process_document_images(self, documents: list[Document]) -> None:
+        """문서들의 이미지를 분석하고, 해당 이미지가 나오는 페이지/구간의 청크에만 설명 추가."""
+        try:
+            # 1) 고유 이미지 수집 (image_id 기준, 한 번만 분석)
+            unique_images: Dict[str, Dict[str, Any]] = {}
             for doc in documents:
-                images_to_analyze = []
-                
-                # 문서에서 추출된 이미지들 (extracted_images)
                 if 'extracted_images' in doc.metadata and doc.metadata['extracted_images']:
-                    images_to_analyze.extend(doc.metadata['extracted_images'])
-                
-                # 단일 이미지 파일인 경우 (image_url이 있지만 extracted_images는 없음)
+                    for img in doc.metadata['extracted_images']:
+                        iid = img.get('image_id')
+                        if iid and iid not in unique_images:
+                            unique_images[iid] = img
+                # 단일 이미지 파일 (extracted_images 없는 경우)
                 if 'image_url' in doc.metadata and doc.metadata.get('image_url'):
-                    # extracted_images에 포함되지 않은 단일 이미지 파일
                     if not ('extracted_images' in doc.metadata and doc.metadata['extracted_images']):
                         image_info = {
                             'image_id': doc.metadata.get('file_id', doc.metadata.get('file_name', 'unknown')),
@@ -171,27 +198,117 @@ class RAGChain:
                                 'image_index': 0
                             }
                         }
-                        images_to_analyze.append(image_info)
-                
-                if images_to_analyze:
-                    print(f"Analyzing {len(images_to_analyze)} images in document")
-                    
-                    # 이미지 분석 수행
-                    analyzed_images = await self.analyze_images_with_llm(images_to_analyze)
-                    
-                    # 분석 결과를 문서 메타데이터에 추가
-                    doc.metadata['image_analysis'] = analyzed_images
-                    
-                    # 이미지 설명을 문서 내용에 추가 (검색 가능하도록)
-                    image_descriptions = []
-                    for img_analysis in analyzed_images:
-                        if img_analysis.get('analysis'):
-                            image_descriptions.append(f"이미지 {img_analysis['image_id']}: {img_analysis['analysis']}")
-                    
-                    if image_descriptions:
-                        doc.page_content += "\n\n[이미지 내용]\n" + "\n".join(image_descriptions)
-                        print(f"Added {len(image_descriptions)} image descriptions to document content")
-                        
+                        unique_images[image_info['image_id']] = image_info
+                        # 단일 이미지는 해당 doc에만 넣기 위해 doc 참조 보관 (아래에서 처리)
+            unique_list = list(unique_images.values())
+            if not unique_list:
+                return
+
+            # 2) 고유 이미지만 1회 분석
+            print(f"Analyzing {len(unique_list)} unique images (once per document set)...")
+            analyzed_list = await self.analyze_images_with_llm(unique_list)
+            # image_id -> 분석 텍스트, 페이지(1-based)
+            analysis_by_id: Dict[str, tuple[str, Optional[int]]] = {}
+            for img in analyzed_list:
+                iid = img.get('image_id')
+                if not iid:
+                    continue
+                analysis_text = img.get('analysis') or ""
+                page_num = None
+                orig = unique_images.get(iid)
+                if orig:
+                    page_num = self._get_image_page_number(orig)
+                analysis_by_id[iid] = (analysis_text, page_num)
+
+            # 3) (page_1based, img_index) -> (image_id, analysis_text) 역방향 매핑 구성
+            placeholder_map: Dict[tuple, tuple] = {}
+            for iid, (analysis_text, page_1based) in analysis_by_id.items():
+                img_index = self._image_index_from_id(iid)
+                if page_1based is not None and img_index is not None and analysis_text:
+                    placeholder_map[(page_1based, img_index)] = (iid, analysis_text)
+
+            placeholder_re = re.compile(r"__IMAGE_PLACEHOLDER_p(\d+)_i(\d+)__")
+
+            # 4) 청크별 처리
+            for doc in documents:
+                is_single_image_doc = (
+                    doc.metadata.get('image_url')
+                    and not (doc.metadata.get('extracted_images'))
+                )
+
+                # 단일 이미지 파일(PNG/JPG 등): 기존 방식으로 텍스트 끝에 추가
+                if is_single_image_doc:
+                    chunk_image_analyses = []
+                    for iid, (analysis_text, _) in analysis_by_id.items():
+                        if not analysis_text:
+                            continue
+                        doc_iid = doc.metadata.get('file_id', doc.metadata.get('file_name', 'unknown'))
+                        if iid != doc_iid:
+                            continue
+                        chunk_image_analyses.append({
+                            'image_id': iid,
+                            'analysis': analysis_text,
+                            'metadata': unique_images.get(iid, {}).get('metadata', {}),
+                            'image_url': unique_images.get(iid, {}).get('image_url', '')
+                        })
+                    if chunk_image_analyses:
+                        doc.page_content += "\n\n" + "\n\n".join(
+                            f"[이미지]\n{a['analysis']}" for a in chunk_image_analyses
+                        )
+                        doc.metadata['image_analysis'] = chunk_image_analyses
+                        doc.metadata['extracted_images'] = [
+                            unique_images[a['image_id']] for a in chunk_image_analyses
+                            if a.get('image_id') in unique_images
+                        ]
+                        doc.metadata['image_count'] = len(doc.metadata['extracted_images'])
+                    else:
+                        doc.metadata['extracted_images'] = []
+                        doc.metadata['image_count'] = 0
+                    continue
+
+                # PDF: 플레이스홀더를 이미지 분석 텍스트로 치환
+                placeholders_found = placeholder_re.findall(doc.page_content)
+                chunk_image_analyses = []
+
+                if placeholders_found:
+                    for page_str, idx_str in placeholders_found:
+                        entry = placeholder_map.get((int(page_str), int(idx_str)))
+                        if entry:
+                            iid, analysis_text = entry
+                            chunk_image_analyses.append({
+                                'image_id': iid,
+                                'analysis': analysis_text,
+                                'metadata': unique_images.get(iid, {}).get('metadata', {}),
+                                'image_url': unique_images.get(iid, {}).get('image_url', '')
+                            })
+
+                    def make_replacer(pmap: Dict[tuple, tuple]):
+                        def replacer(match: re.Match) -> str:
+                            entry = pmap.get((int(match.group(1)), int(match.group(2))))
+                            if entry:
+                                _, analysis_text = entry
+                                page = int(match.group(1))
+                                idx = int(match.group(2))
+                                return f"[이미지: {page}페이지 이미지{idx + 1}]\n{analysis_text}"
+                            return ""
+                        return replacer
+
+                    doc.page_content = placeholder_re.sub(make_replacer(placeholder_map), doc.page_content)
+
+                    if chunk_image_analyses:
+                        doc.metadata['image_analysis'] = chunk_image_analyses
+                        doc.metadata['extracted_images'] = [
+                            unique_images[a['image_id']] for a in chunk_image_analyses
+                            if a.get('image_id') in unique_images
+                        ]
+                        doc.metadata['image_count'] = len(doc.metadata['extracted_images'])
+                        print(f"Replaced {len(chunk_image_analyses)} image placeholder(s) in chunk")
+                    else:
+                        doc.metadata['extracted_images'] = []
+                        doc.metadata['image_count'] = 0
+                else:
+                    doc.metadata['extracted_images'] = []
+                    doc.metadata['image_count'] = 0
         except Exception as e:
             print(f"Error in process_document_images: {e}")
             raise
