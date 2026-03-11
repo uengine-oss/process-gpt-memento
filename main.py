@@ -693,7 +693,7 @@ async def process_google_drive(request: ProcessRequest):
     try:
         drive_loader = GoogleDriveLoader(tenant_id=request.tenant_id)
         proc_inst_id = request.options.get("proc_inst_id") if request.options else None
-        extra_drive_folder_id = os.getenv("MEMENTO_DRIVE_FOLDER_ID", "").strip()
+        extra_drive_folder_id = os.getenv("MEMENTO_DRIVE_FOLDER_ID", "1jKXip_MCDJFO7sXrvqhGD_i45_7wdp-v").strip()
 
         # Check if specific file_path is provided
         if hasattr(request, 'file_path') and request.file_path:
