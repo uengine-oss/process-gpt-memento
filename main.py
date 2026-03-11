@@ -234,6 +234,7 @@ async def retrieve(
     proc_inst_id: Optional[str] = None,
     all_docs: bool = False,
     top_k: int = Query(default=5, ge=1, le=100),
+    drive_folder_id: Optional[str] = None,
 ):
     try:
         if proc_inst_id:
@@ -252,9 +253,17 @@ async def retrieve(
             }
 
         rag = RAGChain()
+        if drive_folder_id:
+            metadata_filter = {**metadata_filter, "drive_folder_id": drive_folder_id}
 
         result = await rag.retrieve(query, metadata_filter, top_k=top_k)
         docs = result["source_documents"]
+        if drive_folder_id:
+            docs = [
+                doc
+                for doc in docs
+                if (doc.metadata or {}).get("drive_folder_id") == drive_folder_id
+            ]
 
         return {
             "response": docs,
@@ -269,12 +278,16 @@ async def retrieve(
 
 
 @app.get("/documents/chunks-metadata")
-async def get_chunks_metadata(tenant_id: str, file_name: str):
+async def get_chunks_metadata(tenant_id: str, file_name: str, drive_folder_id: Optional[str] = None):
     """특정 문서의 모든 청크 메타데이터(chunk_index, section_title, page_number 등)를 반환한다."""
     try:
         from vector_store import VectorStoreManager
         vsm = VectorStoreManager()
-        chunks = await vsm.get_all_chunks_metadata(tenant_id=tenant_id, file_name=file_name)
+        chunks = await vsm.get_all_chunks_metadata(
+            tenant_id=tenant_id,
+            file_name=file_name,
+            drive_folder_id=drive_folder_id,
+        )
         return {
             "file_name": file_name,
             "total_chunks": len(chunks),
@@ -288,6 +301,7 @@ class RetrieveByIndicesRequest(BaseModel):
     tenant_id: str
     file_name: str
     chunk_indices: List[int]
+    drive_folder_id: Optional[str] = None
 
 
 @app.post("/retrieve-by-indices")
@@ -300,6 +314,7 @@ async def retrieve_by_indices(request: RetrieveByIndicesRequest):
             tenant_id=request.tenant_id,
             file_name=request.file_name,
             chunk_indices=request.chunk_indices,
+            drive_folder_id=request.drive_folder_id,
         )
         return {
             "response": [
@@ -624,6 +639,8 @@ async def _run_drive_folder_async(
                             'tenant_id': tenant_id,
                             'storage_type': 'drive'
                         }
+                        if file.get("drive_folder_id"):
+                            metadata["drive_folder_id"] = file["drive_folder_id"]
                         if proc_inst_id:
                             metadata['proc_inst_id'] = proc_inst_id
                         doc.metadata.update(metadata)
@@ -676,6 +693,7 @@ async def process_google_drive(request: ProcessRequest):
     try:
         drive_loader = GoogleDriveLoader(tenant_id=request.tenant_id)
         proc_inst_id = request.options.get("proc_inst_id") if request.options else None
+        extra_drive_folder_id = os.getenv("MEMENTO_DRIVE_FOLDER_ID", "").strip()
 
         # Check if specific file_path is provided
         if hasattr(request, 'file_path') and request.file_path:
@@ -745,6 +763,13 @@ async def process_google_drive(request: ProcessRequest):
             # Async folder indexing: process all unprocessed files in background
             try:
                 files = await drive_loader.list_files(SUPPORTED_MIME_TYPES)
+                if extra_drive_folder_id:
+                    extra_files = await drive_loader.list_files(SUPPORTED_MIME_TYPES, extra_drive_folder_id)
+                    merged: Dict[str, dict] = {f["id"]: f for f in files if isinstance(f, dict) and f.get("id")}
+                    for item in extra_files:
+                        if isinstance(item, dict) and item.get("id") and item["id"] not in merged:
+                            merged[item["id"]] = item
+                    files = list(merged.values())
             except ValueError as e:
                 if "No valid Google credentials found" in str(e) or "Authentication failed" in str(e):
                     auth_response = create_auth_error_response(

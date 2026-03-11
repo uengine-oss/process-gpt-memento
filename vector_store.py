@@ -68,7 +68,8 @@ class VectorStoreManager:
                         "id": metadata.get('id'),
                         "content": text,
                         "metadata": metadata,
-                        "embedding": embedding
+                        "embedding": embedding,
+                        "drive_folder_id": metadata.get('drive_folder_id')
                     }).execute()
                     print(f"Successfully inserted document {i+1}/{len(processed_documents)}")
                 except Exception as e:
@@ -133,6 +134,7 @@ class VectorStoreManager:
                                     "image_url": image_info.get('image_url', ''),
                                 },
                                 "embedding": image_embedding,
+                                "drive_folder_id": (doc.metadata or {}).get("drive_folder_id"),
                             }
                             self.supabase.table("documents").insert(image_doc_data).execute()
                         except Exception as e:
@@ -199,11 +201,16 @@ class VectorStoreManager:
         tenant_id: str,
         file_name: str,
         chunk_indices: List[int],
+        drive_folder_id: Optional[str] = None,
     ) -> List[Document]:
         """Supabase documents 테이블에서 chunk_index 리스트로 청크를 직접 조회한다."""
         try:
             return await asyncio.to_thread(
-                self._get_chunks_by_indices_sync, tenant_id, file_name, chunk_indices
+                self._get_chunks_by_indices_sync,
+                tenant_id,
+                file_name,
+                chunk_indices,
+                drive_folder_id,
             )
         except Exception as e:
             print(f"Error fetching chunks by indices: {e}")
@@ -214,6 +221,7 @@ class VectorStoreManager:
         tenant_id: str,
         file_name: str,
         chunk_indices: List[int],
+        drive_folder_id: Optional[str] = None,
     ) -> List[Document]:
         """chunk_indices가 비어있거나 조회 실패 시 빈 리스트를 반환한다.
 
@@ -224,16 +232,20 @@ class VectorStoreManager:
             return []
         target_set = {int(i) for i in chunk_indices}
         try:
-            response = (
+            query = (
                 self.supabase.table("documents")
                 .select("content, metadata")
                 .eq("metadata->>tenant_id", tenant_id)
                 .eq("metadata->>file_name", file_name)
-                .execute()
             )
+            if drive_folder_id:
+                query = query.eq("metadata->>drive_folder_id", drive_folder_id)
+            response = query.execute()
             results = []
             for row in response.data or []:
                 meta = row.get("metadata") or {}
+                if drive_folder_id and meta.get("drive_folder_id") != drive_folder_id:
+                    continue
                 if meta.get("type") == "image_analysis":
                     continue
                 try:
@@ -252,32 +264,35 @@ class VectorStoreManager:
             return []
 
     async def get_all_chunks_metadata(
-        self, tenant_id: str, file_name: str
+        self, tenant_id: str, file_name: str, drive_folder_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """특정 문서의 모든 청크 메타데이터(chunk_index, section_title, page_number 등)를 반환한다."""
         try:
             return await asyncio.to_thread(
-                self._get_all_chunks_metadata_sync, tenant_id, file_name
+                self._get_all_chunks_metadata_sync, tenant_id, file_name, drive_folder_id
             )
         except Exception as e:
             print(f"Error fetching chunks metadata: {e}")
             return []
 
     def _get_all_chunks_metadata_sync(
-        self, tenant_id: str, file_name: str
+        self, tenant_id: str, file_name: str, drive_folder_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         try:
-            response = (
+            query = (
                 self.supabase.table("documents")
                 .select("metadata")
                 .eq("metadata->>tenant_id", tenant_id)
                 .eq("metadata->>file_name", file_name)
-                .order("metadata->>chunk_index")
-                .execute()
             )
+            if drive_folder_id:
+                query = query.eq("metadata->>drive_folder_id", drive_folder_id)
+            response = query.order("metadata->>chunk_index").execute()
             results = []
             for row in response.data or []:
                 meta = row["metadata"] or {}
+                if drive_folder_id and meta.get("drive_folder_id") != drive_folder_id:
+                    continue
                 if meta.get("type") == "image_analysis":
                     continue
                 results.append({

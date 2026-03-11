@@ -279,6 +279,62 @@ class GoogleDriveLoader:
                     print("Network connection issue detected. Please check your internet connection.")
                 break
                 
+        if folder_id:
+            for item in results:
+                if isinstance(item, dict):
+                    item.setdefault("drive_folder_id", folder_id)
+        return results
+
+    async def list_files_recursive(
+        self, file_types: Optional[List[str]] = None, folder_id: Optional[str] = None
+    ) -> List[dict]:
+        """폴더 하위까지 재귀적으로 파일 목록을 가져온다."""
+        if not self.service:
+            await self.authenticate()
+
+        if not folder_id:
+            folder_id = await self.get_tenant_folder_id()
+
+        if not folder_id:
+            # 폴더 지정이 없으면 기존 동작 유지 (전체 드라이브 검색)
+            return await self.list_files(file_types, folder_id=None)
+
+        folder_mime = "application/vnd.google-apps.folder"
+        allowed_types = set(file_types or [])
+        results: List[dict] = []
+
+        async def _list_children(parent_id: str) -> None:
+            page_token = None
+            while True:
+                try:
+                    request = self.service.files().list(
+                        q=f"'{parent_id}' in parents and trashed=false",
+                        spaces="drive",
+                        fields="nextPageToken, files(id, name, mimeType)",
+                        pageToken=page_token,
+                    )
+                    response = await asyncio.wait_for(
+                        asyncio.to_thread(request.execute),
+                        timeout=30.0,
+                    )
+                    for item in response.get("files", []):
+                        if item.get("mimeType") == folder_mime:
+                            await _list_children(item["id"])
+                            continue
+                        if not allowed_types or item.get("mimeType") in allowed_types:
+                            item.setdefault("drive_folder_id", folder_id)
+                            results.append(item)
+                    page_token = response.get("nextPageToken")
+                    if not page_token:
+                        break
+                except asyncio.TimeoutError:
+                    print("Request timeout - retrying...")
+                    continue
+                except Exception as e:
+                    print(f"Error listing files recursively: {e}")
+                    break
+
+        await _list_children(folder_id)
         return results
         
     async def download_and_process_file(self, file_id: str, file_name: str, tenant_id: Optional[str] = None) -> Optional[List[Document]]:
