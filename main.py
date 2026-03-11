@@ -297,6 +297,38 @@ async def get_chunks_metadata(tenant_id: str, file_name: str, drive_folder_id: O
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/documents/list")
+async def list_documents(
+    tenant_id: str,
+    drive_folder_id: Optional[str] = None,
+    include_images: bool = False,
+):
+    """특정 폴더(옵션) 내 문서명 목록을 반환한다."""
+    try:
+        query = (
+            supabase.table("documents")
+            .select("metadata")
+            .eq("metadata->>tenant_id", tenant_id)
+        )
+        if drive_folder_id:
+            query = query.eq("metadata->>drive_folder_id", drive_folder_id)
+        response = query.execute()
+
+        file_names: List[str] = []
+        for row in response.data or []:
+            meta = row.get("metadata") or {}
+            if not include_images and meta.get("type") == "image_analysis":
+                continue
+            name = meta.get("file_name")
+            if name:
+                file_names.append(str(name))
+
+        unique_files = list(dict.fromkeys(file_names))
+        return {"files": unique_files, "total": len(unique_files)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class RetrieveByIndicesRequest(BaseModel):
     tenant_id: str
     file_name: str
