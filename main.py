@@ -379,7 +379,7 @@ async def process_output(request: ProcessOutputRequest):
         fields_json = form_definition.data.get("fields_json", {})
         form_html = form_definition.data.get("html", "")
         
-        # Build Drive folder path: {proc_def_id}/{year}/{month}/{day}/{proc_inst_id}/output/
+        # Build Drive folder path: instances/{proc_def_id}/{year}/{month}/{day}/{proc_inst_id}/output/
         proc_def_id = workitem_data.get("proc_def_id")
         proc_inst_id = workitem_data.get("proc_inst_id")
         # Use today's date
@@ -387,7 +387,7 @@ async def process_output(request: ProcessOutputRequest):
         year = f"{today.year:04d}"
         month = f"{today.month:02d}"
         day = f"{today.day:02d}"
-        folder_path = f"{proc_def_id}/{year}/{month}/{day}/{proc_inst_id}/output/"
+        folder_path = f"instances/{proc_def_id}/{year}/{month}/{day}/{proc_inst_id}/output/"
 
         reports = []
         uploads = []
