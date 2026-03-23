@@ -3,10 +3,10 @@ import os
 import uuid
 from dotenv import load_dotenv
 from supabase import create_client
-from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores.supabase import SupabaseVectorStore
 from langchain.schema import Document
 import asyncio
+from llm import create_embeddings
 
 
 load_dotenv()
@@ -20,9 +20,7 @@ class VectorStoreManager:
             os.getenv("SUPABASE_KEY")
         )
         
-        self.embeddings = OpenAIEmbeddings(
-            openai_api_key=os.getenv("OPENAI_API_KEY")
-        )
+        self.embeddings = create_embeddings()
         
         self.vector_store = SupabaseVectorStore(
             client=self.supabase,
@@ -33,7 +31,6 @@ class VectorStoreManager:
         
         # OpenAI API 키 설정
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
-        self.openai_api_base = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
 
     async def add_documents(self, documents: List[Document], tenant_id: str) -> bool:
         """Add documents to the vector store with image analysis and embeddings."""

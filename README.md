@@ -1,153 +1,162 @@
 # Process GPT Memento
 
-AI 기반 문서 처리 및 질의응답 시스템
+FastAPI 기반 멀티테넌트 문서 처리/검색(RAG) 서비스입니다.  
+Google Drive, Supabase Storage, 로컬 파일에서 문서를 수집하고 청킹/임베딩/벡터검색을 제공합니다.
 
-## 주요 기능
+## 핵심 기능
 
-### 📄 문서 처리
-- **PDF, DOCX, PPTX, TXT** 등 다양한 문서 형식 지원
-- **Google Drive** 및 **Supabase Storage** 연동
-- **텍스트 추출** 및 **청킹** 처리
+- 다양한 입력 소스 처리: `drive`, `storage`, `local`, `database`
+- 문서 파싱/청킹: PDF, DOCX, PPTX, XLSX, TXT, HWP, HWPX
+- 이미지 추출 및 분석: PDF/DOCX/PPTX 및 단일 이미지(JPG/PNG/GIF/BMP/WEBP)
+- Supabase 기반 벡터 저장/유사도 검색
+- Google OAuth 기반 테넌트별 Drive 접근
+- LLM 호출 경로를 `litellm proxy`로 전환 가능 (`llm.py`)
 
-### 🖼️ 이미지 처리 (신규!)
-- **문서 내 이미지 자동 추출**
-- **OpenAI Vision API**를 사용한 이미지 내용 분석
-- **이미지 설명을 텍스트로 변환**하여 벡터 저장
-- 지원 형식: JPG, PNG, GIF
+## 아키텍처 개요
 
-### 🔍 벡터 검색
-- **Supabase Vector Store** 기반 임베딩 저장
-- **이미지 내용 포함** 통합 검색
-- **유사도 기반** 문서 검색
+- API 엔트리포인트: `main.py` (기본 포트 `8005`)
+- 문서 로딩/청킹: `document_loader.py`
+- RAG 체인/이미지 분석: `rag_chain.py`
+- 벡터 저장소: `vector_store.py`
+- LLM 팩토리(프록시 라우팅): `llm.py`
 
-### 🔐 멀티 테넌트 지원
-- **OAuth 2.0** 기반 Google Drive 인증
-- **테넌트별** 문서 및 이미지 관리
-- **격리된** 데이터 접근
+## 환경 변수
 
-## 설치 및 설정
+`.env` 파일 예시:
 
-### 1. 의존성 설치
+```env
+# Supabase
+SUPABASE_URL=your_supabase_url
+SUPABASE_KEY=your_supabase_service_or_anon_key
+
+# LLM Proxy (권장)
+LLM_PROXY_URL=http://litellm-proxy:4000
+LLM_PROXY_API_KEY=your_virtual_key
+LLM_MODEL=gpt-4o
+LLM_EMBEDDING_MODEL=text-embedding-3-small
+
+# Fallback/OpenAI (일부 모듈에서 여전히 사용)
+OPENAI_API_KEY=your_openai_api_key
+
+# Google Drive 처리 관련
+MEMENTO_DRIVE_FOLDER_ID=optional_extra_folder_id
+```
+
+참고:
+- `rag_chain.py`의 LLM 호출은 `llm.py:create_llm()`을 사용합니다.
+- 임베딩(`OpenAIEmbeddings`)도 `llm.py:create_embeddings()`를 통해 프록시/가상키와 `LLM_EMBEDDING_MODEL`을 사용합니다.
+- 일부 섹션 타이틀 생성 로직은 현재 `OPENAI_API_KEY`를 사용합니다.
+
+## 설치
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 환경 변수 설정
-`.env` 파일을 생성하고 다음 변수들을 설정하세요:
+또는 프로젝트가 `pyproject.toml` 기반이라면 사용 중인 패키지 매니저(`uv`, `pip`)에 맞춰 설치하세요.
 
-```env
-# Supabase 설정
-SUPABASE_URL=your_supabase_url
-SUPABASE_KEY=your_supabase_anon_key
+## 실행
 
-# OpenAI 설정
-OPENAI_API_KEY=your_openai_api_key
-OPENAI_API_BASE=https://api.openai.com/v1  # 선택사항
-
-# Google Drive OAuth 설정
-GOOGLE_CLIENT_ID=your_google_client_id
-GOOGLE_CLIENT_SECRET=your_google_client_secret
-```
-
-### 3. 데이터베이스 설정
-Supabase에서 다음 테이블들이 필요합니다:
-
-### 4. Supabase Storage 설정
-이미지 처리를 위해 Supabase Storage에 퍼블릭 버킷을 설정해야 합니다:
-
-1. **Supabase 대시보드**에서 Storage 섹션으로 이동
-2. **새 버킷 생성**: `files` 이름으로 버킷 생성
-3. **퍼블릭 액세스 설정**: 버킷을 퍼블릭으로 설정하여 이미지 URL 접근 가능
-4. **RLS 정책 설정**: 필요에 따라 Row Level Security 정책 구성
-
-```sql
--- 문서 테이블
-CREATE TABLE documents (
-    id UUID PRIMARY KEY,
-    content TEXT,
-    metadata JSONB,
-    embedding vector(1536)
-);
-
--- 이미지 메타데이터 테이블
-CREATE TABLE document_images (
-    id UUID PRIMARY KEY,
-    document_id UUID REFERENCES documents(id),
-    tenant_id TEXT,
-    image_id TEXT,
-    image_url TEXT,
-    metadata JSONB,
-    created_at timestamp with time zone null default now()
-);
-
--- 처리된 파일 추적 테이블
-CREATE TABLE processed_files (
-    id UUID PRIMARY KEY,
-    file_id TEXT,
-    tenant_id TEXT,
-    file_name TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-```
-
-## 사용법
-
-### 1. 서버 실행
 ```bash
 python main.py
 ```
 
-### 2. Google Drive 문서 처리
+기본 실행 주소:
+- `http://localhost:8005`
+
+## 주요 API
+
+### 처리
+
+- `POST /process`  
+  - `storage_type=local|drive|storage`
+  - 로컬 디렉토리, Google Drive, Supabase Storage 파일 처리
+- `POST /process/database`  
+  - DB 레코드(`todolist`)를 문서로 변환해 벡터 저장
+- `POST /process-output`  
+  - 워크아이템 산출물 DOCX 생성 + Drive 업로드 + RAG 저장
+- `GET /process/drive/status`  
+  - Drive 폴더 인덱싱 백그라운드 작업 상태 조회
+
+### 조회/질의
+
+- `GET /retrieve`  
+  - 유사도 검색 결과(원문 청크) 반환
+- `GET /query`  
+  - RAG 기반 최종 답변 + 소스 메타데이터 반환
+- `POST /retrieve-by-indices`  
+  - 선택한 `chunk_index` 목록으로 청크 직접 조회
+- `GET /documents/list`  
+  - 문서 목록 조회
+- `GET /documents/chunks-metadata`  
+  - 문서별 청크 메타데이터 조회
+
+### 업로드
+
+- `POST /save-to-storage`  
+  - 파일 업로드 + 처리 + 벡터 저장
+- `POST /save-to-drive`  
+  - 파일을 Google Drive에 업로드
+
+### 인증
+
+- `GET /auth/google/url`
+- `GET /auth/google/status`
+- `POST /auth/google/save-token`
+- `POST /auth/google/callback`
+
+## 사용 예시
+
+### 1) 문서 처리 요청
+
 ```bash
-curl -X POST "http://localhost:8000/process/drive" \
+curl -X POST "http://localhost:8005/process" \
   -H "Content-Type: application/json" \
   -d '{
-    "tenant_id": "your_tenant_id",
-    "file_path": "google_drive_file_id"
+    "storage_type": "drive",
+    "tenant_id": "localhost"
   }'
 ```
 
-### 3. 이미지 추출 테스트
+### 2) 검색
+
 ```bash
-python test_image_extraction.py
+curl "http://localhost:8005/retrieve?query=교육&tenant_id=localhost&top_k=5"
 ```
 
-## 이미지 처리 워크플로우
+### 3) 질의응답
 
-1. **문서 업로드**: PDF, DOCX, PPTX 파일을 Google Drive에 업로드
-2. **이미지 추출**: 문서 내 이미지를 자동으로 감지하고 추출
-3. **Supabase Storage 업로드**: 추출된 이미지를 Supabase Storage 퍼블릭 버킷에 업로드
-4. **AI 분석**: OpenAI Vision API로 이미지 URL을 통해 이미지 내용을 텍스트로 변환
-5. **벡터 저장**: 텍스트 + 이미지 설명을 통합하여 벡터 저장소에 저장
-6. **통합 검색**: 텍스트와 이미지 내용을 모두 포함한 검색 가능
+```bash
+curl "http://localhost:8005/query?query=프로젝트%20A의%20예산이%20얼마%20나왔지?&tenant_id=localhost"
+```
 
 ## 지원 파일 형식
 
-| 형식 | 텍스트 추출 | 이미지 추출 | 이미지 형식 |
-|------|-------------|-------------|-------------|
-| PDF | ✅ | ✅ | JPG, PNG, GIF |
-| DOCX | ✅ | ✅ | JPG, PNG, GIF |
-| PPTX | ✅ | ✅ | JPG, PNG, GIF |
-| TXT | ✅ | ❌ | - |
-| HWP | ✅ | ❌ | - |
-| HWPX | ✅ | ❌ | - |
+| 형식 | 텍스트 추출 | 문서 내 이미지 추출 |
+|------|-------------|----------------------|
+| PDF  | ✅ | ✅ |
+| DOCX | ✅ | ✅ |
+| PPTX | ✅ | ✅ |
+| XLSX | ✅ | ❌ |
+| TXT  | ✅ | ❌ |
+| HWP  | ✅ | ❌ |
+| HWPX | ✅ | ❌ |
+| JPG/PNG/GIF/BMP/WEBP | (단일 이미지 문서로 처리) | - |
+
+## Supabase 스키마 참고
+
+아래 테이블/함수가 필요합니다.
+
+- `documents` (벡터 컬럼 포함)
+- `document_images` (추출 이미지 메타)
+- `processed_files` (중복 처리 방지)
+- RPC 함수 `match_documents` (유사도 검색)
+
+프로젝트에 맞는 정확한 DDL은 운영 중인 Supabase 스키마를 기준으로 관리하세요.
 
 ## 문제 해결
 
-### 이미지 추출이 안되는 경우
-1. **OpenAI API 키** 확인
-2. **문서 형식** 지원 여부 확인
-3. **로그** 확인하여 오류 메시지 파악
-
-### 벡터 저장 실패
-1. **Supabase 연결** 상태 확인
-2. **데이터베이스 테이블** 존재 여부 확인
-3. **환경 변수** 설정 확인
-
-## 라이선스
-
-MIT License
-
-## 기여
-
-버그 리포트 및 기능 제안은 이슈로 등록해 주세요.
+- `LLM_PROXY_API_KEY` 또는 `OPENAI_API_KEY`가 없으면 RAG LLM 초기화가 실패할 수 있습니다.
+- `OPENAI_API_KEY`가 없으면 임베딩/일부 섹션 타이틀 생성이 실패할 수 있습니다.
+- Drive 인증 오류 시 `/auth/google/url`로 OAuth URL을 먼저 발급하세요.
+- 이미지 분석 실패 시 Supabase Storage 공개 URL 접근 가능 여부를 확인하세요.

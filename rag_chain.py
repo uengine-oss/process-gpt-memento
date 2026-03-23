@@ -2,11 +2,11 @@ import os
 import re
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
 from langchain.chains.retrieval_qa.base import RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 from vector_store import VectorStoreManager
+from llm import create_llm
 import asyncio
 
 class RAGChain:
@@ -15,18 +15,14 @@ class RAGChain:
         # Load environment variables from .env file only
         load_dotenv(override=True)
         
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if not openai_api_key:
-            raise ValueError("OPENAI_API_KEY not found in .env file")
+        llm_api_key = os.getenv("LLM_PROXY_API_KEY") or os.getenv("OPENAI_API_KEY")
+        if not llm_api_key:
+            raise ValueError("LLM_PROXY_API_KEY or OPENAI_API_KEY not found in .env file")
         
-        # Initialize ChatOpenAI with debugging
-        print("Initializing ChatOpenAI...")
-        self.llm = ChatOpenAI(
-            model_name="gpt-4o",  # Vision API를 지원하는 모델로 변경
-            temperature=0,
-            api_key=openai_api_key
-        )
-        print("ChatOpenAI initialized successfully")
+        # Initialize proxy-routed LLM via shared helper
+        print("Initializing proxy-routed LLM...")
+        self.llm = create_llm(temperature=0.0)
+        print("Proxy-routed LLM initialized successfully")
         
         self.vector_store = VectorStoreManager()
         if self.vector_store.supabase is None:
