@@ -56,8 +56,16 @@ class VectorStoreManager:
             print(f"Generating embeddings for {len(processed_documents)} documents...")
             texts = [doc.page_content for doc in processed_documents]
             metadatas = [doc.metadata for doc in processed_documents]
-            embeddings = self.embeddings.embed_documents(texts)
-            
+
+            # 임베딩 API 토큰 한도 방지: 배치 단위로 처리
+            EMBED_BATCH_SIZE = 50
+            embeddings = []
+            for batch_start in range(0, len(texts), EMBED_BATCH_SIZE):
+                batch_texts = texts[batch_start:batch_start + EMBED_BATCH_SIZE]
+                batch_embeddings = self.embeddings.embed_documents(batch_texts)
+                embeddings.extend(batch_embeddings)
+                print(f"Embedded batch {batch_start // EMBED_BATCH_SIZE + 1}/{(len(texts) - 1) // EMBED_BATCH_SIZE + 1} ({len(batch_texts)} docs)")
+
             print("Inserting documents into vector store...")
             for i, (text, metadata, embedding) in enumerate(zip(texts, metadatas, embeddings)):
                 try:
@@ -128,6 +136,9 @@ class VectorStoreManager:
                                     "tenant_id": tenant_id,
                                     "source": "image_extraction",
                                     "file_name": str(image_name),
+                                    "source_file_name": doc.metadata.get("file_name", ""),
+                                    "drive_folder_name": doc.metadata.get("drive_folder_name", ""),
+                                    "drive_folder_id": (doc.metadata or {}).get("drive_folder_id", ""),
                                     "image_url": image_info.get('image_url', ''),
                                 },
                                 "embedding": image_embedding,

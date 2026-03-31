@@ -100,6 +100,18 @@ class GoogleDriveLoader:
             print(f"Error fetching folder ID: {e}")
             return None
         
+    async def get_folder_name(self, folder_id: str) -> str:
+        """Google Drive 폴더 ID로 폴더명을 조회한다."""
+        try:
+            if not self.service:
+                await self.authenticate()
+            request = self.service.files().get(fileId=folder_id, fields="name")
+            result = await asyncio.to_thread(request.execute)
+            return result.get("name", "")
+        except Exception as e:
+            print(f"Error fetching folder name for {folder_id}: {e}")
+            return ""
+
     async def authenticate(self) -> None:
         """Authenticate with Google Drive API using tenant-level tokens"""
         if self.service:
@@ -303,7 +315,7 @@ class GoogleDriveLoader:
         allowed_types = set(file_types or [])
         results: List[dict] = []
 
-        async def _list_children(parent_id: str) -> None:
+        async def _list_children(parent_id: str, parent_folder_name: str = "") -> None:
             page_token = None
             while True:
                 try:
@@ -319,10 +331,14 @@ class GoogleDriveLoader:
                     )
                     for item in response.get("files", []):
                         if item.get("mimeType") == folder_mime:
-                            await _list_children(item["id"])
+                            # 하위 폴더 재귀: 폴더 경로를 이어 붙임
+                            sub_name = item.get("name", "")
+                            sub_path = f"{parent_folder_name}/{sub_name}" if parent_folder_name else sub_name
+                            await _list_children(item["id"], sub_path)
                             continue
                         if not allowed_types or item.get("mimeType") in allowed_types:
                             item.setdefault("drive_folder_id", folder_id)
+                            item["drive_folder_name"] = parent_folder_name
                             results.append(item)
                     page_token = response.get("nextPageToken")
                     if not page_token:
@@ -334,7 +350,14 @@ class GoogleDriveLoader:
                     print(f"Error listing files recursively: {e}")
                     break
 
-        await _list_children(folder_id)
+        # 루트 폴더명 조회
+        root_folder_name = ""
+        try:
+            root_folder_name = await self.get_folder_name(folder_id)
+        except Exception:
+            pass
+
+        await _list_children(folder_id, root_folder_name)
         return results
         
     async def download_and_process_file(self, file_id: str, file_name: str, tenant_id: Optional[str] = None) -> Optional[List[Document]]:
@@ -427,15 +450,20 @@ class GoogleDriveLoader:
                 'application/vnd.google-apps.folder'  # Google Drive 폴더
             ]
             
-        files = await self.list_files(file_types, folder_id)
+        files = await self.list_files_recursive(file_types, folder_id)
         all_chunks = []
-        
+
         for file in files:
-            print(f"Processing file: {file['name']} (ID: {file['id']})")
+            file_folder_name = file.get("drive_folder_name", "")
+            print(f"Processing file: {file['name']} (folder: {file_folder_name or 'root'}, ID: {file['id']})")
             chunks = await self.download_and_process_file(file['id'], file['name'], self.tenant_id)
             if chunks is not None:
+                if file_folder_name:
+                    for chunk in chunks:
+                        if hasattr(chunk, "metadata") and isinstance(chunk.metadata, dict):
+                            chunk.metadata["drive_folder_name"] = file_folder_name
                 all_chunks.extend(chunks)
-            
+
         return all_chunks
             
     async def save_to_google_drive(self, file_content: io.BytesIO, file_name: Optional[str] = None, folder_id: Optional[str] = None, folder_path: Optional[str] = None) -> dict:

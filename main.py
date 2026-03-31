@@ -277,6 +277,55 @@ async def retrieve(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/retrieve-images")
+async def retrieve_images(
+    query: str,
+    tenant_id: str,
+    top_k: int = Query(default=5, ge=1, le=30),
+    drive_folder_id: Optional[str] = None,
+):
+    """캡션(Vision 분석) 기반 이미지 전용 검색 엔드포인트.
+
+    documents 테이블에서 type='image_analysis'인 항목만 대상으로
+    시맨틱 검색을 수행하고, 이미지 URL·캡션·메타데이터를 반환한다.
+    """
+    try:
+        metadata_filter = {
+            "tenant_id": tenant_id,
+            "type": "image_analysis",
+        }
+        if drive_folder_id:
+            metadata_filter["drive_folder_id"] = drive_folder_id
+
+        rag = RAGChain()
+        result = await rag.retrieve(query, metadata_filter, top_k=top_k)
+        docs = result["source_documents"]
+
+        if drive_folder_id:
+            docs = [
+                doc for doc in docs
+                if (doc.metadata or {}).get("drive_folder_id") == drive_folder_id
+            ]
+
+        images = []
+        for doc in docs:
+            meta = doc.metadata or {}
+            images.append({
+                "image_id": meta.get("image_id", ""),
+                "image_url": meta.get("image_url", ""),
+                "caption": (doc.page_content or "").strip(),
+                "file_name": meta.get("file_name", ""),
+                "source_file_name": meta.get("source_file_name", ""),
+                "drive_folder_name": meta.get("drive_folder_name", ""),
+                "metadata": meta,
+            })
+
+        return {"images": images}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/documents/chunks-metadata")
 async def get_chunks_metadata(tenant_id: str, file_name: str, drive_folder_id: Optional[str] = None):
     """특정 문서의 모든 청크 메타데이터(chunk_index, section_title, page_number 등)를 반환한다."""
@@ -315,16 +364,25 @@ async def list_documents(
         response = query.execute()
 
         file_names: List[str] = []
+        file_folder_map: dict = {}  # file_name → drive_folder_name
         for row in response.data or []:
             meta = row.get("metadata") or {}
             if not include_images and meta.get("type") == "image_analysis":
                 continue
             name = meta.get("file_name")
             if name:
-                file_names.append(str(name))
+                name = str(name)
+                file_names.append(name)
+                if name not in file_folder_map:
+                    folder = meta.get("drive_folder_name") or ""
+                    file_folder_map[name] = str(folder)
 
         unique_files = list(dict.fromkeys(file_names))
-        return {"files": unique_files, "total": len(unique_files)}
+        file_details = [
+            {"file_name": f, "drive_folder_name": file_folder_map.get(f, "")}
+            for f in unique_files
+        ]
+        return {"files": unique_files, "file_details": file_details, "total": len(unique_files)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -673,6 +731,8 @@ async def _run_drive_folder_async(
                         }
                         if file.get("drive_folder_id"):
                             metadata["drive_folder_id"] = file["drive_folder_id"]
+                        if file.get("drive_folder_name"):
+                            metadata["drive_folder_name"] = file["drive_folder_name"]
                         if proc_inst_id:
                             metadata['proc_inst_id'] = proc_inst_id
                         doc.metadata.update(metadata)
@@ -794,11 +854,12 @@ async def process_google_drive(request: ProcessRequest):
         else:
             # Async folder indexing: process all unprocessed files in background
             try:
-                files = await drive_loader.list_files(SUPPORTED_MIME_TYPES)
+                files = await drive_loader.list_files_recursive(SUPPORTED_MIME_TYPES)
                 if extra_drive_folder_id:
-                    extra_files = await drive_loader.list_files(SUPPORTED_MIME_TYPES, extra_drive_folder_id)
-                    merged: Dict[str, dict] = {f["id"]: f for f in files if isinstance(f, dict) and f.get("id")}
-                    for item in extra_files:
+                    extra_files = await drive_loader.list_files_recursive(SUPPORTED_MIME_TYPES, extra_drive_folder_id)
+                    # extra 폴더 파일 우선: extra의 drive_folder_id가 유지되도록
+                    merged: Dict[str, dict] = {f["id"]: f for f in extra_files if isinstance(f, dict) and f.get("id")}
+                    for item in files:
                         if isinstance(item, dict) and item.get("id") and item["id"] not in merged:
                             merged[item["id"]] = item
                     files = list(merged.values())
