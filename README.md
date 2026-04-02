@@ -1,3 +1,5 @@
+> **전체 설치 및 실행 방법은 메인 프로젝트를 참고하세요:** [ProcessGPT](https://github.com/uengine-oss/process-gpt)
+
 # Process GPT Memento
 
 FastAPI 기반 멀티테넌트 문서 처리/검색(RAG) 서비스입니다.  
