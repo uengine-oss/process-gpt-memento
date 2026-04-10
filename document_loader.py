@@ -58,6 +58,75 @@ def _extract_text_from_hwp_or_hwpx(file_path: str, file_extension: str) -> Tuple
     if file_extension == ".hwpx":
         try:
             import xml.etree.ElementTree as ET
+
+            def _ltag(elem):
+                t = elem.tag
+                return t.split('}', 1)[1] if '}' in t else t
+
+            def _collect_t(elem):
+                parts = []
+                for n in elem.iter():
+                    if _ltag(n) == 'tbl':
+                        continue
+                    if _ltag(n) == 't' and n.text:
+                        parts.append(n.text)
+                return "".join(parts)
+
+            def _tbl_to_md(tbl):
+                cells = []
+                for tr in tbl:
+                    if _ltag(tr) != 'tr':
+                        continue
+                    for tc in tr:
+                        if _ltag(tc) != 'tc':
+                            continue
+                        row = col = 0
+                        for cc in tc:
+                            tag = _ltag(cc)
+                            if tag == 'cellAddr':
+                                for k, v in cc.attrib.items():
+                                    if 'colAddr' in k: col = int(v)
+                                    if 'rowAddr' in k: row = int(v)
+                        tp = []
+                        for sub in tc.iter():
+                            if _ltag(sub) == 't' and sub.text:
+                                tp.append(sub.text)
+                        cells.append((row, col, " ".join("".join(tp).split())))
+                if not cells:
+                    return ""
+                mr = max(r + 1 for r, c, t in cells)
+                mc = max(c + 1 for r, c, t in cells)
+                grid = [[""] * mc for _ in range(mr)]
+                for r, c, t in cells:
+                    grid[r][c] = t
+                cw = [max(3, *(len(grid[r][c]) for r in range(mr))) for c in range(mc)]
+                lines = []
+                for r in range(mr):
+                    lines.append("| " + " | ".join(grid[r][c].ljust(cw[c]) for c in range(mc)) + " |")
+                    if r == 0:
+                        lines.append("| " + " | ".join("-" * cw[c] for c in range(mc)) + " |")
+                return "\n".join(lines)
+
+            def _walk(elem, results):
+                tag = _ltag(elem)
+                if tag == 'tbl':
+                    md = _tbl_to_md(elem)
+                    if md:
+                        results.append(md)
+                    return
+                if tag == 'p':
+                    has_tbl = any(_ltag(d) == 'tbl' for d in elem.iter() if d is not elem)
+                    if has_tbl:
+                        for ch in elem:
+                            _walk(ch, results)
+                    else:
+                        text = _collect_t(elem)
+                        if text.strip():
+                            results.append(text)
+                    return
+                for ch in elem:
+                    _walk(ch, results)
+
             with zipfile.ZipFile(file_path, "r") as z:
                 names = z.namelist()
                 section_files = sorted(n for n in names if "Contents/section" in n and n.endswith(".xml"))
@@ -74,16 +143,10 @@ def _extract_text_from_hwp_or_hwpx(file_path: str, file_extension: str) -> Tuple
                 for section_file in section_files:
                     with z.open(section_file) as f:
                         root = ET.fromstring(f.read())
-                    lines = []
-                    for elem in root.iter():
-                        if elem.tag.endswith("}p"):
-                            line = "".join(
-                                (n.text or "") for n in elem.iter() if n.tag.endswith("}t")
-                            )
-                            if line.strip():
-                                lines.append(line)
-                    if lines:
-                        sections.append("\n".join(lines))
+                    parts = []
+                    _walk(root, parts)
+                    if parts:
+                        sections.append("\n\n".join(parts))
                 return ("\n\n".join(sections), None)
         except Exception as e:
             return (None, str(e))

@@ -652,10 +652,12 @@ SUPPORTED_MIME_TYPES = [
     'application/vnd.openxmlformats-officedocument.presentationml.presentation',
     'application/x-hwp',
     'application/haansofthwp',
+    'application/haansofthwpx',
     'application/haansoftpdf',
     'application/haansoftdocx',
     'application/vnd.hancom.hwp',
     'application/vnd.hancom.hwpx',
+    'application/octet-stream',  # Google Drive가 hwp/hwpx 등 미인식 파일에 부여하는 MIME 타입
     'text/plain',
     'image/jpeg',
     'image/png',
@@ -1141,22 +1143,35 @@ async def save_to_storage(
                 })
                 if proc_inst_id:
                     doc.metadata['proc_inst_id'] = proc_inst_id
-        
-        # Only raise exception if no documents AND no images were extracted
-        # If images were extracted and uploaded, it's valid even if documents is empty
+
+        # If no documents but images were extracted, still consider it a success
         if not documents and not has_uploaded_images:
-            raise HTTPException(status_code=400, detail="No content extracted from file")
-        
+            return {
+                "message": "File uploaded to storage (no content extracted)",
+                "file_path": storage_file_path,
+                "file_name": file_name,
+                "public_url": upload_result.get('public_url'),
+                "processed": False
+            }
+
         # Store in vector database
         rag = RAGChain()
         success = await rag.process_and_store_documents(documents, tenant_id)
-        
+
         if not success:
-            raise HTTPException(status_code=500, detail="Failed to process and store documents")
-        
+            # 임베딩 실패해도 파일은 스토리지에 있으므로 성공 응답
+            print(f"Vector store processing failed for {file_name}, but file is uploaded")
+            return {
+                "message": "File uploaded to storage (vector processing failed)",
+                "file_path": storage_file_path,
+                "file_name": file_name,
+                "public_url": upload_result.get('public_url'),
+                "processed": False
+            }
+
         # Save processed file info
         await rag.save_processed_files([storage_file_path], tenant_id, [file_name])
-        
+
         return {
             "message": "File uploaded, processed, and stored successfully",
             "file_path": storage_file_path,

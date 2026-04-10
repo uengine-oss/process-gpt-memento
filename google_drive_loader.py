@@ -336,7 +336,14 @@ class GoogleDriveLoader:
                             sub_path = f"{parent_folder_name}/{sub_name}" if parent_folder_name else sub_name
                             await _list_children(item["id"], sub_path)
                             continue
-                        if not allowed_types or item.get("mimeType") in allowed_types:
+                        mime = item.get("mimeType", "")
+                        name = item.get("name", "")
+                        if not allowed_types or mime in allowed_types:
+                            # octet-stream인 경우 확장자로 지원 여부 재확인
+                            if mime == "application/octet-stream":
+                                ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+                                if ext not in ("hwp", "hwpx", "pdf", "docx", "xlsx", "pptx", "txt"):
+                                    continue
                             item.setdefault("drive_folder_id", folder_id)
                             item["drive_folder_name"] = parent_folder_name
                             results.append(item)
