@@ -59,7 +59,10 @@ def create_embeddings(model: Optional[str] = None):
     """
     from langchain_openai import OpenAIEmbeddings
 
-    base_url = os.getenv("LLM_PROXY_URL", "http://litellm-proxy:4000")
+    base_url = (
+        os.getenv("EMBEDDING_BASE_URL")
+        or os.getenv("LLM_PROXY_URL", "http://litellm-proxy:4000")
+    )
     api_key = os.getenv("LLM_PROXY_API_KEY") or os.getenv("OPENAI_API_KEY", "")
     resolved_model = (
         model

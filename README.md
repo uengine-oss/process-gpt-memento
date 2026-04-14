@@ -36,6 +36,7 @@ LLM_PROXY_URL=http://litellm-proxy:4000
 LLM_PROXY_API_KEY=your_virtual_key
 LLM_MODEL=gpt-4o
 LLM_EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_BASE_URL=
 
 # Fallback/OpenAI (일부 모듈에서 여전히 사용)
 OPENAI_API_KEY=your_openai_api_key
@@ -46,7 +47,7 @@ MEMENTO_DRIVE_FOLDER_ID=optional_extra_folder_id
 
 참고:
 - `rag_chain.py`의 LLM 호출은 `llm.py:create_llm()`을 사용합니다.
-- 임베딩(`OpenAIEmbeddings`)도 `llm.py:create_embeddings()`를 통해 프록시/가상키와 `LLM_EMBEDDING_MODEL`을 사용합니다.
+- 임베딩(`OpenAIEmbeddings`)은 `llm.py:create_embeddings()`를 통해 `EMBEDDING_BASE_URL`이 있으면 이를 우선 사용하고, 없으면 `LLM_PROXY_URL`을 사용합니다. 모델은 `LLM_EMBEDDING_MODEL`을 사용합니다.
 - 일부 섹션 타이틀 생성 로직은 현재 `OPENAI_API_KEY`를 사용합니다.
 
 ## 설치
