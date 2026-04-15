@@ -1,13 +1,11 @@
 import os
 import re
 from typing import List, Dict, Any, Optional
+import asyncio
 from dotenv import load_dotenv
-from langchain.chains.retrieval_qa.base import RetrievalQA
-from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 from vector_store import VectorStoreManager
 from llm import create_llm
-import asyncio
 
 class RAGChain:
     def __init__(self):
@@ -83,51 +81,86 @@ class RAGChain:
                 "source_documents": []
             }
         
-    async def answer(self, query: str, filter: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _format_context_documents(self, source_documents: List[Document]) -> str:
+        """Format retrieved documents into a compact context block for the LLM."""
+        context_parts: List[str] = []
+
+        for index, doc in enumerate(source_documents, start=1):
+            metadata = doc.metadata or {}
+            file_name = metadata.get("file_name") or metadata.get("source") or "unknown"
+            section_title = metadata.get("section_title") or ""
+            page_number = metadata.get("page_number") or metadata.get("page")
+            chunk_index = metadata.get("chunk_index")
+
+            header_parts = [f"문서 {index}", f"파일: {file_name}"]
+            if section_title:
+                header_parts.append(f"섹션: {section_title}")
+            if page_number is not None:
+                header_parts.append(f"페이지: {page_number}")
+            if chunk_index is not None:
+                header_parts.append(f"청크: {chunk_index}")
+
+            context_parts.append(
+                "\n".join(
+                    [
+                        " | ".join(header_parts),
+                        doc.page_content or "",
+                    ]
+                ).strip()
+            )
+
+        return "\n\n".join(part for part in context_parts if part).strip()
+
+    async def answer(
+        self,
+        query: str,
+        filter: Optional[Dict[str, Any]] = None,
+        top_k: int = 5,
+    ) -> Dict[str, Any]:
         """Answer a query using the RAG chain."""
+        lang = self.detect_language(query)
         try:
-            # Detect language
-            lang = self.detect_language(query)
             print(f"Detected language: {lang}")
-            
-            # Select prompt based on language
+
             prompt_template = self.prompts[lang]
-            prompt = PromptTemplate(
-                template=prompt_template,
-                input_variables=["context", "question"]
-            )
+            retrieval_result = await self.retrieve(query, filter=filter, top_k=top_k)
+            source_documents = retrieval_result.get("source_documents", [])
 
-            chain = RetrievalQA.from_chain_type(
-                llm=self.llm,
-                chain_type="stuff",
-                retriever=self.vector_store.get_retriever(),
-                return_source_documents=True,
-                chain_type_kwargs={
-                    "prompt": prompt
+            if not source_documents:
+                return {
+                    "answer": (
+                        "I don't have enough information to answer that question."
+                        if lang == "en"
+                        else "질문에 답변하기에 충분한 정보가 없습니다."
+                    ),
+                    "source_documents": [],
                 }
-            )
 
-            print("Running RetrievalQA chain...")
-            result = await asyncio.to_thread(
-                chain,
-                {"query": query}
-            )
-            
-            answer = result.get("result", "I don't have enough information to answer that question." if lang == 'en' else "질문에 답변하기에 충분한 정보가 없습니다.")
-            source_documents = result.get("source_documents", [])
-            
+            context = self._format_context_documents(source_documents)
+            final_prompt = prompt_template.format(context=context, question=query)
+
+            print("Running direct RAG prompt with retrieved context...")
+            response = await self.llm.ainvoke(final_prompt)
+            answer = getattr(response, "content", response)
+            if not isinstance(answer, str):
+                answer = str(answer)
+
             print(f"Answer: {answer}")
             print(f"Number of source documents: {len(source_documents)}")
-            
+
             return {
                 "answer": answer,
-                "source_documents": source_documents
+                "source_documents": source_documents,
             }
         except Exception as e:
             print(f"Error in answer_question: {e}")
             return {
-                "answer": "An error occurred while processing your question." if lang == 'en' else "질문을 처리하는 중 오류가 발생했습니다.",
-                "sources": []
+                "answer": (
+                    "An error occurred while processing your question."
+                    if lang == "en"
+                    else "질문을 처리하는 중 오류가 발생했습니다."
+                ),
+                "source_documents": [],
             }
     
     async def process_and_store_documents(self, documents: list[Document], tenant_id: str) -> bool:

@@ -11,8 +11,10 @@ Setting `disable_streaming=True` forces the underlying model to not use streamin
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
 import os
+from typing import Optional, Tuple, Union
+
+import httpx
 
 TimeoutType = Union[float, Tuple[float, float]]
 
@@ -52,13 +54,78 @@ def create_llm(
     )
 
 
+class OpenAICompatibleEmbeddings:
+    """Minimal embeddings client for OpenAI-compatible providers."""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str,
+        api_key: str,
+        timeout: TimeoutType = 60.0,
+    ):
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def _embedding_endpoint(self) -> str:
+        return f"{self.base_url}/embeddings"
+
+    def _request_embeddings(self, inputs: list[str]) -> list[list[float]]:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "input": inputs,
+        }
+
+        with httpx.Client(timeout=self.timeout) as client:
+            response = client.post(
+                self._embedding_endpoint(),
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            body = response.json()
+
+        data = body.get("data")
+        if isinstance(data, list):
+            embeddings = [
+                item.get("embedding")
+                for item in data
+                if isinstance(item, dict) and isinstance(item.get("embedding"), list)
+            ]
+            if len(embeddings) == len(inputs):
+                return embeddings
+
+        embeddings = body.get("embeddings")
+        if isinstance(embeddings, list) and len(embeddings) == len(inputs):
+            return embeddings
+
+        raise ValueError(
+            "No embedding data received. "
+            f"model={self.model}, response_keys={list(body.keys())}, "
+            f"response_preview={str(body)[:500]}"
+        )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        return self._request_embeddings(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._request_embeddings([text])[0]
+
+
 def create_embeddings(model: Optional[str] = None):
     """
-    Standard OpenAIEmbeddings constructor wrapper used across the project.
-    Routes through the same proxy/key strategy as create_llm().
+    Standard embeddings constructor wrapper used across the project.
+    Handles OpenAI-compatible providers whose embeddings responses differ
+    slightly from the OpenAI SDK expectations.
     """
-    from langchain_openai import OpenAIEmbeddings
-
     base_url = (
         os.getenv("EMBEDDING_BASE_URL")
         or os.getenv("LLM_PROXY_URL", "http://litellm-proxy:4000")
@@ -69,9 +136,11 @@ def create_embeddings(model: Optional[str] = None):
         or (os.getenv("LLM_EMBEDDING_MODEL") or "").strip()
         or "text-embedding-3-small"
     )
+    timeout = float(os.getenv("EMBEDDING_TIMEOUT_SEC", "60"))
 
-    return OpenAIEmbeddings(
+    return OpenAICompatibleEmbeddings(
         model=resolved_model,
         base_url=base_url,
         api_key=api_key,
+        timeout=timeout,
     )

@@ -14,6 +14,7 @@ dependencies = [
     "beautifulsoup4==4.12.3",
     "certifi==2024.2.2",
     "charset-normalizer==3.3.2",
+    "chromadb",
     "click==8.1.7",
     "dataclasses-json==0.6.4",
     "deprecated==1.2.14",

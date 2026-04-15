@@ -1,172 +1,310 @@
+from __future__ import annotations
+
 from typing import List, Dict, Any, Optional
-import os
-import uuid
-from dotenv import load_dotenv
-from supabase import create_client
-from langchain_community.vectorstores.supabase import SupabaseVectorStore
-from langchain.schema import Document
 import asyncio
+import os
+from pathlib import Path
+import uuid
+
+from chromadb import PersistentClient
+from dotenv import load_dotenv
+from langchain.schema import Document
+from supabase import create_client
+
 from llm import create_embeddings
 
 
 load_dotenv()
 
+PRIMITIVE_METADATA_TYPES = (str, int, float, bool)
+
+
 class VectorStoreManager:
-    """Manages vector store operations with Supabase"""
-    
+    """Stores source documents in Supabase and indexes embeddings in Chroma."""
+
     def __init__(self):
         self.supabase = create_client(
             os.getenv("SUPABASE_URL"),
-            os.getenv("SUPABASE_KEY")
+            os.getenv("SUPABASE_KEY"),
         )
-        
         self.embeddings = create_embeddings()
-        
-        self.vector_store = SupabaseVectorStore(
-            client=self.supabase,
-            embedding=self.embeddings,
-            table_name="documents",
-            query_name="match_documents"
+        self.supabase_write_embedding = (
+            os.getenv("SUPABASE_WRITE_EMBEDDING", "false").strip().lower()
+            in {"1", "true", "yes", "on"}
         )
-        
-        # OpenAI API 키 설정
-        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+        self.supabase_dummy_embedding_dimensions = int(
+            os.getenv("SUPABASE_DUMMY_EMBEDDING_DIMENSIONS", "1536")
+        )
+
+        persist_dir = Path(
+            os.getenv("CHROMA_PERSIST_DIRECTORY", "./chroma_db")
+        ).expanduser()
+        if not persist_dir.is_absolute():
+            persist_dir = (Path(__file__).resolve().parent / persist_dir).resolve()
+        persist_dir.mkdir(parents=True, exist_ok=True)
+
+        self.chroma_collection_name = (
+            os.getenv("CHROMA_COLLECTION_NAME") or "documents"
+        ).strip()
+        self.chroma_client = PersistentClient(path=str(persist_dir))
+        self.collection = self.chroma_client.get_or_create_collection(
+            name=self.chroma_collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
 
     async def add_documents(self, documents: List[Document], tenant_id: str) -> bool:
-        """Add documents to the vector store with image analysis and embeddings."""
+        """Add source documents to Supabase and vector index entries to Chroma."""
         try:
             print(f"Adding {len(documents)} documents to vector store...")
-            
-            processed_documents = []
-            
+
+            processed_documents: List[Document] = []
             for doc in documents:
-                # 메타데이터 업데이트
-                doc.metadata.update({
-                    'tenant_id': tenant_id,
-                    'id': str(uuid.uuid4())
-                })
-                
+                doc.metadata.update(
+                    {
+                        "tenant_id": tenant_id,
+                        # Chunks inherit a document UUID upstream, so we always assign a
+                        # row-level UUID here to keep Supabase ids unique.
+                        "id": str(uuid.uuid4()),
+                    }
+                )
+
                 if doc.page_content is None:
                     doc.page_content = ""
-                if doc.metadata.get('source') is None:
-                    doc.metadata['source'] = "Unknown"
-                    
+                if doc.metadata.get("source") is None:
+                    doc.metadata["source"] = "Unknown"
+
                 processed_documents.append(doc)
-            
+
             print(f"Generating embeddings for {len(processed_documents)} documents...")
-            texts = [doc.page_content for doc in processed_documents]
+            texts = [doc.page_content or "" for doc in processed_documents]
             metadatas = [doc.metadata for doc in processed_documents]
+            embeddings = self._embed_texts(texts)
 
-            # 임베딩 API 토큰 한도 방지: 배치 단위로 처리
-            EMBED_BATCH_SIZE = 50
-            embeddings = []
-            for batch_start in range(0, len(texts), EMBED_BATCH_SIZE):
-                batch_texts = texts[batch_start:batch_start + EMBED_BATCH_SIZE]
-                batch_embeddings = self.embeddings.embed_documents(batch_texts)
-                embeddings.extend(batch_embeddings)
-                print(f"Embedded batch {batch_start // EMBED_BATCH_SIZE + 1}/{(len(texts) - 1) // EMBED_BATCH_SIZE + 1} ({len(batch_texts)} docs)")
+            print("Saving documents to Supabase and Chroma...")
+            for i, (text, metadata, embedding) in enumerate(
+                zip(texts, metadatas, embeddings), start=1
+            ):
+                document_row_id = str(metadata.get("id") or uuid.uuid4())
+                metadata["id"] = document_row_id
+                self._insert_source_document(
+                    document_row_id=document_row_id,
+                    text=text,
+                    metadata=metadata,
+                    embedding=embedding,
+                )
+                self._upsert_chroma_document(
+                    document_row_id=document_row_id,
+                    text=text,
+                    metadata=metadata,
+                    embedding=embedding,
+                )
+                print(
+                    f"Saved document {i}/{len(processed_documents)} "
+                    f"to Supabase and Chroma"
+                )
 
-            print("Inserting documents into vector store...")
-            for i, (text, metadata, embedding) in enumerate(zip(texts, metadatas, embeddings)):
-                try:
-                    self.supabase.table("documents").insert({
-                        "id": metadata.get('id'),
-                        "content": text,
-                        "metadata": metadata,
-                        "embedding": embedding,
-                        "drive_folder_id": metadata.get('drive_folder_id')
-                    }).execute()
-                    print(f"Successfully inserted document {i+1}/{len(processed_documents)}")
-                except Exception as e:
-                    print(f"Error inserting document {i+1}: {e}")
-                    continue
-            
-            # 이미지 메타데이터: image_analysis가 있는 청크만 처리 (해당 페이지 청크에만 이미지 있음)
             await self._save_image_metadata_once(processed_documents, tenant_id)
-
             return True
         except Exception as e:
             print(f"Error adding documents to vector store: {e}")
             return False
 
+    def _embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings in batches to avoid provider token limits."""
+        embed_batch_size = 50
+        embeddings: List[List[float]] = []
+        total_batches = (len(texts) - 1) // embed_batch_size + 1 if texts else 0
+
+        for batch_start in range(0, len(texts), embed_batch_size):
+            batch_texts = texts[batch_start : batch_start + embed_batch_size]
+            batch_embeddings = self.embeddings.embed_documents(batch_texts)
+            embeddings.extend(batch_embeddings)
+            print(
+                f"Embedded batch {batch_start // embed_batch_size + 1}/{total_batches} "
+                f"({len(batch_texts)} docs)"
+            )
+        return embeddings
+
+    def _build_supabase_payload(
+        self,
+        document_row_id: str,
+        text: str,
+        metadata: Dict[str, Any],
+        embedding: Optional[List[float]] = None,
+    ) -> Dict[str, Any]:
+        payload = {
+            "id": document_row_id,
+            "content": text,
+            "metadata": metadata,
+        }
+        if self.supabase_write_embedding and embedding is not None:
+            payload["embedding"] = embedding
+        return payload
+
+    def _insert_source_document(
+        self,
+        document_row_id: str,
+        text: str,
+        metadata: Dict[str, Any],
+        embedding: Optional[List[float]] = None,
+    ) -> None:
+        payload = self._build_supabase_payload(
+            document_row_id=document_row_id,
+            text=text,
+            metadata=metadata,
+            embedding=embedding,
+        )
+        try:
+            self.supabase.table("documents").insert(payload).execute()
+        except Exception as exc:
+            if not self.supabase_write_embedding:
+                fallback_payload = dict(payload)
+                fallback_dimensions = self.supabase_dummy_embedding_dimensions
+                if fallback_dimensions > 0:
+                    # Some existing schemas still require a vector column even though
+                    # retrieval has moved to Chroma. Retry with a zero vector solely to
+                    # satisfy the legacy column shape without using it for search.
+                    fallback_payload["embedding"] = [0.0] * fallback_dimensions
+                    try:
+                        self.supabase.table("documents").insert(fallback_payload).execute()
+                        return
+                    except Exception as fallback_exc:
+                        raise RuntimeError(
+                            "Supabase documents insert failed without embedding and with "
+                            f"a dummy {fallback_dimensions}-dimensional vector. "
+                            "Check the documents.embedding column constraint or override "
+                            "SUPABASE_DUMMY_EMBEDDING_DIMENSIONS."
+                        ) from fallback_exc
+
+                raise RuntimeError(
+                    "Supabase documents insert failed without embedding. "
+                    "The documents.embedding column may still require a non-null vector. "
+                    "Relax or disable that constraint before using Chroma-only indexing."
+                ) from exc
+            raise
+
+    def _build_chroma_metadata(
+        self, metadata: Dict[str, Any], document_row_id: str
+    ) -> Dict[str, Any]:
+        chroma_metadata: Dict[str, Any] = {}
+        for key, value in (metadata or {}).items():
+            if value is None:
+                continue
+            if isinstance(value, PRIMITIVE_METADATA_TYPES):
+                chroma_metadata[key] = value
+
+        chroma_metadata["document_row_id"] = document_row_id
+        chroma_metadata.setdefault("type", "document")
+        return chroma_metadata
+
+    def _upsert_chroma_document(
+        self,
+        document_row_id: str,
+        text: str,
+        metadata: Dict[str, Any],
+        embedding: List[float],
+    ) -> None:
+        self.collection.upsert(
+            ids=[document_row_id],
+            embeddings=[embedding],
+            documents=[text],
+            metadatas=[self._build_chroma_metadata(metadata, document_row_id)],
+        )
+
     async def _save_image_metadata_once(
         self, processed_documents: List[Document], tenant_id: str
     ) -> None:
-        """이미지 메타데이터를 고유 이미지당 1회만 저장 (image_analysis가 있는 청크만 처리)"""
+        """이미지 메타데이터를 고유 이미지당 1회만 저장 (image_analysis가 있는 청크만 처리)."""
         try:
-            # 이미 저장한 image_id (임베딩 중복 방지)
-            saved_embedding_ids: set = set()
+            saved_embedding_ids: set[str] = set()
             total_images_saved = 0
 
             for doc in processed_documents:
-                image_analysis = doc.metadata.get('image_analysis') or []
+                image_analysis = doc.metadata.get("image_analysis") or []
                 if not image_analysis:
                     continue
 
-                doc_id = doc.metadata.get('id')
-                # extracted_images에서 image_id -> 전체 이미지 정보 매핑
+                doc_id = doc.metadata.get("id")
                 extracted_map = {
-                    img.get('image_id'): img
-                    for img in (doc.metadata.get('extracted_images') or [])
+                    img.get("image_id"): img
+                    for img in (doc.metadata.get("extracted_images") or [])
                 }
 
                 for analysis in image_analysis:
-                    image_id = analysis.get('image_id')
+                    image_id = analysis.get("image_id")
                     if not image_id:
                         continue
                     image_info = extracted_map.get(image_id)
                     if not image_info:
                         continue
 
-                    analysis_text = analysis.get('analysis', '')
-                    image_name = image_info.get('image_name', image_id)
+                    analysis_text = analysis.get("analysis", "")
+                    image_name = image_info.get("image_name", image_id)
 
-                    # 임베딩: 고유 image_id당 1회만 생성
                     if analysis_text and image_id not in saved_embedding_ids:
                         try:
                             image_embedding = self.embeddings.embed_query(analysis_text)
                             saved_embedding_ids.add(image_id)
-                            image_doc_data = {
-                                "id": str(uuid.uuid4()),
-                                "content": analysis_text,
-                                "metadata": {
-                                    "type": "image_analysis",
-                                    "image_id": image_id,
-                                    "document_id": doc_id,
-                                    "tenant_id": tenant_id,
-                                    "source": "image_extraction",
-                                    "file_name": str(image_name),
-                                    "source_file_name": doc.metadata.get("file_name", ""),
-                                    "drive_folder_name": doc.metadata.get("drive_folder_name", ""),
-                                    "drive_folder_id": (doc.metadata or {}).get("drive_folder_id", ""),
-                                    "image_url": image_info.get('image_url', ''),
-                                },
-                                "embedding": image_embedding,
-                                "drive_folder_id": (doc.metadata or {}).get("drive_folder_id"),
+
+                            image_document_row_id = str(uuid.uuid4())
+                            image_metadata = {
+                                "type": "image_analysis",
+                                "image_id": image_id,
+                                "document_id": doc_id,
+                                "tenant_id": tenant_id,
+                                "source": "image_extraction",
+                                "file_name": str(image_name),
+                                "source_file_name": doc.metadata.get("file_name", ""),
+                                "drive_folder_name": doc.metadata.get(
+                                    "drive_folder_name", ""
+                                ),
+                                "drive_folder_id": (doc.metadata or {}).get(
+                                    "drive_folder_id", ""
+                                ),
+                                "image_url": image_info.get("image_url", ""),
                             }
-                            self.supabase.table("documents").insert(image_doc_data).execute()
+                            self._insert_source_document(
+                                document_row_id=image_document_row_id,
+                                text=analysis_text,
+                                metadata=image_metadata,
+                                embedding=image_embedding,
+                            )
+                            self._upsert_chroma_document(
+                                document_row_id=image_document_row_id,
+                                text=analysis_text,
+                                metadata=image_metadata,
+                                embedding=image_embedding,
+                            )
                         except Exception as e:
                             print(f"Error generating embedding for image {image_id}: {e}")
 
-                    # document_images 테이블에 저장 (청크-이미지 매핑)
                     image_data = {
                         "id": str(uuid.uuid4()),
                         "document_id": doc_id,
                         "tenant_id": tenant_id,
                         "image_id": image_id,
-                        "image_url": image_info.get('image_url', ''),
-                        "metadata": image_info.get('metadata', {}),
+                        "image_url": image_info.get("image_url", ""),
+                        "metadata": image_info.get("metadata", {}),
                     }
                     self.supabase.table("document_images").insert(image_data).execute()
                     total_images_saved += 1
 
             if total_images_saved:
-                print(f"Saved image metadata: {total_images_saved} chunk-image link(s), {len(saved_embedding_ids)} unique image embedding(s)")
+                print(
+                    "Saved image metadata: "
+                    f"{total_images_saved} chunk-image link(s), "
+                    f"{len(saved_embedding_ids)} unique image embedding(s)"
+                )
         except Exception as e:
             print(f"Error in _save_image_metadata_once: {e}")
 
-    async def similarity_search(self, query: str, filter: Optional[Dict[str, Any]] = None, top_k: int = 5) -> List[Document]:
-        """Search for similar documents asynchronously."""
+    async def similarity_search(
+        self,
+        query: str,
+        filter: Optional[Dict[str, Any]] = None,
+        top_k: int = 5,
+    ) -> List[Document]:
+        """Search Chroma and hydrate the matching source documents from Supabase."""
         try:
             print(f"Searching for documents similar to query: {query}")
             return await asyncio.to_thread(self._similarity_search_sync, query, filter, top_k)
@@ -174,35 +312,88 @@ class VectorStoreManager:
             print(f"Error searching documents: {e}")
             return []
 
-    def _similarity_search_sync(self, query: str, filter: Optional[Dict[str, Any]] = None, top_k: int = 5) -> List[Document]:
+    def _build_chroma_where(
+        self, filter: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if not filter:
+            return None
+
+        where: Dict[str, Any] = {}
+        for key, value in filter.items():
+            if value is None:
+                continue
+            if isinstance(value, PRIMITIVE_METADATA_TYPES):
+                where[key] = value
+        if not where:
+            return None
+        if len(where) == 1:
+            return where
+        return {"$and": [{key: value} for key, value in where.items()]}
+
+    def _similarity_search_sync(
+        self,
+        query: str,
+        filter: Optional[Dict[str, Any]] = None,
+        top_k: int = 5,
+    ) -> List[Document]:
         try:
-            if not filter:
-                filter = {}
             query_embedding = self.embeddings.embed_query(query)
-            response = self.supabase.rpc(
-                'match_documents',
-                {
-                    'query_embedding': query_embedding,
-                    'filter': filter,
-                    'match_count': top_k
-                }
-            ).execute()
-            results = []
-            for match in response.data:
-                doc = Document(
-                    page_content=match['content'],
-                    metadata=match['metadata']
-                )
-                results.append(doc)
+            where = self._build_chroma_where(filter)
+            response = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=top_k,
+                where=where,
+            )
+
+            hit_ids = response.get("ids", [[]])
+            ordered_document_ids: List[str] = []
+            for raw_id in hit_ids[0] if hit_ids else []:
+                document_id = str(raw_id)
+                if document_id and document_id not in ordered_document_ids:
+                    ordered_document_ids.append(document_id)
+
+            results = self._fetch_documents_by_ids(ordered_document_ids)
             print(f"Found {len(results)} similar documents")
             return results
         except Exception as e:
             print(f"Error searching documents: {e}")
             return []
 
+    def _fetch_documents_by_ids(self, document_ids: List[str]) -> List[Document]:
+        if not document_ids:
+            return []
+
+        response = (
+            self.supabase.table("documents")
+            .select("id, content, metadata")
+            .in_("id", document_ids)
+            .execute()
+        )
+
+        rows_by_id = {
+            str(row.get("id")): row
+            for row in (response.data or [])
+            if row.get("id") is not None
+        }
+
+        ordered_documents: List[Document] = []
+        for document_id in document_ids:
+            row = rows_by_id.get(str(document_id))
+            if not row:
+                continue
+            ordered_documents.append(
+                Document(
+                    page_content=row.get("content") or "",
+                    metadata=row.get("metadata") or {},
+                )
+            )
+        return ordered_documents
+
     def get_retriever(self, top_k: int = 5, **kwargs):
-        """Get a retriever for the vector store."""
-        return self.vector_store.as_retriever(search_kwargs={"k": top_k})
+        raise NotImplementedError(
+            "SupabaseVectorStore retriever was removed. "
+            "Use similarity_search() and build the RAG context explicitly."
+        )
 
     async def get_chunks_by_indices(
         self,
@@ -261,10 +452,12 @@ class VectorStoreManager:
                 except (TypeError, ValueError):
                     idx = -1
                 if idx in target_set:
-                    results.append(Document(
-                        page_content=row.get("content") or "",
-                        metadata=meta,
-                    ))
+                    results.append(
+                        Document(
+                            page_content=row.get("content") or "",
+                            metadata=meta,
+                        )
+                    )
             print(f"Fetched {len(results)} chunks by indices for {file_name}")
             return results
         except Exception as e:
@@ -303,12 +496,15 @@ class VectorStoreManager:
                     continue
                 if meta.get("type") == "image_analysis":
                     continue
-                results.append({
-                    "chunk_index": meta.get("chunk_index"),
-                    "section_title": meta.get("section_title") or meta.get("content", "")[:50],
-                    "page_number": meta.get("page_number") or meta.get("page"),
-                    "content_length": meta.get("content_length"),
-                })
+                results.append(
+                    {
+                        "chunk_index": meta.get("chunk_index"),
+                        "section_title": meta.get("section_title")
+                        or meta.get("content", "")[:50],
+                        "page_number": meta.get("page_number") or meta.get("page"),
+                        "content_length": meta.get("content_length"),
+                    }
+                )
             return results
         except Exception as e:
             print(f"Error in _get_all_chunks_metadata_sync: {e}")
