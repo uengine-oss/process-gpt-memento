@@ -272,11 +272,7 @@ async def retrieve(
             ]
 
         return {
-            "response": docs,
-            "metadata": {
-                f"{doc.metadata.get('file_name', 'unknown')}#{doc.metadata.get('chunk_index', i)}": doc.metadata
-                for i, doc in enumerate(docs)
-            }
+            "response": docs
         }
         
     except Exception as e:
