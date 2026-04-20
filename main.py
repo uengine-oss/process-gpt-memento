@@ -235,9 +235,15 @@ async def retrieve(
     all_docs: bool = False,
     top_k: int = Query(default=5, ge=1, le=100),
     drive_folder_id: Optional[str] = None,
+    room_id: Optional[str] = None,
 ):
     try:
-        if proc_inst_id:
+        if room_id:
+            metadata_filter = {
+                "tenant_id": tenant_id,
+                "room_id": room_id
+            }
+        elif proc_inst_id:
             metadata_filter = {
                 "tenant_id": tenant_id,
                 "proc_inst_id": proc_inst_id
@@ -1040,20 +1046,23 @@ async def save_to_storage(
     Args:
         file: The file to upload
         tenant_id: Tenant ID
-        options: Optional JSON string with additional options (e.g., {"proc_inst_id": "..."})
-    
+        options: Optional JSON string with additional options
+                 (e.g., {"proc_inst_id": "...", "room_id": "..."})
+
     Returns:
         Dictionary with file_path, file_name, public_url, and processed status
     """
     try:
         import json
-        
+
         # Parse options if provided
         proc_inst_id = None
+        room_id = None
         if options:
             try:
                 options_dict = json.loads(options)
                 proc_inst_id = options_dict.get("proc_inst_id")
+                room_id = options_dict.get("room_id")
             except json.JSONDecodeError:
                 pass
         
@@ -1085,15 +1094,18 @@ async def save_to_storage(
             # 이미 files 폴더에 저장했으므로, process_image_file에서는 다시 저장하지 않고 기존 경로 사용
             file_id = storage_file_path.replace('/', '_').replace('\\', '_')
             documents = await process_image_file(
-                file_content, 
-                file_name, 
-                file_id, 
-                tenant_id, 
+                file_content,
+                file_name,
+                file_id,
+                tenant_id,
                 proc_inst_id,
                 storage_type='storage',
                 storage_file_path=storage_file_path,
                 public_url=upload_result.get('public_url')
             )
+            if documents and room_id:
+                for doc in documents:
+                    doc.metadata['room_id'] = room_id
         else:
             # Process document file
             file_io = io.BytesIO(file_content)
@@ -1143,6 +1155,8 @@ async def save_to_storage(
                 })
                 if proc_inst_id:
                     doc.metadata['proc_inst_id'] = proc_inst_id
+                if room_id:
+                    doc.metadata['room_id'] = room_id
 
         # If no documents but images were extracted, still consider it a success
         if not documents and not has_uploaded_images:
