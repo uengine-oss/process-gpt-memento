@@ -166,3 +166,4 @@ token.json
 credentials.json
 *.lock
 documents/
+chroma_db/

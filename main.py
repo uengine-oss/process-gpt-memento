@@ -238,11 +238,36 @@ async def retrieve(
     room_id: Optional[str] = None,
 ):
     try:
+        rag = RAGChain()
+        docs = []
+
         if room_id:
-            metadata_filter = {
-                "tenant_id": tenant_id,
-                "room_id": room_id
-            }
+            room_filter = {"tenant_id": tenant_id, "room_id": room_id}
+            global_filter = {"tenant_id": tenant_id, "knowledge_scope": "global"}
+            if drive_folder_id:
+                room_filter["drive_folder_id"] = drive_folder_id
+                global_filter["drive_folder_id"] = drive_folder_id
+
+            room_result = await rag.retrieve(query, room_filter, top_k=top_k)
+            global_result = await rag.retrieve(query, global_filter, top_k=top_k)
+            # 글로벌 지식을 우선 병합해, 방별 문서가 많아도 글로벌 용어집이 응답 후보에서 밀리지 않도록 한다.
+            raw_docs = (global_result.get("source_documents") or []) + (room_result.get("source_documents") or [])
+            dedup_keys = set()
+            for doc in raw_docs:
+                meta = doc.metadata or {}
+
+                dedup_key = (
+                    str(meta.get("id") or ""),
+                    str(meta.get("chunk_id") or ""),
+                    str(meta.get("file_id") or ""),
+                    str(meta.get("chunk_index") or ""),
+                )
+                if dedup_key in dedup_keys:
+                    continue
+                dedup_keys.add(dedup_key)
+                docs.append(doc)
+                if len(docs) >= top_k:
+                    break
         elif proc_inst_id:
             metadata_filter = {
                 "tenant_id": tenant_id,
@@ -258,18 +283,18 @@ async def retrieve(
                 "source_type": "process_output"
             }
 
-        rag = RAGChain()
-        if drive_folder_id:
-            metadata_filter = {**metadata_filter, "drive_folder_id": drive_folder_id}
+        if not room_id:
+            if drive_folder_id:
+                metadata_filter = {**metadata_filter, "drive_folder_id": drive_folder_id}
 
-        result = await rag.retrieve(query, metadata_filter, top_k=top_k)
-        docs = result["source_documents"]
-        if drive_folder_id:
-            docs = [
-                doc
-                for doc in docs
-                if (doc.metadata or {}).get("drive_folder_id") == drive_folder_id
-            ]
+            result = await rag.retrieve(query, metadata_filter, top_k=top_k)
+            docs = result["source_documents"]
+            if drive_folder_id:
+                docs = [
+                    doc
+                    for doc in docs
+                    if (doc.metadata or {}).get("drive_folder_id") == drive_folder_id
+                ]
 
         return {
             "response": docs
@@ -1102,6 +1127,10 @@ async def save_to_storage(
             if documents and room_id:
                 for doc in documents:
                     doc.metadata['room_id'] = room_id
+                    doc.metadata['knowledge_scope'] = 'room'
+            elif documents:
+                for doc in documents:
+                    doc.metadata['knowledge_scope'] = 'global'
         else:
             # Process document file
             file_io = io.BytesIO(file_content)
@@ -1153,6 +1182,9 @@ async def save_to_storage(
                     doc.metadata['proc_inst_id'] = proc_inst_id
                 if room_id:
                     doc.metadata['room_id'] = room_id
+                    doc.metadata['knowledge_scope'] = 'room'
+                else:
+                    doc.metadata['knowledge_scope'] = 'global'
 
         # If no documents but images were extracted, still consider it a success
         if not documents and not has_uploaded_images:
