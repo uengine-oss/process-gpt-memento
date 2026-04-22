@@ -12,6 +12,7 @@ from langchain.schema import Document
 from supabase import create_client
 
 from llm import create_embeddings
+import config
 
 
 load_dotenv()
@@ -28,24 +29,17 @@ class VectorStoreManager:
             os.getenv("SUPABASE_KEY"),
         )
         self.embeddings = create_embeddings()
-        self.supabase_write_embedding = (
-            os.getenv("SUPABASE_WRITE_EMBEDDING", "false").strip().lower()
-            in {"1", "true", "yes", "on"}
-        )
-        self.supabase_dummy_embedding_dimensions = int(
-            os.getenv("SUPABASE_DUMMY_EMBEDDING_DIMENSIONS", "1536")
+        self.supabase_write_embedding = config.supabase_write_embedding()
+        self.supabase_dummy_embedding_dimensions = (
+            config.supabase_dummy_embedding_dimensions()
         )
 
-        persist_dir = Path(
-            os.getenv("CHROMA_PERSIST_DIRECTORY", "./chroma_db")
-        ).expanduser()
+        persist_dir = Path(config.chroma_persist_directory()).expanduser()
         if not persist_dir.is_absolute():
             persist_dir = (Path(__file__).resolve().parent / persist_dir).resolve()
         persist_dir.mkdir(parents=True, exist_ok=True)
 
-        self.chroma_collection_name = (
-            os.getenv("CHROMA_COLLECTION_NAME") or "documents"
-        ).strip()
+        self.chroma_collection_name = config.chroma_collection_name().strip()
         self.chroma_client = PersistentClient(path=str(persist_dir))
         self.collection = self.chroma_client.get_or_create_collection(
             name=self.chroma_collection_name,
@@ -509,3 +503,13 @@ class VectorStoreManager:
         except Exception as e:
             print(f"Error in _get_all_chunks_metadata_sync: {e}")
             return []
+
+
+_vector_store_instance: Optional["VectorStoreManager"] = None
+
+
+def get_vector_store() -> "VectorStoreManager":
+    global _vector_store_instance
+    if _vector_store_instance is None:
+        _vector_store_instance = VectorStoreManager()
+    return _vector_store_instance

@@ -4,25 +4,35 @@ from typing import List, Dict, Any, Optional
 import asyncio
 from dotenv import load_dotenv
 from langchain.schema import Document
-from vector_store import VectorStoreManager
+from vector_store import VectorStoreManager, get_vector_store
 from llm import create_llm
+from retrievers import get_retriever
+
+load_dotenv(override=True)
+
 
 class RAGChain:
     def __init__(self):
         print("Initializing RAG Chain...")
-        # Load environment variables from .env file only
-        load_dotenv(override=True)
-        
-        llm_api_key = os.getenv("LLM_PROXY_API_KEY") or os.getenv("OPENAI_API_KEY")
+
+        llm_api_key = (
+            os.getenv("LLM_API_KEY")
+            or os.getenv("LLM_PROXY_API_KEY")
+            or os.getenv("OPENROUTER_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+        )
         if not llm_api_key:
-            raise ValueError("LLM_PROXY_API_KEY or OPENAI_API_KEY not found in .env file")
+            raise ValueError(
+                "No LLM API key found. Set one of: "
+                "LLM_API_KEY, LLM_PROXY_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY"
+            )
         
         # Initialize proxy-routed LLM via shared helper
         print("Initializing proxy-routed LLM...")
         self.llm = create_llm(temperature=0.0)
         print("Proxy-routed LLM initialized successfully")
         
-        self.vector_store = VectorStoreManager()
+        self.vector_store = get_vector_store()
         if self.vector_store.supabase is None:
             from supabase import create_client
             self.supabase = create_client(
@@ -61,25 +71,31 @@ class RAGChain:
         return 'en'
 
     async def retrieve(self, query: str, filter: Optional[Dict[str, Any]] = None, top_k: int = 5) -> Dict[str, Any]:
-        """Retrieve documents from the vector store."""
+        """
+        Retrieve documents from the vector store.
+
+        실제 검색 전략은 retrievers/config.py의 STRATEGY로 선택되며
+        (plain / multi_query / hyde / rag_fusion / rewrite), 여기서는
+        해당 retriever에게 위임만 한다.
+        """
         try:
             print(f"\nProcessing query: {query}")
-            
-            docs = await self.vector_store.similarity_search(query, filter=filter, top_k=top_k)
-            
+
+            retriever = get_retriever(top_k=top_k)
+            docs = await retriever.retrieve(
+                query,
+                self.vector_store,
+                filter=filter,
+                top_k=top_k,
+            )
+
             if not docs:
-                return {
-                    "source_documents": []
-                }
-            
-            return {
-                "source_documents": docs
-            }
+                return {"source_documents": []}
+
+            return {"source_documents": docs}
         except Exception as e:
             print(f"Error in retrieve: {e}")
-            return {
-                "source_documents": []
-            }
+            return {"source_documents": []}
         
     def _format_context_documents(self, source_documents: List[Document]) -> str:
         """Format retrieved documents into a compact context block for the LLM."""
@@ -167,13 +183,24 @@ class RAGChain:
         """Process and store documents in the vector store with integrated image analysis."""
         try:
             print(f"\nProcessing {len(documents)} documents...")
-            
-            # 이미지 분석을 먼저 수행
+
+            try:
+                from main import log_memory_snapshot
+                log_memory_snapshot(f"embed-before:{tenant_id}")
+            except Exception:
+                pass
+
             await self.process_document_images(documents)
-            
-            # 벡터 저장소에 저장 (이미지 분석 완료된 상태)
-            return await self.vector_store.add_documents(documents, tenant_id)
-            
+            result = await self.vector_store.add_documents(documents, tenant_id)
+
+            try:
+                from main import log_memory_snapshot
+                log_memory_snapshot(f"embed-after:{tenant_id}")
+            except Exception:
+                pass
+
+            return result
+
         except Exception as e:
             print(f"Error in process_and_store_documents: {e}")
             return False
@@ -434,98 +461,84 @@ class RAGChain:
             print(f"Error in process_database_records: {e}")
             return False
 
-    async def analyze_images_with_llm(self, images_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """추출된 이미지를 LLM으로 분석 - URL 또는 base64 사용"""
+    async def analyze_images_with_llm(
+        self,
+        images_data: List[Dict[str, Any]],
+        concurrency: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """추출된 이미지를 LLM으로 분석 - URL 또는 base64 사용. Semaphore 로 동시 호출 제한."""
         import base64
         import httpx
         from urllib.parse import urlparse
-        
-        analyzed_images = []
-        
-        for image_info in images_data:
-            try:
-                # Supabase Storage에서 업로드된 이미지의 URL 사용
-                image_url = image_info.get('image_url')
-                if not image_url:
-                    print(f"Skipping image {image_info.get('image_id')}: No image URL found")
-                    continue
-                
-                # 이미지 형식 감지
-                image_format = image_info.get('metadata', {}).get('format', 'png')
-                mime_type = f"image/{image_format.lower()}"
-                
-                # URL이 localhost인지 확인
-                parsed_url = urlparse(image_url)
-                is_localhost = parsed_url.hostname in ['localhost', '127.0.0.1', '0.0.0.0'] or (
-                    parsed_url.hostname and 'localhost' in parsed_url.hostname
-                )
-                
-                # 이미지 콘텐츠 준비
-                if is_localhost:
-                    # localhost인 경우 base64 인코딩 사용
-                    print(f"Downloading image from localhost URL: {image_url}")
-                    async with httpx.AsyncClient() as client:
-                        image_response = await client.get(image_url)
-                        image_response.raise_for_status()
-                        image_bytes = image_response.content
-                    
-                    # base64 인코딩
-                    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
-                    image_data_url = f"data:{mime_type};base64,{image_base64}"
-                    
-                    # OpenAI Vision API에 base64 데이터 전달
-                    response = await self.llm.ainvoke([
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": "이 이미지를 자세히 분석하고 설명해주세요. 문서의 일부라면 텍스트 내용, 차트, 그래프, 이미지 등을 포함하여 설명해주세요."
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": image_data_url
-                                    }
-                                }
-                            ]
-                        }
-                    ])
-                else:
-                    # localhost가 아닌 경우 URL 사용
-                    print(f"Using image URL: {image_url}")
-                    response = await self.llm.ainvoke([
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": "이 이미지를 자세히 분석하고 설명해주세요. 문서의 일부라면 텍스트 내용, 차트, 그래프, 이미지 등을 포함하여 설명해주세요."
-                                },
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": image_url
-                                    }
-                                }
-                            ]
-                        }
-                    ])
-                
-                analyzed_images.append({
-                    'image_id': image_info['image_id'],
-                    'analysis': response.content,
-                    'metadata': image_info['metadata'],
-                    'image_url': image_url
-                })
-                
-                print(f"Successfully analyzed image {image_info.get('image_id')} from URL: {image_url}")
-                
-            except Exception as e:
-                print(f"Error analyzing image {image_info.get('image_id')}: {e}")
-                continue
-        
-        return analyzed_images
+
+        sem = asyncio.Semaphore(concurrency)
+
+        async def analyze_one(image_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            async with sem:
+                return await self._analyze_single_image(image_info)
+
+        results = await asyncio.gather(
+            *[analyze_one(img) for img in images_data],
+            return_exceptions=True,
+        )
+        return [r for r in results if isinstance(r, dict)]
+
+    async def _analyze_single_image(self, image_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        import base64
+        import httpx
+        from urllib.parse import urlparse
+
+        image_url = image_info.get('image_url')
+        if not image_url:
+            return None
+
+        image_format = image_info.get('metadata', {}).get('format', 'png')
+        mime_type = f"image/{image_format.lower()}"
+        parsed_url = urlparse(image_url)
+        is_localhost = parsed_url.hostname in ['localhost', '127.0.0.1', '0.0.0.0'] or (
+            parsed_url.hostname and 'localhost' in parsed_url.hostname
+        )
+        prompt_text = "이 이미지를 자세히 분석하고 설명해주세요. 문서의 일부라면 텍스트 내용, 차트, 그래프, 이미지 등을 포함하여 설명해주세요."
+
+        try:
+            if is_localhost:
+                async with httpx.AsyncClient() as client:
+                    image_response = await client.get(image_url)
+                    image_response.raise_for_status()
+                    image_bytes = image_response.content
+                image_b64 = base64.b64encode(image_bytes).decode('utf-8')
+                url_payload = f"data:{mime_type};base64,{image_b64}"
+            else:
+                url_payload = image_url
+
+            response = await self.llm.ainvoke([{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt_text},
+                    {"type": "image_url", "image_url": {"url": url_payload}},
+                ],
+            }])
+
+            return {
+                'image_id': image_info['image_id'],
+                'analysis': response.content,
+                'metadata': image_info['metadata'],
+                'image_url': image_url,
+            }
+        except Exception as e:
+            print(f"Error analyzing image {image_info.get('image_id')}: {e}")
+            return None
+
+
+_rag_chain_instance: Optional["RAGChain"] = None
+
+
+def get_rag_chain() -> "RAGChain":
+    global _rag_chain_instance
+    if _rag_chain_instance is None:
+        _rag_chain_instance = RAGChain()
+    return _rag_chain_instance
+
 
 # Example usage
 if __name__ == "__main__":
