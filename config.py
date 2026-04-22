@@ -14,6 +14,7 @@ LLM_PROVIDERS: Dict[str, Dict[str, Any]] = {
     "openai": {
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-4o",
+        "supports_vision": True,
         "api_key_env": [
             "OPENAI_LLM_API_KEY",
             "LLM_API_KEY",
@@ -26,6 +27,7 @@ LLM_PROVIDERS: Dict[str, Dict[str, Any]] = {
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
         "model": "openai/gpt-oss-120b",
+        "supports_vision": False,
         "api_key_env": ["OPENROUTER_API_KEY", "OPENROUTER_LLM_API_KEY"],
         "base_url_env": ["OPENROUTER_LLM_BASE_URL", "OPENROUTER_BASE_URL"],
         "model_env": ["OPENROUTER_LLM_MODEL"],
@@ -33,6 +35,7 @@ LLM_PROVIDERS: Dict[str, Dict[str, Any]] = {
     "custom": {
         "base_url": None,
         "model": "/models/openai/gpt-oss-120b",
+        "supports_vision": False,
         "api_key_env": ["CUSTOM_LLM_API_KEY"],
         "base_url_env": ["CUSTOM_LLM_BASE_URL"],
         "model_env": ["CUSTOM_LLM_MODEL"],
@@ -129,8 +132,16 @@ def resolve_llm_config(model_override: Optional[str] = None) -> Dict[str, Any]:
         "base_url": base_url,
         "api_key": _first_env(spec["api_key_env"]),
         "model": model_override or _first_env(spec["model_env"]) or spec["model"],
+        "supports_vision": bool(spec.get("supports_vision", False)),
         "extra_headers": _openrouter_headers() if provider == "openrouter" else {},
     }
+
+
+def image_analysis_enabled() -> bool:
+    override = os.getenv("MEMENTO_IMAGE_ANALYSIS")
+    if override is not None and override.strip() != "":
+        return override.strip().lower() in {"1", "true", "yes", "on"}
+    return resolve_llm_config().get("supports_vision", False)
 
 
 def resolve_embedding_config(model_override: Optional[str] = None) -> Dict[str, Any]:
