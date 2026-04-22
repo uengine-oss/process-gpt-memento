@@ -381,26 +381,16 @@ class GoogleDriveLoader:
             fh.seek(0)
             file_content = fh.read()
             
-            # 이미지 추출 (document_loader 사용)
-            from document_loader import DocumentProcessor
-            from image_storage_utils import ImageStorageUtils
-            
-            doc_processor = DocumentProcessor()
-            extracted_images = await doc_processor.extract_images_from_document(
-                file_content, 
-                file_name, 
-                file_id
+            from document_loader import get_document_processor
+
+            doc_processor = get_document_processor()
+            extracted_images = await doc_processor.extract_and_upload_images_batched(
+                file_content,
+                file_name,
+                file_id,
+                tenant_id,
+                batch_size=15,
             )
-            
-            # Supabase Storage에 이미지 업로드
-            if extracted_images:
-                storage_utils = ImageStorageUtils()
-                uploaded_images = await storage_utils.upload_images_batch(
-                    extracted_images, 
-                    tenant_id, 
-                    file_id
-                )
-                extracted_images = uploaded_images
             
             # 문서 처리
             fh.seek(0)

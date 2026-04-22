@@ -9,7 +9,7 @@ import tempfile
 import asyncio
 import io
 import zipfile
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, AsyncIterator
 from pathlib import Path
 from pydantic import BaseModel
 from langchain.schema import Document
@@ -718,6 +718,142 @@ class DocumentProcessor:
             print(f"Error processing PPTX file {file_name}: {e}")
             
         return extracted_images
+
+    async def iter_extract_images_from_document(
+        self, file_content: bytes, file_name: str, file_id: str
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Yield one image at a time so callers can process in batches without holding all bytes."""
+        file_extension = Path(file_name).suffix.lower()
+        if file_extension == '.pdf':
+            async for img in self._iter_pdf_images(file_content, file_name, file_id):
+                yield img
+        elif file_extension == '.docx':
+            async for img in self._iter_zip_images(file_content, file_id, suffix='.docx',
+                                                   prefix='word/media/', id_tpl='{file_id}_img{i}'):
+                yield img
+        elif file_extension == '.pptx':
+            async for img in self._iter_zip_images(file_content, file_id, suffix='.pptx',
+                                                   prefix='ppt/media/', id_tpl='{file_id}_slide_img{i}'):
+                yield img
+
+    async def _iter_pdf_images(
+        self, file_content: bytes, file_name: str, file_id: str
+    ) -> AsyncIterator[Dict[str, Any]]:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+            tmp.write(file_content)
+            tmp_path = tmp.name
+        try:
+            doc = fitz.open(tmp_path)
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                for img_index, img in enumerate(page.get_images()):
+                    try:
+                        base_image = doc.extract_image(img[0])
+                        image_bytes = base_image['image']
+                        ext = base_image.get('ext', 'png')
+                        yield {
+                            'image_id': f"{file_id}_page{page_num+1}_img{img_index}",
+                            'image_name': f"{file_id}_page{page_num+1}_img{img_index}.{ext}",
+                            'image_data': image_bytes,
+                            'metadata': {
+                                'format': ext,
+                                'source_path': file_name,
+                                'page_number': page_num + 1,
+                                'image_index': img_index,
+                            },
+                        }
+                    except Exception as e:
+                        print(f"Error extracting image {img_index} from page {page_num + 1}: {e}")
+                        continue
+            doc.close()
+        finally:
+            os.unlink(tmp_path)
+
+    async def _iter_zip_images(
+        self, file_content: bytes, file_id: str, suffix: str, prefix: str, id_tpl: str
+    ) -> AsyncIterator[Dict[str, Any]]:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(file_content)
+            tmp_path = tmp.name
+        try:
+            with zipfile.ZipFile(tmp_path, 'r') as zf:
+                image_files = [f for f in zf.namelist() if f.startswith(prefix)]
+                for i, image_path in enumerate(image_files, start=1):
+                    try:
+                        data = zf.read(image_path)
+                        ext = Path(image_path).suffix.lower()
+                        if not ext:
+                            if data.startswith(b'\xff\xd8\xff'):
+                                ext = '.jpg'
+                            elif data.startswith(b'\x89PNG\r\n\x1a\n'):
+                                ext = '.png'
+                            elif data.startswith(b'GIF8'):
+                                ext = '.gif'
+                            else:
+                                ext = '.png'
+                        image_id = id_tpl.format(file_id=file_id, i=i)
+                        yield {
+                            'image_id': image_id,
+                            'image_name': f"{image_id}{ext}",
+                            'image_data': data,
+                            'metadata': {
+                                'format': ext[1:],
+                                'source_path': image_path,
+                                'image_index': i,
+                            },
+                        }
+                    except Exception as e:
+                        print(f"Error extracting image {image_path}: {e}")
+                        continue
+        finally:
+            os.unlink(tmp_path)
+
+    async def extract_and_upload_images_batched(
+        self,
+        file_content: bytes,
+        file_name: str,
+        file_id: str,
+        tenant_id: str,
+        batch_size: int = 15,
+    ) -> List[Dict[str, Any]]:
+        """Extract and upload images in batches; raw bytes released between batches."""
+        from image_storage_utils import get_image_storage_utils
+        storage = get_image_storage_utils()
+        folder = f"extracted_images/{tenant_id}/{file_id}"
+
+        uploaded: List[Dict[str, Any]] = []
+        batch: List[Dict[str, Any]] = []
+        total = 0
+
+        async def flush() -> None:
+            nonlocal total
+            if not batch:
+                return
+            results = await asyncio.gather(*[
+                storage.upload_image_to_storage(img['image_data'], img['image_name'], folder)
+                for img in batch
+            ], return_exceptions=True)
+            for img, result in zip(batch, results):
+                if isinstance(result, Exception) or not result:
+                    print(f"Error uploading {img['image_name']}: {result}")
+                    continue
+                uploaded.append({
+                    'image_id': img['image_id'],
+                    'image_name': img['image_name'],
+                    'image_url': result.get('public_url'),
+                    'metadata': img['metadata'],
+                })
+            total += len(batch)
+            print(f"Uploaded {total} images (batch of {len(batch)})")
+            batch.clear()
+
+        async for img in self.iter_extract_images_from_document(file_content, file_name, file_id):
+            batch.append(img)
+            if len(batch) >= batch_size:
+                await flush()
+        await flush()
+        return uploaded
+
 
 _document_processor_instance: Optional["DocumentProcessor"] = None
 

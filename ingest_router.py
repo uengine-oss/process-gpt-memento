@@ -810,21 +810,14 @@ async def save_to_storage(
             processor = get_document_processor()
 
             file_id_for_images = storage_file_path.replace('/', '_').replace('\\', '_')
-            extracted_images = await processor.extract_images_from_document(
+            uploaded_images = await processor.extract_and_upload_images_batched(
                 file_content,
                 file_name,
-                file_id_for_images
+                file_id_for_images,
+                tenant_id,
+                batch_size=15,
             )
-
-            if extracted_images:
-                storage_utils = get_image_storage_utils()
-                uploaded_images = await storage_utils.upload_images_batch(
-                    extracted_images,
-                    tenant_id,
-                    file_id_for_images
-                )
-                image_urls = [img.get('image_url') for img in uploaded_images if img.get('image_url')]
-                has_uploaded_images = len(uploaded_images) > 0
+            has_uploaded_images = len(uploaded_images) > 0
 
             docs = await processor.load_document(file_io, file_name)
 
