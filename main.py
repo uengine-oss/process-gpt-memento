@@ -47,6 +47,9 @@ supabase: Client = create_client(
     os.getenv("SUPABASE_KEY")
 )
 
+ROBO_GLOSSARY_API_BASE_URL = (os.getenv("ROBO_GLOSSARY_API_BASE_URL") or "http://127.0.0.1:5504/robo").rstrip("/")
+ROBO_GLOSSARY_TIMEOUT_SEC = float(os.getenv("ROBO_GLOSSARY_TIMEOUT_SEC", "5"))
+
 # Drive folder indexing job state (in-memory)
 drive_jobs: Dict[str, dict] = {}
 tenant_active_job: Dict[str, str] = {}
@@ -89,6 +92,69 @@ class ProcessOutputRequest(BaseModel):
 class UploadRequest(BaseModel):
     tenant_id: str
     options: Optional[dict] = None
+
+
+async def retrieve_glossary_terms(query: str, tenant_id: str, top_k: int) -> List[Document]:
+    normalized_query = (query or "").strip()
+    if not normalized_query:
+        return []
+
+    search_url = f"{ROBO_GLOSSARY_API_BASE_URL}/glossary/terms/search"
+    headers = {
+        "Accept": "application/json",
+        "X-Tenant-Id": tenant_id,
+    }
+    params = {
+        "query": normalized_query,
+        "limit": str(max(1, min(top_k, 20))),
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=ROBO_GLOSSARY_TIMEOUT_SEC) as client:
+            response = await client.get(search_url, params=params, headers=headers)
+            response.raise_for_status()
+            payload = response.json() if response.text else {}
+    except Exception as e:
+        print(f"Glossary retrieval skipped due to error: {e}")
+        return []
+
+    docs: List[Document] = []
+    for term in payload.get("terms") or []:
+        name = str(term.get("name") or "").strip()
+        if not name:
+            continue
+        description = str(term.get("description") or "").strip()
+        glossary_name = str(term.get("glossaryName") or "").strip()
+        synonyms = term.get("synonyms") if isinstance(term.get("synonyms"), list) else []
+        synonyms_text = ", ".join(str(item).strip() for item in synonyms if str(item).strip())
+
+        page_content_lines = [
+            f"[용어집] {name}",
+            f"설명: {description or '-'}",
+        ]
+        if glossary_name:
+            page_content_lines.append(f"용어집: {glossary_name}")
+        if synonyms_text:
+            page_content_lines.append(f"동의어: {synonyms_text}")
+
+        docs.append(
+            Document(
+                page_content="\n".join(page_content_lines),
+                metadata={
+                    "tenant_id": tenant_id,
+                    "knowledge_scope": "global",
+                    "source_type": "glossary_term",
+                    "file_name": f"glossary-{(glossary_name or 'global').replace(' ', '_')}.txt",
+                    "chunk_index": 0,
+                    "glossary_id": term.get("glossaryId"),
+                    "glossary_name": glossary_name,
+                    "term_id": term.get("id"),
+                    "term_name": name,
+                    "term_status": term.get("status"),
+                },
+            )
+        )
+    return docs
 
 async def process_image_file(file_content: bytes, file_name: str, file_id: str, tenant_id: str, proc_inst_id: Optional[str] = None, storage_type: str = 'storage', storage_file_path: Optional[str] = None, public_url: Optional[str] = None) -> Optional[List[Document]]:
     """이미지 파일을 처리하여 Document 객체로 변환"""
@@ -295,6 +361,29 @@ async def retrieve(
                     for doc in docs
                     if (doc.metadata or {}).get("drive_folder_id") == drive_folder_id
                 ]
+
+        glossary_docs = await retrieve_glossary_terms(query=query, tenant_id=tenant_id, top_k=top_k)
+        if glossary_docs:
+            merged_docs: List[Document] = []
+            dedup_keys = set()
+            for doc in glossary_docs + docs:
+                meta = doc.metadata or {}
+                dedup_key = (
+                    str(meta.get("source_type") or ""),
+                    str(meta.get("term_id") or ""),
+                    str(meta.get("id") or ""),
+                    str(meta.get("chunk_id") or ""),
+                    str(meta.get("file_id") or ""),
+                    str(meta.get("chunk_index") or ""),
+                    (doc.page_content or "").strip(),
+                )
+                if dedup_key in dedup_keys:
+                    continue
+                dedup_keys.add(dedup_key)
+                merged_docs.append(doc)
+                if len(merged_docs) >= max(top_k, min(top_k * 2, 20)):
+                    break
+            docs = merged_docs
 
         return {
             "response": docs
