@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
 from supabase import create_client, Client
+from langchain.schema import Document
 
 from google_drive_loader import GoogleDriveLoader
 from rag_chain import RAGChain, get_rag_chain
