@@ -44,6 +44,7 @@ def _read_rss_mb() -> Optional[float]:
 
 def log_memory_snapshot(label: str = "periodic", top: int = 5) -> None:
     gc.collect()
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rss = _read_rss_mb()
     objs = len(gc.get_objects())
 
@@ -56,7 +57,7 @@ def log_memory_snapshot(label: str = "periodic", top: int = 5) -> None:
         pass
 
     print(
-        f"[memory:{label}] rss={rss}MB gc_objects={objs} "
+        f"{ts} [memory:{label}] rss={rss}MB gc_objects={objs} "
         f"drive_jobs={jobs_total}(running={jobs_running})",
         flush=True,
     )
@@ -66,7 +67,7 @@ def log_memory_snapshot(label: str = "periodic", top: int = 5) -> None:
         for i, s in enumerate(stats, 1):
             frame = s.traceback[0]
             print(
-                f"[memory:{label}] top{i} {frame.filename}:{frame.lineno} "
+                f"{ts} [memory:{label}] top{i} {frame.filename}:{frame.lineno} "
                 f"size={round(s.size / 1024, 1)}KB count={s.count}",
                 flush=True,
             )
