@@ -233,6 +233,10 @@ class RAGChain:
 
     async def process_document_images(self, documents: list[Document]) -> None:
         """문서들의 이미지를 분석하고, 해당 이미지가 나오는 페이지/구간의 청크에만 설명 추가."""
+        import config
+        if not config.image_analysis_enabled():
+            print("Image analysis disabled (provider does not support vision)")
+            return
         try:
             # 1) 고유 이미지 수집 (image_id 기준, 한 번만 분석)
             unique_images: Dict[str, Dict[str, Any]] = {}
@@ -464,24 +468,32 @@ class RAGChain:
     async def analyze_images_with_llm(
         self,
         images_data: List[Dict[str, Any]],
+        batch_size: int = 10,
         concurrency: int = 5,
     ) -> List[Dict[str, Any]]:
-        """추출된 이미지를 LLM으로 분석 - URL 또는 base64 사용. Semaphore 로 동시 호출 제한."""
-        import base64
-        import httpx
-        from urllib.parse import urlparse
+        """배치 단위로 Vision 분석. 배치 내 concurrency 만큼 동시 호출."""
+        analyzed: List[Dict[str, Any]] = []
+        total = len(images_data)
 
-        sem = asyncio.Semaphore(concurrency)
+        for start in range(0, total, batch_size):
+            batch = images_data[start:start + batch_size]
+            sem = asyncio.Semaphore(concurrency)
 
-        async def analyze_one(image_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            async with sem:
-                return await self._analyze_single_image(image_info)
+            async def analyze_one(image_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                async with sem:
+                    return await self._analyze_single_image(image_info)
 
-        results = await asyncio.gather(
-            *[analyze_one(img) for img in images_data],
-            return_exceptions=True,
-        )
-        return [r for r in results if isinstance(r, dict)]
+            batch_results = await asyncio.gather(
+                *[analyze_one(img) for img in batch],
+                return_exceptions=True,
+            )
+            for r in batch_results:
+                if isinstance(r, dict):
+                    analyzed.append(r)
+
+            print(f"Analyzed {min(start + batch_size, total)}/{total} images")
+
+        return analyzed
 
     async def _analyze_single_image(self, image_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         import base64

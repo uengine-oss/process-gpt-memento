@@ -167,3 +167,9 @@ credentials.json
 *.lock
 documents/
 chroma_db/
+
+# Benchmark runtime artifacts (keep scripts, ignore data)
+benchmark/docs/*
+!benchmark/docs/.gitkeep
+benchmark/chroma_bench/
+benchmark/results/
