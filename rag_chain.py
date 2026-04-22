@@ -183,13 +183,24 @@ class RAGChain:
         """Process and store documents in the vector store with integrated image analysis."""
         try:
             print(f"\nProcessing {len(documents)} documents...")
-            
-            # 이미지 분석을 먼저 수행
+
+            try:
+                from main import log_memory_snapshot
+                log_memory_snapshot(f"embed-before:{tenant_id}")
+            except Exception:
+                pass
+
             await self.process_document_images(documents)
-            
-            # 벡터 저장소에 저장 (이미지 분석 완료된 상태)
-            return await self.vector_store.add_documents(documents, tenant_id)
-            
+            result = await self.vector_store.add_documents(documents, tenant_id)
+
+            try:
+                from main import log_memory_snapshot
+                log_memory_snapshot(f"embed-after:{tenant_id}")
+            except Exception:
+                pass
+
+            return result
+
         except Exception as e:
             print(f"Error in process_and_store_documents: {e}")
             return False

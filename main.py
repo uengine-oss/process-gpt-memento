@@ -9,6 +9,7 @@ import io
 import gc
 import json
 import httpx
+import asyncio
 import tracemalloc
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
@@ -27,15 +28,7 @@ from ingest_router import router as ingest_router
 
 app = FastAPI(title="Memento Service API", description="API for document processing and querying")
 
-@app.on_event("startup")
-async def _log_startup_config():
-    log_provider_config()
-    log_chunker_strategy()
-    log_retriever_strategy()
-    if os.getenv("MEMENTO_TRACEMALLOC", "0").strip().lower() in {"1", "true", "yes", "on"}:
-        if not tracemalloc.is_tracing():
-            tracemalloc.start(25)
-            print("tracemalloc started (depth=25)")
+MEMORY_LOG_INTERVAL_SEC = 60
 
 
 def _read_rss_mb() -> Optional[float]:
@@ -47,6 +40,58 @@ def _read_rss_mb() -> Optional[float]:
     except Exception:
         return None
     return None
+
+
+def log_memory_snapshot(label: str = "periodic", top: int = 5) -> None:
+    gc.collect()
+    rss = _read_rss_mb()
+    objs = len(gc.get_objects())
+
+    jobs_total = jobs_running = 0
+    try:
+        from ingest_router import drive_jobs
+        jobs_total = len(drive_jobs)
+        jobs_running = sum(1 for j in drive_jobs.values() if j.get("status") == "running")
+    except Exception:
+        pass
+
+    print(
+        f"[memory:{label}] rss={rss}MB gc_objects={objs} "
+        f"drive_jobs={jobs_total}(running={jobs_running})",
+        flush=True,
+    )
+
+    if tracemalloc.is_tracing():
+        stats = tracemalloc.take_snapshot().statistics("lineno")[:top]
+        for i, s in enumerate(stats, 1):
+            frame = s.traceback[0]
+            print(
+                f"[memory:{label}] top{i} {frame.filename}:{frame.lineno} "
+                f"size={round(s.size / 1024, 1)}KB count={s.count}",
+                flush=True,
+            )
+
+
+async def _memory_log_loop():
+    while True:
+        await asyncio.sleep(MEMORY_LOG_INTERVAL_SEC)
+        try:
+            log_memory_snapshot("periodic")
+        except Exception as e:
+            print(f"[memory:periodic] error: {e}", flush=True)
+
+
+@app.on_event("startup")
+async def _log_startup_config():
+    log_provider_config()
+    log_chunker_strategy()
+    log_retriever_strategy()
+    if os.getenv("MEMENTO_TRACEMALLOC", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        if not tracemalloc.is_tracing():
+            tracemalloc.start(25)
+            print("tracemalloc started (depth=25)", flush=True)
+    log_memory_snapshot("startup")
+    asyncio.create_task(_memory_log_loop())
 
 
 @app.get("/debug/memory")
