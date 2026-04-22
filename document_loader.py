@@ -15,6 +15,8 @@ from pydantic import BaseModel
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from openai import OpenAI
+
+from chunkers import get_chunker
 from langchain_community.document_loaders import (
     UnstructuredWordDocumentLoader,
     UnstructuredPowerPointLoader,
@@ -158,13 +160,9 @@ class DocumentProcessor:
     def __init__(self, chunk_size: int = 2000, chunk_overlap: int = 400):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.chunk_size,
-            chunk_overlap=self.chunk_overlap,
-            separators=["\n\n", "\n", ".", "!", "?", " ", ""],
-            length_function=len,
-            is_separator_regex=False
-        )
+        # Chunking strategy is selected via CHUNKER_STRATEGY env var
+        # (recursive / fixed_token / markdown_header / semantic / hybrid).
+        self.chunker = get_chunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         self._openai_client: Optional[OpenAI] = None
 
     def _get_openai_client(self) -> OpenAI:
@@ -453,8 +451,8 @@ class DocumentProcessor:
                 for doc in documents:
                     doc.metadata.update(metadata)
             
-            # Split documents into chunks
-            chunks = await asyncio.to_thread(self.text_splitter.split_documents, documents)
+            # Split documents into chunks (strategy pluggable via CHUNKER_STRATEGY)
+            chunks = await self.chunker.split(documents)
 
             # Add chunk information to metadata
             for i, chunk in enumerate(chunks):
@@ -721,8 +719,18 @@ class DocumentProcessor:
             
         return extracted_images
 
+_document_processor_instance: Optional["DocumentProcessor"] = None
+
+
+def get_document_processor() -> "DocumentProcessor":
+    global _document_processor_instance
+    if _document_processor_instance is None:
+        _document_processor_instance = DocumentProcessor()
+    return _document_processor_instance
+
+
 # Example usage
 if __name__ == "__main__":
     processor = DocumentProcessor()
     documents = processor.process_directory("./documents")
-    print(f"Processed {len(documents)} document chunks") 
+    print(f"Processed {len(documents)} document chunks")

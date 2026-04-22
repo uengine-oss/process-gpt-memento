@@ -4,25 +4,35 @@ from typing import List, Dict, Any, Optional
 import asyncio
 from dotenv import load_dotenv
 from langchain.schema import Document
-from vector_store import VectorStoreManager
+from vector_store import VectorStoreManager, get_vector_store
 from llm import create_llm
+from retrievers import get_retriever
+
+load_dotenv(override=True)
+
 
 class RAGChain:
     def __init__(self):
         print("Initializing RAG Chain...")
-        # Load environment variables from .env file only
-        load_dotenv(override=True)
-        
-        llm_api_key = os.getenv("LLM_PROXY_API_KEY") or os.getenv("OPENAI_API_KEY")
+
+        llm_api_key = (
+            os.getenv("LLM_API_KEY")
+            or os.getenv("LLM_PROXY_API_KEY")
+            or os.getenv("OPENROUTER_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+        )
         if not llm_api_key:
-            raise ValueError("LLM_PROXY_API_KEY or OPENAI_API_KEY not found in .env file")
+            raise ValueError(
+                "No LLM API key found. Set one of: "
+                "LLM_API_KEY, LLM_PROXY_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY"
+            )
         
         # Initialize proxy-routed LLM via shared helper
         print("Initializing proxy-routed LLM...")
         self.llm = create_llm(temperature=0.0)
         print("Proxy-routed LLM initialized successfully")
         
-        self.vector_store = VectorStoreManager()
+        self.vector_store = get_vector_store()
         if self.vector_store.supabase is None:
             from supabase import create_client
             self.supabase = create_client(
@@ -61,25 +71,31 @@ class RAGChain:
         return 'en'
 
     async def retrieve(self, query: str, filter: Optional[Dict[str, Any]] = None, top_k: int = 5) -> Dict[str, Any]:
-        """Retrieve documents from the vector store."""
+        """
+        Retrieve documents from the vector store.
+
+        실제 검색 전략은 retrievers/config.py의 STRATEGY로 선택되며
+        (plain / multi_query / hyde / rag_fusion / rewrite), 여기서는
+        해당 retriever에게 위임만 한다.
+        """
         try:
             print(f"\nProcessing query: {query}")
-            
-            docs = await self.vector_store.similarity_search(query, filter=filter, top_k=top_k)
-            
+
+            retriever = get_retriever(top_k=top_k)
+            docs = await retriever.retrieve(
+                query,
+                self.vector_store,
+                filter=filter,
+                top_k=top_k,
+            )
+
             if not docs:
-                return {
-                    "source_documents": []
-                }
-            
-            return {
-                "source_documents": docs
-            }
+                return {"source_documents": []}
+
+            return {"source_documents": docs}
         except Exception as e:
             print(f"Error in retrieve: {e}")
-            return {
-                "source_documents": []
-            }
+            return {"source_documents": []}
         
     def _format_context_documents(self, source_documents: List[Document]) -> str:
         """Format retrieved documents into a compact context block for the LLM."""
@@ -526,6 +542,17 @@ class RAGChain:
                 continue
         
         return analyzed_images
+
+
+_rag_chain_instance: Optional["RAGChain"] = None
+
+
+def get_rag_chain() -> "RAGChain":
+    global _rag_chain_instance
+    if _rag_chain_instance is None:
+        _rag_chain_instance = RAGChain()
+    return _rag_chain_instance
+
 
 # Example usage
 if __name__ == "__main__":

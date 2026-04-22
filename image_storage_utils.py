@@ -3,7 +3,7 @@ Image storage utilities for Supabase Storage
 """
 import os
 import asyncio
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from supabase import create_client, Client
 
 class ImageStorageUtils:
@@ -102,5 +102,15 @@ class ImageStorageUtils:
             except Exception as e:
                 print(f"Error uploading image {image.get('image_name', 'unknown')}: {e}")
                 continue
-                
+
         return uploaded_images
+
+
+_image_storage_instance: Optional["ImageStorageUtils"] = None
+
+
+def get_image_storage_utils() -> "ImageStorageUtils":
+    global _image_storage_instance
+    if _image_storage_instance is None:
+        _image_storage_instance = ImageStorageUtils()
+    return _image_storage_instance
