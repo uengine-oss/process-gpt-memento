@@ -470,13 +470,6 @@ class DocumentProcessor:
                     except (TypeError, ValueError):
                         pass
 
-            # LLM으로 각 청크에 section_title 생성
-            print(f"Generating section_title for {len(chunks)} chunks...")
-            section_titles = await self._generate_section_titles(chunks)
-            for chunk, title in zip(chunks, section_titles):
-                if title:
-                    chunk.metadata["section_title"] = title
-
             return chunks
         except Exception as e:
             print(f"Error processing documents: {e}")
@@ -817,6 +810,11 @@ class DocumentProcessor:
         batch_size: int = 15,
     ) -> List[Dict[str, Any]]:
         """Extract and upload images in batches; raw bytes released between batches."""
+        import config
+        if not config.image_analysis_enabled():
+            print("Skipping image extraction/upload (vision disabled)")
+            return []
+
         from image_storage_utils import get_image_storage_utils
         storage = get_image_storage_utils()
         folder = f"extracted_images/{tenant_id}/{file_id}"
