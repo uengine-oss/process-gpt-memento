@@ -3,12 +3,12 @@ from typing import Dict, Optional, Type
 
 from . import config
 from .base import BaseParser
-from .pymupdf4llm_parser import PyMuPDF4LLMParser
+from .pymupdf_parser import PyMuPDFParser
 from .pdfplumber_parser import PdfplumberParser
 
 
 _REGISTRY: Dict[str, Type[BaseParser]] = {
-    PyMuPDF4LLMParser.name: PyMuPDF4LLMParser,
+    PyMuPDFParser.name: PyMuPDFParser,
     PdfplumberParser.name: PdfplumberParser,
 }
 
@@ -18,20 +18,20 @@ def available_strategies() -> list[str]:
 
 
 def get_pdf_parser(strategy: Optional[str] = None) -> BaseParser:
-    name = (strategy or config.PDF_STRATEGY or "pymupdf4llm").strip().lower()
+    name = (strategy or config.PDF_STRATEGY or "pymupdf").strip().lower()
     cls = _REGISTRY.get(name)
     if cls is None:
-        print(f"[parsers] 알 수 없는 전략 '{name}' → 'pymupdf4llm'로 폴백")
-        cls = PyMuPDF4LLMParser
-        name = "pymupdf4llm"
+        print(f"[parsers] 알 수 없는 전략 '{name}' → 'pymupdf'로 폴백")
+        cls = PyMuPDFParser
+        name = "pymupdf"
     print(f"[parsers] PDF 파서 '{name}' 사용")
     return cls()
 
 
 def log_active_strategy() -> None:
-    name = (config.PDF_STRATEGY or "pymupdf4llm").strip().lower()
+    name = (config.PDF_STRATEGY or "pymupdf").strip().lower()
     if name not in _REGISTRY:
-        name = "pymupdf4llm"
+        name = "pymupdf"
     lines = [
         "",
         "=" * 60,
@@ -47,7 +47,7 @@ def log_active_strategy() -> None:
 
 __all__ = [
     "BaseParser",
-    "PyMuPDF4LLMParser",
+    "PyMuPDFParser",
     "PdfplumberParser",
     "get_pdf_parser",
     "available_strategies",
