@@ -17,6 +17,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from openai import OpenAI
 
 from chunkers import get_chunker
+from parsers import get_pdf_parser
 from langchain_community.document_loaders import (
     UnstructuredWordDocumentLoader,
     UnstructuredPowerPointLoader,
@@ -26,11 +27,6 @@ from langchain_community.document_loaders import (
     TextLoader
 )
 import fitz  # PyMuPDF for PDF image extraction
-
-try:
-    import pdfplumber
-except ImportError:
-    pdfplumber = None
 
 # Allow loading vendored extract_hwp when the installed extract-hwp package has no module (PyPI 0.1.0 packaging bug)
 _vendor_dir = Path(__file__).resolve().parent / "vendor"
@@ -231,130 +227,6 @@ class DocumentProcessor:
         text = "\n\n".join(parts) if parts else ""
         return [Document(page_content=text)]
 
-    @staticmethod
-    def _table_to_markdown(table: List[List[Any]]) -> str:
-        """표를 마크다운 형식으로 변환"""
-        if not table or len(table) == 0:
-            return ""
-        markdown = []
-        header = table[0]
-        markdown.append("| " + " | ".join(str(cell) if cell is not None and cell != "" else "" for cell in header) + " |")
-        markdown.append("| " + " | ".join(["---"] * len(header)) + " |")
-        for row in table[1:]:
-            markdown.append("| " + " | ".join(str(cell) if cell is not None and cell != "" else "" for cell in row) + " |")
-        return "\n".join(markdown)
-
-    @staticmethod
-    def _get_text_blocks_outside_tables(page: Any, table_bboxes: List[tuple]) -> List[Dict[str, Any]]:
-        """표 영역을 제외하고 y좌표별 텍스트 블록 추출 (pdfplumber Page 사용)"""
-        def word_in_bbox(word: Dict, bbox: tuple) -> bool:
-            x0, top, x1, bottom = bbox
-            h_mid = (word["x0"] + word["x1"]) / 2
-            v_mid = (word["top"] + word["bottom"]) / 2
-            return x0 <= h_mid <= x1 and top <= v_mid <= bottom
-
-        try:
-            all_words = page.extract_words()
-        except Exception:
-            return []
-        words = [w for w in all_words if not any(word_in_bbox(w, bbox) for bbox in table_bboxes)]
-        if not words:
-            return []
-
-        lines: Dict[float, List[tuple]] = {}
-        for word in words:
-            y = round(word["top"], 1)
-            if y not in lines:
-                lines[y] = []
-            lines[y].append((word["x0"], word.get("text", "")))
-
-        text_blocks = []
-        current_block: List[tuple] = []
-        prev_y = None
-        for y in sorted(lines.keys()):
-            line_words = sorted(lines[y], key=lambda x: x[0])
-            line_text = " ".join(w[1] for w in line_words)
-            if prev_y is not None and (y - prev_y) > 20:
-                if current_block:
-                    text_blocks.append({
-                        "type": "text",
-                        "y": current_block[0][0],
-                        "content": "\n".join(line[1] for line in current_block),
-                    })
-                current_block = []
-            current_block.append((y, line_text))
-            prev_y = y
-        if current_block:
-            text_blocks.append({
-                "type": "text",
-                "y": current_block[0][0],
-                "content": "\n".join(line[1] for line in current_block),
-            })
-        return text_blocks
-
-    def _load_pdf_with_pdfplumber(self, tmp_path: str, file_name: str) -> List[Document]:
-        """pdfplumber로 PDF 파싱: 표, 텍스트, 이미지 플레이스홀더를 y좌표 순서대로 결합"""
-        documents = []
-        with pdfplumber.open(tmp_path) as pdf:
-            for page_num, page in enumerate(pdf.pages):
-                elements: List[Dict[str, Any]] = []
-                tables = page.find_tables()
-                for table in tables:
-                    try:
-                        extracted = table.extract()
-                        if extracted:
-                            elements.append({
-                                "type": "table",
-                                "y": table.bbox[1],
-                                "content": extracted,
-                            })
-                    except Exception:
-                        continue
-                table_bboxes = [t.bbox for t in tables]
-                text_blocks = self._get_text_blocks_outside_tables(page, table_bboxes)
-                elements.extend(text_blocks)
-
-                # 이미지 플레이스홀더를 y좌표 기준으로 텍스트/표 사이에 삽입
-                try:
-                    for img_index, img in enumerate(page.images):
-                        top = img.get("top")
-                        if top is not None:
-                            elements.append({
-                                "type": "image_placeholder",
-                                "y": top,
-                                "image_index": img_index,
-                                "page_num_1based": page_num + 1,
-                            })
-                except Exception:
-                    pass
-
-                elements.sort(key=lambda x: x["y"])
-
-                parts = []
-                for elem in elements:
-                    if elem["type"] == "text":
-                        if elem.get("content"):
-                            parts.append(elem["content"])
-                    elif elem["type"] == "table":
-                        md = self._table_to_markdown(elem.get("content"))
-                        if md:
-                            parts.append(md)
-                    elif elem["type"] == "image_placeholder":
-                        parts.append(
-                            f"__IMAGE_PLACEHOLDER_p{elem['page_num_1based']}_i{elem['image_index']}__"
-                        )
-
-                page_content = "\n\n".join(parts) if parts else ""
-                doc = Document(
-                    page_content=page_content,
-                    metadata={
-                        "source": file_name,
-                        "page": page_num,
-                    },
-                )
-                documents.append(doc)
-        return documents
-
     async def load_document(self, file_content: bytes, file_name: str) -> Optional[List[Document]]:
         """Async: Load a document from memory (BytesIO object)."""
         try:
@@ -398,15 +270,8 @@ class DocumentProcessor:
                 finally:
                     await asyncio.to_thread(os.unlink, tmp_path)
             elif file_extension == '.pdf':
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
-                    await asyncio.to_thread(tmp.write, file_content.read())
-                    tmp_path = tmp.name
-                try:
-                    documents = await asyncio.to_thread(
-                        self._load_pdf_with_pdfplumber, tmp_path, file_name
-                    )
-                finally:
-                    await asyncio.to_thread(os.unlink, tmp_path)
+                data = await asyncio.to_thread(file_content.read)
+                documents = await get_pdf_parser().parse(data, file_name)
             elif file_extension in ('.hwp', '.hwpx'):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
                     await asyncio.to_thread(tmp.write, file_content.read())

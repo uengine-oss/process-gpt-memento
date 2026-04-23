@@ -22,6 +22,7 @@ from rag_chain import RAGChain, get_rag_chain
 from llm import log_provider_config
 from chunkers import log_active_strategy as log_chunker_strategy
 from retrievers import log_active_strategy as log_retriever_strategy
+from parsers import log_active_strategy as log_parser_strategy
 
 from auth_utils import create_auth_error_response
 from ingest_router import router as ingest_router
@@ -86,6 +87,7 @@ async def _memory_log_loop():
 @app.on_event("startup")
 async def _log_startup_config():
     log_provider_config()
+    log_parser_strategy()
     log_chunker_strategy()
     log_retriever_strategy()
     if os.getenv("MEMENTO_TRACEMALLOC", "0").strip().lower() in {"1", "true", "yes", "on"}:
