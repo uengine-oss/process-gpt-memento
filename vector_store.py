@@ -75,27 +75,31 @@ class VectorStoreManager:
             embeddings = self._embed_texts(texts)
 
             print("Saving documents to Supabase and Chroma...")
-            for i, (text, metadata, embedding) in enumerate(
-                zip(texts, metadatas, embeddings), start=1
-            ):
-                document_row_id = str(metadata.get("id") or uuid.uuid4())
-                metadata["id"] = document_row_id
-                self._insert_source_document(
-                    document_row_id=document_row_id,
-                    text=text,
-                    metadata=metadata,
-                    embedding=embedding,
+            row_ids: List[str] = []
+            for text, metadata in zip(texts, metadatas):
+                rid = str(metadata.get("id") or uuid.uuid4())
+                metadata["id"] = rid
+                row_ids.append(rid)
+
+            batch_size = 100
+            total = len(processed_documents)
+            batch_count = (total - 1) // batch_size + 1 if total else 0
+            for bi, start in enumerate(range(0, total, batch_size), start=1):
+                end = start + batch_size
+                self._insert_source_documents_batch(
+                    row_ids=row_ids[start:end],
+                    texts=texts[start:end],
+                    metadatas=metadatas[start:end],
+                    embeddings=embeddings[start:end],
                 )
-                self._upsert_chroma_document(
-                    document_row_id=document_row_id,
-                    text=text,
-                    metadata=metadata,
-                    embedding=embedding,
+                self._upsert_chroma_documents_batch(
+                    row_ids=row_ids[start:end],
+                    texts=texts[start:end],
+                    metadatas=metadatas[start:end],
+                    embeddings=embeddings[start:end],
                 )
-                print(
-                    f"Saved document {i}/{len(processed_documents)} "
-                    f"to Supabase and Chroma"
-                )
+                print(f"Saved batch {bi}/{batch_count} ({min(end, total) - start} docs)")
+            print(f"Total: {total} documents saved")
 
             await self._save_image_metadata_once(processed_documents, tenant_id)
             return True
@@ -176,6 +180,53 @@ class VectorStoreManager:
                     "Relax or disable that constraint before using Chroma-only indexing."
                 ) from exc
             raise
+
+    def _insert_source_documents_batch(
+        self,
+        row_ids: List[str],
+        texts: List[str],
+        metadatas: List[Dict[str, Any]],
+        embeddings: List[List[float]],
+    ) -> None:
+        payloads = [
+            self._build_supabase_payload(rid, t, m, e)
+            for rid, t, m, e in zip(row_ids, texts, metadatas, embeddings)
+        ]
+        try:
+            self.supabase.table("documents").insert(payloads).execute()
+            return
+        except Exception as exc:
+            if self.supabase_write_embedding:
+                raise
+            dims = self.supabase_dummy_embedding_dimensions
+            if dims <= 0:
+                raise RuntimeError(
+                    "Supabase documents batch insert failed without embedding. "
+                    "Relax the documents.embedding NOT NULL constraint or set "
+                    "SUPABASE_DUMMY_EMBEDDING_DIMENSIONS > 0."
+                ) from exc
+            for p in payloads:
+                p["embedding"] = [0.0] * dims
+            try:
+                self.supabase.table("documents").insert(payloads).execute()
+            except Exception as fallback_exc:
+                raise RuntimeError(
+                    f"Supabase batch insert failed even with dummy {dims}-d vector."
+                ) from fallback_exc
+
+    def _upsert_chroma_documents_batch(
+        self,
+        row_ids: List[str],
+        texts: List[str],
+        metadatas: List[Dict[str, Any]],
+        embeddings: List[List[float]],
+    ) -> None:
+        self.collection.upsert(
+            ids=row_ids,
+            embeddings=embeddings,
+            documents=texts,
+            metadatas=[self._build_chroma_metadata(m, rid) for m, rid in zip(metadatas, row_ids)],
+        )
 
     def _build_chroma_metadata(
         self, metadata: Dict[str, Any], document_row_id: str
