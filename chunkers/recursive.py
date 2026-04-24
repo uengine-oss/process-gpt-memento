@@ -19,6 +19,9 @@ class RecursiveChunker(BaseChunker):
             separators=["\n\n", "\n", ".", "!", "?", " ", ""],
             length_function=len,
             is_separator_regex=False,
+            # 청크가 부모 문서에서 어디서 시작했는지 metadata.start_index 로 실어준다.
+            # PDF bbox 역산에 사용됨.
+            add_start_index=True,
         )
 
     async def split(

@@ -750,6 +750,137 @@ async def list_documents(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/preview/pdf-highlight")
+async def preview_pdf_highlight(
+    tenant_id: str,
+    file_id: str,
+    page: int,
+    bbox: str,
+    dpi: int = 150,
+):
+    """PDF 한 페이지를 렌더링하면서 bbox 영역에 노란색 하이라이트를 오버레이한 PNG를
+    Supabase 'files' 버킷에 캐시하고 public URL을 반환한다.
+
+    Args:
+        tenant_id: 테넌트 스코프 (보안/격리)
+        file_id: Supabase storage 내 PDF 경로 (예: 'tenant/uuid.pdf').
+                 청크 메타의 `file_id` 필드 그대로 사용.
+        page: 0-based 페이지 번호.
+        bbox: "x0,y0,x1,y1" (PDF point 단위).
+        dpi: 렌더링 해상도. 기본 150.
+
+    Returns:
+        {"url": public_url, "cache_key": hash, "page": N, "width": W, "height": H}
+    """
+    import hashlib
+    import pymupdf
+
+    # 입력 검증
+    try:
+        bbox_parts = [float(v.strip()) for v in bbox.split(",")]
+        if len(bbox_parts) != 4:
+            raise ValueError("bbox must be 'x0,y0,x1,y1'")
+        x0, y0, x1, y1 = bbox_parts
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid bbox: {exc}")
+    if not file_id:
+        raise HTTPException(status_code=400, detail="file_id required")
+
+    # 캐시 키 — 동일 요청은 같은 PNG로.
+    cache_key_src = f"{file_id}|{page}|{x0:.2f},{y0:.2f},{x1:.2f},{y1:.2f}|dpi={dpi}"
+    cache_key = hashlib.sha1(cache_key_src.encode("utf-8")).hexdigest()
+    cache_path = f"pdf-highlight-cache/{tenant_id}/{cache_key}.png"
+
+    # 1) 캐시 hit? — public URL을 바로 돌려준다. storage exists 체크 대신 download 시도.
+    try:
+        existing = await asyncio.to_thread(
+            supabase.storage.from_("files").download, cache_path
+        )
+        if existing:
+            public_url_resp = supabase.storage.from_("files").get_public_url(cache_path)
+            cached_url = (
+                public_url_resp.get("publicURL", "")
+                if isinstance(public_url_resp, dict) else str(public_url_resp)
+            )
+            if cached_url:
+                return {
+                    "url": cached_url,
+                    "cache_key": cache_key,
+                    "page": page,
+                    "cached": True,
+                }
+    except Exception:
+        # 캐시 없음 → 신규 렌더링 진행
+        pass
+
+    # 2) 원본 PDF 다운로드
+    try:
+        pdf_bytes = await asyncio.to_thread(
+            supabase.storage.from_("files").download, file_id
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"PDF not found in storage: {file_id} ({exc})")
+    if not pdf_bytes:
+        raise HTTPException(status_code=404, detail=f"PDF empty: {file_id}")
+
+    # 3) fitz로 하이라이트 + 렌더링
+    def _render() -> tuple[bytes, int, int]:
+        pdf = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            if page < 0 or page >= pdf.page_count:
+                raise ValueError(f"page {page} out of range (0..{pdf.page_count - 1})")
+            pg = pdf.load_page(page)
+            rect = pymupdf.Rect(x0, y0, x1, y1)
+            # 페이지 경계 안으로 클램프 (bbox가 약간 넘치는 경우 대비)
+            rect = rect & pg.rect
+            # 노란 반투명 오버레이 (fill_opacity=0.35)
+            pg.draw_rect(
+                rect,
+                color=(1, 0.75, 0),     # stroke: 주황 테두리
+                fill=(1, 0.92, 0.2),    # fill: 노랑
+                fill_opacity=0.35,
+                width=1.5,
+            )
+            pix = pg.get_pixmap(dpi=dpi)
+            return pix.tobytes("png"), pix.width, pix.height
+        finally:
+            pdf.close()
+
+    try:
+        png_bytes, img_w, img_h = await asyncio.to_thread(_render)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"render failed: {exc}")
+
+    # 4) 캐시 업로드 (upsert)
+    try:
+        await asyncio.to_thread(
+            supabase.storage.from_("files").upload,
+            cache_path,
+            png_bytes,
+            {"content-type": "image/png", "upsert": "true"},
+        )
+    except Exception as exc:
+        # 업로드 실패해도 렌더링된 PNG를 본문으로 돌려주면 사용자 경험상 문제 없으나
+        # 일관성 위해 여기서 실패 리턴
+        print(f"[pdf-highlight] 캐시 업로드 실패: {exc}")
+
+    public_url_resp = supabase.storage.from_("files").get_public_url(cache_path)
+    public_url = (
+        public_url_resp.get("publicURL", "")
+        if isinstance(public_url_resp, dict) else str(public_url_resp)
+    )
+    return {
+        "url": public_url,
+        "cache_key": cache_key,
+        "page": page,
+        "width": img_w,
+        "height": img_h,
+        "cached": False,
+    }
+
+
 @app.post("/retrieve-by-indices")
 async def retrieve_by_indices(request: RetrieveByIndicesRequest):
     """LLM이 선택한 chunk_index 리스트로 청크를 직접 조회한다."""

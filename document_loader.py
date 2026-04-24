@@ -330,6 +330,64 @@ class DocumentProcessor:
             print(f"Error loading document from memory {file_name}: {e}")
             return None
 
+    @staticmethod
+    def _attach_chunk_bbox(chunk) -> None:
+        """청크의 start_index + 부모 blocks_json을 이용해 bbox 유니온을 계산해 붙인다.
+
+        결과: chunk.metadata['bboxes_json'] = '[{"page": N, "bbox": [x0,y0,x1,y1],
+        "page_width": W, "page_height": H}]' (Chroma primitive 제약 때문에 문자열로).
+        PDF 아닌 문서는 blocks_json이 없으므로 아무것도 하지 않음.
+        """
+        import json as _json
+        blocks_json = chunk.metadata.get("blocks_json")
+        if not blocks_json:
+            return
+        try:
+            blocks = _json.loads(blocks_json)
+        except Exception:
+            return
+        if not blocks:
+            return
+        start = chunk.metadata.get("start_index")
+        if not isinstance(start, int) or start < 0:
+            return
+        end = start + len(chunk.page_content or "")
+        # 청크 범위 [start, end)와 겹치는 블록들의 bbox 유니온 계산
+        x0 = y0 = float("inf")
+        x1 = y1 = float("-inf")
+        matched = False
+        for blk in blocks:
+            b_off = blk.get("offset")
+            b_len = blk.get("length")
+            bb = blk.get("bbox")
+            if not isinstance(b_off, int) or not isinstance(b_len, int) or not isinstance(bb, list) or len(bb) != 4:
+                continue
+            b_end = b_off + b_len
+            # 겹침 판정
+            if b_end <= start or b_off >= end:
+                continue
+            matched = True
+            x0 = min(x0, float(bb[0]))
+            y0 = min(y0, float(bb[1]))
+            x1 = max(x1, float(bb[2]))
+            y1 = max(y1, float(bb[3]))
+        if not matched:
+            return
+        page_num = chunk.metadata.get("page")
+        page_w = chunk.metadata.get("page_width")
+        page_h = chunk.metadata.get("page_height")
+        entry = {
+            "page": int(page_num) if page_num is not None else None,
+            "bbox": [round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)],
+        }
+        if page_w is not None:
+            entry["page_width"] = float(page_w)
+        if page_h is not None:
+            entry["page_height"] = float(page_h)
+        chunk.metadata["bboxes_json"] = _json.dumps([entry], ensure_ascii=False)
+        # 원본 blocks_json은 청크 메타에 계속 남아있으면 저장 용량 낭비 → 제거
+        chunk.metadata.pop("blocks_json", None)
+
     async def process_documents(self, documents: List[Document], metadata: dict = None) -> List[Document]:
         """Async: Process documents by splitting them into chunks and adding metadata."""
         try:
@@ -357,6 +415,13 @@ class DocumentProcessor:
                         chunk.metadata["page_number"] = int(chunk.metadata["page"]) + 1
                     except (TypeError, ValueError):
                         pass
+
+                # PDF bbox 역산: 부모 페이지의 blocks_json + chunk의 start_index로
+                # 어떤 블록(들)이 청크에 포함됐는지 찾아 bbox 유니온을 계산.
+                try:
+                    self._attach_chunk_bbox(chunk)
+                except Exception as bbox_err:
+                    print(f"[bbox] 청크 bbox 계산 실패: {bbox_err}")
 
             return chunks
         except Exception as e:

@@ -2,6 +2,7 @@
 import os
 import tempfile
 import asyncio
+import json
 from typing import List
 from langchain.schema import Document
 
@@ -30,9 +31,18 @@ class PyMuPDFParser(BaseParser):
         try:
             pdf = pymupdf.open(tmp_path)
             for page_num, page in enumerate(pdf):
+                markdown, blocks, page_size = self._page_to_markdown(page, page_num)
                 docs.append(Document(
-                    page_content=self._page_to_markdown(page, page_num),
-                    metadata={"source": file_name, "page": page_num},
+                    page_content=markdown,
+                    metadata={
+                        "source": file_name,
+                        "page": page_num,
+                        # 블록별 (offset, length, bbox) 리스트 — 청킹 후 offset 매칭에 사용.
+                        # Chroma는 flat primitive만 허용하므로 JSON 문자열로 저장.
+                        "blocks_json": json.dumps(blocks, ensure_ascii=False) if blocks else "",
+                        "page_width": page_size[0],
+                        "page_height": page_size[1],
+                    },
                 ))
             pdf.close()
         finally:
@@ -41,7 +51,13 @@ class PyMuPDFParser(BaseParser):
         return self._tag(docs)
 
     @staticmethod
-    def _page_to_markdown(page, page_num: int) -> str:
+    def _page_to_markdown(page, page_num: int):
+        """페이지를 markdown으로 변환 + 각 블록의 (offset, length, bbox)를 수집.
+
+        Returns:
+            (markdown_text, blocks_list, (page_width, page_height))
+            blocks_list: [{"offset": int, "length": int, "bbox": [x0,y0,x1,y1]}, ...]
+        """
         valid_tables = []
         try:
             for tab in page.find_tables().tables:
@@ -56,21 +72,41 @@ class PyMuPDFParser(BaseParser):
             pass
 
         table_bboxes = [t.bbox for t in valid_tables]
+        # items: [(y_sort_key, text, bbox)]
         items = []
 
         for block in page.get_text("blocks"):
             bbox, text = block[:4], block[4]
             if any(_intersects(bbox, tb) for tb in table_bboxes):
                 continue
-            if text.strip():
-                items.append((bbox[1], text.strip()))
+            stripped = text.strip()
+            if stripped:
+                items.append((bbox[1], stripped, list(bbox)))
 
         for tab in valid_tables:
             try:
-                items.append((tab.bbox[1], tab.to_markdown()))
+                items.append((tab.bbox[1], tab.to_markdown(), list(tab.bbox)))
             except Exception:
                 continue
 
         items.sort(key=lambda x: x[0])
-        body = "\n\n".join(c for _, c in items)
-        return f"# 페이지 {page_num + 1}\n\n{body}" if body else ""
+
+        # markdown 빌드 + offset 추적
+        header = f"# 페이지 {page_num + 1}\n\n"
+        parts = [header]
+        cursor = len(header)
+        blocks: list = []
+        for idx, (_y, text, bbox) in enumerate(items):
+            if idx > 0:
+                separator = "\n\n"
+                parts.append(separator)
+                cursor += len(separator)
+            blocks.append({"offset": cursor, "length": len(text), "bbox": bbox})
+            parts.append(text)
+            cursor += len(text)
+
+        markdown = "".join(parts) if items else ""
+        # 페이지 크기 (렌더링 시 좌표 정규화용)
+        rect = page.rect
+        page_size = (float(rect.width), float(rect.height))
+        return markdown, blocks, page_size
