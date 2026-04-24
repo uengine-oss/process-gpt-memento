@@ -87,7 +87,6 @@ async def _memory_log_loop():
 @app.on_event("startup")
 async def _log_startup_config():
     log_provider_config()
-    log_parser_strategy()
     log_chunker_strategy()
     log_retriever_strategy()
     if os.getenv("MEMENTO_TRACEMALLOC", "0").strip().lower() in {"1", "true", "yes", "on"}:
