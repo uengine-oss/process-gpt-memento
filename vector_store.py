@@ -24,10 +24,17 @@ class VectorStoreManager:
     """Stores source documents in Supabase and indexes embeddings in Chroma."""
 
     def __init__(self):
-        self.supabase = create_client(
-            os.getenv("SUPABASE_URL"),
-            os.getenv("SUPABASE_KEY"),
-        )
+        # Chroma-only mode: when Supabase env vars are absent, skip Supabase
+        # entirely and use Chroma both as index AND as document store.
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_KEY")
+        if supabase_url and supabase_key:
+            self.supabase = create_client(supabase_url, supabase_key)
+            self.chroma_only_mode = False
+        else:
+            self.supabase = None
+            self.chroma_only_mode = True
+            print("[VectorStoreManager] SUPABASE_URL/KEY not set -> Chroma-only mode")
         self.embeddings = create_embeddings()
         self.supabase_write_embedding = config.supabase_write_embedding()
         self.supabase_dummy_embedding_dimensions = (
@@ -86,12 +93,13 @@ class VectorStoreManager:
             batch_count = (total - 1) // batch_size + 1 if total else 0
             for bi, start in enumerate(range(0, total, batch_size), start=1):
                 end = start + batch_size
-                self._insert_source_documents_batch(
-                    row_ids=row_ids[start:end],
-                    texts=texts[start:end],
-                    metadatas=metadatas[start:end],
-                    embeddings=embeddings[start:end],
-                )
+                if not self.chroma_only_mode:
+                    self._insert_source_documents_batch(
+                        row_ids=row_ids[start:end],
+                        texts=texts[start:end],
+                        metadatas=metadatas[start:end],
+                        embeddings=embeddings[start:end],
+                    )
                 self._upsert_chroma_documents_batch(
                     row_ids=row_ids[start:end],
                     texts=texts[start:end],
@@ -260,6 +268,9 @@ class VectorStoreManager:
         self, processed_documents: List[Document], tenant_id: str
     ) -> None:
         """이미지 메타데이터를 고유 이미지당 1회만 저장 (image_analysis가 있는 청크만 처리)."""
+        if self.chroma_only_mode:
+            # Image metadata persistence is Supabase-only; skip in Chroma-only mode.
+            return
         try:
             saved_embedding_ids: set[str] = set()
             total_images_saved = 0
@@ -408,6 +419,32 @@ class VectorStoreManager:
         if not document_ids:
             return []
 
+        if self.chroma_only_mode:
+            # In Chroma-only mode, hydrate directly from Chroma (which stores
+            # the document text alongside the embedding).
+            chroma_resp = self.collection.get(
+                ids=document_ids, include=["documents", "metadatas"]
+            )
+            chroma_ids = chroma_resp.get("ids") or []
+            chroma_docs = chroma_resp.get("documents") or []
+            chroma_metas = chroma_resp.get("metadatas") or []
+            rows_by_id = {
+                rid: {"content": doc, "metadata": meta or {}}
+                for rid, doc, meta in zip(chroma_ids, chroma_docs, chroma_metas)
+            }
+            ordered_documents: List[Document] = []
+            for document_id in document_ids:
+                row = rows_by_id.get(str(document_id))
+                if not row:
+                    continue
+                ordered_documents.append(
+                    Document(
+                        page_content=row.get("content") or "",
+                        metadata=row.get("metadata") or {},
+                    )
+                )
+            return ordered_documents
+
         response = (
             self.supabase.table("documents")
             .select("id, content, metadata")
@@ -475,6 +512,30 @@ class VectorStoreManager:
         if not chunk_indices:
             return []
         target_set = {int(i) for i in chunk_indices}
+        if self.chroma_only_mode:
+            where = {"$and": [{"tenant_id": tenant_id}, {"file_name": file_name}]}
+            if drive_folder_id:
+                where["$and"].append({"drive_folder_id": drive_folder_id})
+            chroma_resp = self.collection.get(
+                where=where, include=["documents", "metadatas"]
+            )
+            results = []
+            for doc, meta in zip(
+                chroma_resp.get("documents") or [],
+                chroma_resp.get("metadatas") or [],
+            ):
+                meta = meta or {}
+                if meta.get("type") == "image_analysis":
+                    continue
+                try:
+                    idx = int(meta.get("chunk_index", -1))
+                except (TypeError, ValueError):
+                    idx = -1
+                if idx in target_set:
+                    results.append(
+                        Document(page_content=doc or "", metadata=meta)
+                    )
+            return results
         try:
             query = (
                 self.supabase.table("documents")
@@ -524,6 +585,28 @@ class VectorStoreManager:
     def _get_all_chunks_metadata_sync(
         self, tenant_id: str, file_name: str, drive_folder_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
+        if self.chroma_only_mode:
+            where = {"$and": [{"tenant_id": tenant_id}, {"file_name": file_name}]}
+            if drive_folder_id:
+                where["$and"].append({"drive_folder_id": drive_folder_id})
+            chroma_resp = self.collection.get(
+                where=where, include=["metadatas"]
+            )
+            results = []
+            for meta in chroma_resp.get("metadatas") or []:
+                meta = meta or {}
+                if meta.get("type") == "image_analysis":
+                    continue
+                results.append(
+                    {
+                        "chunk_index": meta.get("chunk_index"),
+                        "section_title": meta.get("section_title"),
+                        "page_number": meta.get("page_number") or meta.get("page"),
+                        "content_length": meta.get("content_length"),
+                    }
+                )
+            results.sort(key=lambda r: r.get("chunk_index") or 0)
+            return results
         try:
             query = (
                 self.supabase.table("documents")

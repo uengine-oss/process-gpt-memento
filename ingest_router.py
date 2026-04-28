@@ -40,10 +40,12 @@ import config
 
 router = APIRouter()
 
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_KEY")
-)
+_supabase_url = os.getenv("SUPABASE_URL")
+_supabase_key = os.getenv("SUPABASE_KEY")
+if _supabase_url and _supabase_key:
+    supabase: Optional[Client] = create_client(_supabase_url, _supabase_key)
+else:
+    supabase = None
 
 drive_jobs: Dict[str, dict] = {}
 tenant_active_job: Dict[str, str] = {}

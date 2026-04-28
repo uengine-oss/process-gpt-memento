@@ -33,14 +33,9 @@ class RAGChain:
         print("Proxy-routed LLM initialized successfully")
         
         self.vector_store = get_vector_store()
-        if self.vector_store.supabase is None:
-            from supabase import create_client
-            self.supabase = create_client(
-                os.getenv('SUPABASE_URL'),
-                os.getenv('SUPABASE_KEY')
-            )
-        else:
-            self.supabase = self.vector_store.supabase
+        # In Chroma-only mode (no Supabase env), skip Supabase client creation
+        # entirely. Methods that use self.supabase must guard for None.
+        self.supabase = self.vector_store.supabase
         
         # Create custom prompt templates for different languages
         self.prompts = {

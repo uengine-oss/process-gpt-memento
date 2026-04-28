@@ -165,10 +165,13 @@ oauth2_scheme = OAuth2AuthorizationCodeBearer(
     tokenUrl="https://oauth2.googleapis.com/token"
 )
 
-supabase: Client = create_client(
-    os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_KEY")
-)
+_supabase_url = os.getenv("SUPABASE_URL")
+_supabase_key = os.getenv("SUPABASE_KEY")
+if _supabase_url and _supabase_key:
+    supabase: Optional[Client] = create_client(_supabase_url, _supabase_key)
+else:
+    supabase = None
+    print("[main] SUPABASE_URL/KEY not set -> Supabase-dependent endpoints disabled")
 
 ROBO_GLOSSARY_API_BASE_URL = (os.getenv("ROBO_GLOSSARY_API_BASE_URL") or "http://127.0.0.1:5504/robo").rstrip("/")
 ROBO_GLOSSARY_TIMEOUT_SEC = float(os.getenv("ROBO_GLOSSARY_TIMEOUT_SEC", "5"))
@@ -553,6 +556,7 @@ async def retrieve(
     top_k: int = Query(default=5, ge=1, le=100),
     drive_folder_id: Optional[str] = None,
     room_id: Optional[str] = None,
+    file_name: Optional[str] = None,
 ):
     try:
         rag = get_rag_chain()
@@ -603,6 +607,8 @@ async def retrieve(
         if not room_id:
             if drive_folder_id:
                 metadata_filter = {**metadata_filter, "drive_folder_id": drive_folder_id}
+            if file_name:
+                metadata_filter = {**metadata_filter, "file_name": file_name}
 
             result = await rag.retrieve(query, metadata_filter, top_k=top_k)
             docs = result["source_documents"]
@@ -611,6 +617,12 @@ async def retrieve(
                     doc
                     for doc in docs
                     if (doc.metadata or {}).get("drive_folder_id") == drive_folder_id
+                ]
+            if file_name:
+                docs = [
+                    doc
+                    for doc in docs
+                    if (doc.metadata or {}).get("file_name") == file_name
                 ]
 
         glossary_docs = await retrieve_glossary_terms(query=query, tenant_id=tenant_id, top_k=top_k)
