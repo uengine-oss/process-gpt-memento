@@ -21,7 +21,7 @@ class PyMuPDFParser(BaseParser):
         return await asyncio.to_thread(self._parse_sync, file_content, file_name)
 
     def _parse_sync(self, file_content: bytes, file_name: str) -> List[Document]:
-        import pymupdf
+        import fitz  # PyMuPDF
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(file_content)
@@ -29,7 +29,7 @@ class PyMuPDFParser(BaseParser):
 
         docs: List[Document] = []
         try:
-            pdf = pymupdf.open(tmp_path)
+            pdf = fitz.open(tmp_path)
             for page_num, page in enumerate(pdf):
                 markdown, blocks, page_size = self._page_to_markdown(page, page_num)
                 docs.append(Document(
