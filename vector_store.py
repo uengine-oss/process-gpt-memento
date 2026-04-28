@@ -5,6 +5,7 @@ import asyncio
 import os
 from pathlib import Path
 import uuid
+import unicodedata
 
 from chromadb import PersistentClient
 from dotenv import load_dotenv
@@ -18,6 +19,20 @@ import config
 load_dotenv()
 
 PRIMITIVE_METADATA_TYPES = (str, int, float, bool)
+
+def _normalize_filename(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    # macOS(HFS+/APFS)에서는 한글 파일명이 NFD로 들어오는 경우가 잦아
+    # 저장/검색/필터 비교 시 NFC로 통일한다.
+    # 또한 일부 입력은 호환 자모(예: ㅣ, ㅔ)가 섞여 들어올 수 있어 NFKC를 먼저 적용한다.
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFKC", value))
+
+
+def _normalize_str(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFKC", value))
 
 
 class VectorStoreManager:
@@ -61,6 +76,9 @@ class VectorStoreManager:
                         "id": str(uuid.uuid4()),
                     }
                 )
+
+                if doc.metadata.get("file_name") is not None:
+                    doc.metadata["file_name"] = _normalize_filename(doc.metadata.get("file_name"))
 
                 if doc.page_content is None:
                     doc.page_content = ""
@@ -236,7 +254,7 @@ class VectorStoreManager:
             if value is None:
                 continue
             if isinstance(value, PRIMITIVE_METADATA_TYPES):
-                chroma_metadata[key] = value
+                chroma_metadata[key] = _normalize_str(value)
 
         chroma_metadata["document_row_id"] = document_row_id
         chroma_metadata.setdefault("type", "document")
@@ -368,7 +386,7 @@ class VectorStoreManager:
             if value is None:
                 continue
             if isinstance(value, PRIMITIVE_METADATA_TYPES):
-                where[key] = value
+                where[key] = _normalize_str(value)
         if not where:
             return None
         if len(where) == 1:
