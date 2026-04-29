@@ -5,7 +5,7 @@ import os
 import io
 from typing import List, Optional, Dict, Any
 from supabase import create_client, Client
-from document_loader import DocumentProcessor
+from app.services.document_processor import DocumentProcessor
 import asyncio
 
 from dotenv import load_dotenv

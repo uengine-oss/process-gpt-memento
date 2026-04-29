@@ -16,8 +16,8 @@ from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from openai import OpenAI
 
-from chunkers import get_chunker
-from parsers import (
+from app.plugins.chunkers import get_chunker
+from app.plugins.parsers import (
     get_pdf_parser,
     get_synap_parser,
     synap_supports,
@@ -763,12 +763,12 @@ class DocumentProcessor:
         batch_size: int = 15,
     ) -> List[Dict[str, Any]]:
         """Extract and upload images in batches; raw bytes released between batches."""
-        import config
+        from app.core import config
         if not config.image_analysis_enabled():
             print("Skipping image extraction/upload (vision disabled)")
             return []
 
-        from image_storage_utils import get_image_storage_utils
+        from app.storage.image_storage import get_image_storage_utils
         storage = get_image_storage_utils()
         folder = f"extracted_images/{tenant_id}/{file_id}"
 

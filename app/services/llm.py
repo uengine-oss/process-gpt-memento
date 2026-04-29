@@ -6,7 +6,7 @@ from typing import Optional, Tuple, Union
 
 import httpx
 
-from config import resolve_llm_config, resolve_embedding_config
+from app.core.config import resolve_llm_config, resolve_embedding_config
 
 TimeoutType = Union[float, Tuple[float, float]]
 

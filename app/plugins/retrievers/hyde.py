@@ -42,7 +42,7 @@ class HyDERetriever(BaseRetriever):
         self.include_original_query = include_original_query
 
     async def _generate_hypothetical(self, query: str) -> str:
-        from llm import create_llm
+        from app.services.llm import create_llm
         llm = create_llm(temperature=0.3)
         prompt = _PROMPT.format(query=query, length=self.doc_length)
         text = await ainvoke_text(llm, prompt)

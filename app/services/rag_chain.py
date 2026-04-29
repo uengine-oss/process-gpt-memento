@@ -4,9 +4,9 @@ from typing import List, Dict, Any, Optional
 import asyncio
 from dotenv import load_dotenv
 from langchain.schema import Document
-from vector_store import VectorStoreManager, get_vector_store
-from llm import create_llm
-from retrievers import get_retriever
+from app.services.vector_store import VectorStoreManager, get_vector_store
+from app.services.llm import create_llm
+from app.plugins.retrievers import get_retriever
 
 load_dotenv(override=True)
 
@@ -233,7 +233,7 @@ class RAGChain:
 
     async def process_document_images(self, documents: list[Document]) -> None:
         """문서들의 이미지를 분석하고, 해당 이미지가 나오는 페이지/구간의 청크에만 설명 추가."""
-        import config
+        from app.core import config
         if not config.image_analysis_enabled():
             print("Image analysis disabled (provider does not support vision)")
             return

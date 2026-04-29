@@ -103,7 +103,7 @@ class SemanticChunker(BaseChunker):
         documents: List[Document],
         file_name: Optional[str] = None,
     ) -> List[Document]:
-        from llm import create_embeddings
+        from app.services.llm import create_embeddings
 
         embedder = create_embeddings()
 

@@ -42,10 +42,10 @@ from langchain.schema import Document
 
 load_dotenv(_ROOT / ".env", override=False)
 
-from chunkers import available_strategies as chunker_strategies, get_chunker  # noqa: E402
-from retrievers import available_strategies as retriever_strategies, get_retriever  # noqa: E402
-from llm import create_llm, create_embeddings  # noqa: E402
-from document_loader import DocumentProcessor  # noqa: E402
+from app.plugins.chunkers import available_strategies as chunker_strategies, get_chunker  # noqa: E402
+from app.plugins.retrievers import available_strategies as retriever_strategies, get_retriever  # noqa: E402
+from app.services.llm import create_llm, create_embeddings  # noqa: E402
+from app.services.document_processor import DocumentProcessor  # noqa: E402
 
 from bench_store import BenchVectorStore  # noqa: E402
 from qa import QAItem, generate_qa_set, judge_answer, retrieval_recall  # noqa: E402

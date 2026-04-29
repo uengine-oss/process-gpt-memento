@@ -14,7 +14,7 @@ from chromadb import PersistentClient
 
 
 def get_collection():
-    import config
+    from app.core from app.core import config
     client = PersistentClient(path=config.chroma_persist_directory())
     return client.get_collection(config.chroma_collection_name().strip())
 
@@ -63,7 +63,7 @@ def cmd_list(col, where, limit):
 
 
 def cmd_search(col, query, top_k, where):
-    from llm import create_embeddings
+    from app.services.llm import create_embeddings
     emb = create_embeddings()
     query_vec = emb.embed_query(query)
 

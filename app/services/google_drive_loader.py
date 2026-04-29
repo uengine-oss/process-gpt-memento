@@ -16,7 +16,7 @@ import json
 from langchain.schema import Document
 from datetime import datetime
 
-from document_loader import DocumentProcessor
+from app.services.document_processor import DocumentProcessor
 
 import fitz  # PyMuPDF for PDF image extraction
 from PIL import Image
@@ -381,7 +381,7 @@ class GoogleDriveLoader:
             fh.seek(0)
             file_content = fh.read()
             
-            from document_loader import get_document_processor
+            from app.services.document_processor import get_document_processor
 
             doc_processor = get_document_processor()
             extracted_images = await doc_processor.extract_and_upload_images_batched(

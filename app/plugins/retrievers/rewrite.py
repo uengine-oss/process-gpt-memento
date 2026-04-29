@@ -30,7 +30,7 @@ class RewriteRetriever(BaseRetriever):
     name = "rewrite"
 
     async def _rewrite(self, query: str) -> str:
-        from llm import create_llm
+        from app.services.llm import create_llm
         llm = create_llm(temperature=0.0)
         prompt = _PROMPT.format(query=query)
         text = await ainvoke_text(llm, prompt)

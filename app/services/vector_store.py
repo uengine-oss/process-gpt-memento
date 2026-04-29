@@ -12,8 +12,8 @@ from dotenv import load_dotenv
 from langchain.schema import Document
 from supabase import create_client
 
-from llm import create_embeddings
-import config
+from app.services.llm import create_embeddings
+from app.core import config
 
 
 load_dotenv()
@@ -35,6 +35,17 @@ def _normalize_str(value: Any) -> Any:
     return unicodedata.normalize("NFC", unicodedata.normalize("NFKC", value))
 
 
+def _strip_nul(value: Any) -> Any:
+    """Postgres text 컬럼이 \\u0000을 거절(22P05) — PDF 추출물에서 흔히 섞임."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {k: _strip_nul(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_strip_nul(v) for v in value]
+    return value
+
+
 class VectorStoreManager:
     """Stores source documents in Supabase and indexes embeddings in Chroma."""
 
@@ -51,7 +62,9 @@ class VectorStoreManager:
 
         persist_dir = Path(config.chroma_persist_directory()).expanduser()
         if not persist_dir.is_absolute():
-            persist_dir = (Path(__file__).resolve().parent / persist_dir).resolve()
+            # 프로젝트 루트 기준 (app/services/vector_store.py → repo root)
+            repo_root = Path(__file__).resolve().parents[2]
+            persist_dir = (repo_root / persist_dir).resolve()
         persist_dir.mkdir(parents=True, exist_ok=True)
 
         self.chroma_collection_name = config.chroma_collection_name().strip()
@@ -63,8 +76,14 @@ class VectorStoreManager:
 
     async def add_documents(self, documents: List[Document], tenant_id: str) -> bool:
         """Add source documents to Supabase and vector index entries to Chroma."""
+        import time as _time
+        _t0 = _time.perf_counter()
         try:
-            print(f"Adding {len(documents)} documents to vector store...")
+            file_names = sorted({(d.metadata or {}).get("file_name") or "?" for d in documents})
+            print(
+                f"[vector_store] add_documents: tenant={tenant_id!r} chunks={len(documents)} "
+                f"files={file_names}"
+            )
 
             processed_documents: List[Document] = []
             for doc in documents:
@@ -90,7 +109,12 @@ class VectorStoreManager:
             print(f"Generating embeddings for {len(processed_documents)} documents...")
             texts = [doc.page_content or "" for doc in processed_documents]
             metadatas = [doc.metadata for doc in processed_documents]
+            _emb_t0 = _time.perf_counter()
             embeddings = self._embed_texts(texts)
+            print(
+                f"[vector_store] embeddings done: count={len(embeddings)} "
+                f"elapsed={int((_time.perf_counter()-_emb_t0)*1000)}ms"
+            )
 
             print("Saving documents to Supabase and Chroma...")
             row_ids: List[str] = []
@@ -117,12 +141,18 @@ class VectorStoreManager:
                     embeddings=embeddings[start:end],
                 )
                 print(f"Saved batch {bi}/{batch_count} ({min(end, total) - start} docs)")
-            print(f"Total: {total} documents saved")
+            print(
+                f"[vector_store] add_documents done: total={total} "
+                f"elapsed={int((_time.perf_counter()-_t0)*1000)}ms"
+            )
 
             await self._save_image_metadata_once(processed_documents, tenant_id)
             return True
         except Exception as e:
-            print(f"Error adding documents to vector store: {e}")
+            print(
+                f"[vector_store] add_documents FAILED: error={e!r} "
+                f"elapsed={int((_time.perf_counter()-_t0)*1000)}ms"
+            )
             return False
 
     def _embed_texts(self, texts: List[str]) -> List[List[float]]:
@@ -150,8 +180,8 @@ class VectorStoreManager:
     ) -> Dict[str, Any]:
         payload = {
             "id": document_row_id,
-            "content": text,
-            "metadata": metadata,
+            "content": _strip_nul(text),
+            "metadata": _strip_nul(metadata),
         }
         if self.supabase_write_embedding and embedding is not None:
             payload["embedding"] = embedding

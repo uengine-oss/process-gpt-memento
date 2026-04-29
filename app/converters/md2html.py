@@ -7,7 +7,7 @@ Usage: python3 md2html_converter.py <input.md> [--output output.html] [--mode MO
 import argparse
 import sys
 import os
-from convert_to_html import (
+from app.converters.html import (
     convert_md_to_html_with_mermaid,
     create_dynamic_mermaid_html, 
     convert_md_to_html_with_inline_svg

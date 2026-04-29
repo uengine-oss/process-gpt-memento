@@ -48,7 +48,7 @@ class RAGFusionRetriever(BaseRetriever):
         self.rrf_k = rrf_k
 
     async def _generate_queries(self, query: str) -> List[str]:
-        from llm import create_llm
+        from app.services.llm import create_llm
         llm = create_llm(temperature=0.3)
         prompt = _PROMPT.format(n=self.query_count, query=query)
         text = await ainvoke_text(llm, prompt)
