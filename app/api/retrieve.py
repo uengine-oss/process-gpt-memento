@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -14,6 +15,17 @@ from app.services.glossary import retrieve_glossary_terms
 from app.services.rag_chain import get_rag_chain
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _summarize_doc(doc: Document, max_chars: int = 200) -> str:
+    meta = doc.metadata or {}
+    file_name = meta.get("file_name") or meta.get("source") or "?"
+    chunk_idx = meta.get("chunk_index") if meta.get("chunk_index") is not None else meta.get("chunk_id") or "?"
+    body = (doc.page_content or "").strip().replace("\n", " ")
+    if len(body) > max_chars:
+        body = body[:max_chars] + "…"
+    return f"[{file_name}#{chunk_idx}] {body}"
 
 
 @router.get("/retrieve")
@@ -25,12 +37,34 @@ async def retrieve(
     top_k: int = Query(default=5, ge=1, le=100),
     drive_folder_id: Optional[str] = None,
     room_id: Optional[str] = None,
+    file_name: Optional[str] = None,
 ):
+    logger.info(
+        "[/retrieve] params: query=%r tenant_id=%r room_id=%r file_name=%r proc_inst_id=%r drive_folder_id=%r all_docs=%s top_k=%d",
+        query, tenant_id, room_id, file_name, proc_inst_id, drive_folder_id, all_docs, top_k,
+    )
     try:
         rag = get_rag_chain()
         docs: List[Document] = []
+        did_retrieve = False
 
-        if room_id:
+        if room_id and file_name:
+            # room + file_name 조합: 글로벌 머지 없이 정확히 그 파일만
+            metadata_filter = {"tenant_id": tenant_id, "room_id": room_id, "file_name": file_name}
+            if drive_folder_id:
+                metadata_filter["drive_folder_id"] = drive_folder_id
+            result = await rag.retrieve(query, metadata_filter, top_k=top_k)
+            docs = result.get("source_documents") or []
+            did_retrieve = True
+        elif file_name:
+            # 파일명 단독 필터: 테넌트 + file_name
+            metadata_filter = {"tenant_id": tenant_id, "file_name": file_name}
+            if drive_folder_id:
+                metadata_filter["drive_folder_id"] = drive_folder_id
+            result = await rag.retrieve(query, metadata_filter, top_k=top_k)
+            docs = result.get("source_documents") or []
+            did_retrieve = True
+        elif room_id:
             room_filter = {"tenant_id": tenant_id, "room_id": room_id}
             global_filter = {"tenant_id": tenant_id, "knowledge_scope": "global"}
             if drive_folder_id:
@@ -56,6 +90,7 @@ async def retrieve(
                 docs.append(doc)
                 if len(docs) >= top_k:
                     break
+            did_retrieve = True
         elif proc_inst_id:
             metadata_filter = {"tenant_id": tenant_id, "proc_inst_id": proc_inst_id}
         elif all_docs:
@@ -63,7 +98,7 @@ async def retrieve(
         else:
             metadata_filter = {"tenant_id": tenant_id, "source_type": "process_output"}
 
-        if not room_id:
+        if not did_retrieve:
             if drive_folder_id:
                 metadata_filter = {**metadata_filter, "drive_folder_id": drive_folder_id}
 
@@ -98,9 +133,14 @@ async def retrieve(
                     break
             docs = merged_docs
 
+        logger.info("[/retrieve] returned %d chunks", len(docs))
+        for i, d in enumerate(docs):
+            logger.info("[/retrieve] chunk[%d] %s", i, _summarize_doc(d))
+
         return {"response": docs}
 
     except Exception as e:
+        logger.exception("[/retrieve] failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
