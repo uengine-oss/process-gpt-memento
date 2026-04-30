@@ -176,3 +176,4 @@ curl "http://localhost:8005/query?query=프로젝트%20A의%20예산이%20얼마
 - `documents` insert가 `embedding` 없이 실패하면 DB에서 `embedding` 컬럼이 여전히 non-null/vector 제약을 요구하는지 확인하세요. 즉시 우회가 필요하면 `SUPABASE_DUMMY_EMBEDDING_DIMENSIONS`를 기존 차원으로 맞추세요.
 - Drive 인증 오류 시 `/auth/google/url`로 OAuth URL을 먼저 발급하세요.
 - 이미지 분석 실패 시 Supabase Storage 공개 URL 접근 가능 여부를 확인하세요.
+- HWP/HWPX 파서(`extract-hwp`)가 없거나 실패하면 PDF 변환 폴백을 시도합니다. 이 경로를 쓰려면 서버/컨테이너에 `LibreOffice(soffice)`가 설치되어 있어야 합니다.

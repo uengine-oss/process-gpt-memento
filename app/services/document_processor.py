@@ -31,9 +31,10 @@ from langchain_community.document_loaders import (
     TextLoader
 )
 import fitz  # PyMuPDF for PDF image extraction
+from app.services.file_to_pdf import convert_to_pdf, FileToPdfError
 
 # Allow loading vendored extract_hwp when the installed extract-hwp package has no module (PyPI 0.1.0 packaging bug)
-_vendor_dir = Path(__file__).resolve().parent / "vendor"
+_vendor_dir = Path(__file__).resolve().parents[2] / "vendor"
 if _vendor_dir.is_dir() and str(_vendor_dir) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(_vendor_dir))
 
@@ -299,15 +300,37 @@ class DocumentProcessor:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
                     await asyncio.to_thread(tmp.write, file_content.read())
                     tmp_path = tmp.name
+                converted_pdf_path = None
                 try:
                     text, error = await asyncio.to_thread(
                         _extract_text_from_hwp_or_hwpx, tmp_path, file_extension
                     )
                     if error is not None:
                         print(f"HWP/HWPX extraction error for {file_name}: {error}")
-                        return None
-                    documents = [Document(page_content=text or "")]
+                        # Fallback: parser dependency(e.g. extract-hwp) missing or broken.
+                        # Try converting the original file to PDF, then parse through PDF pipeline.
+                        try:
+                            converted_pdf_path = await asyncio.to_thread(
+                                convert_to_pdf,
+                                tmp_path,
+                                os.path.dirname(tmp_path),
+                            )
+                            with open(converted_pdf_path, "rb") as f:
+                                converted_pdf_bytes = await asyncio.to_thread(f.read)
+                            converted_pdf_name = f"{Path(file_name).stem}.pdf"
+                            documents = await get_pdf_parser().parse(converted_pdf_bytes, converted_pdf_name)
+                            print(f"[fallback] converted {file_extension} -> PDF for {file_name}")
+                        except FileToPdfError as conv_err:
+                            print(f"[fallback] file to PDF conversion error for {file_name}: {conv_err}")
+                            return None
+                        except Exception as conv_err:
+                            print(f"[fallback] unexpected conversion error for {file_name}: {conv_err}")
+                            return None
+                    else:
+                        documents = [Document(page_content=text or "")]
                 finally:
+                    if converted_pdf_path and os.path.exists(converted_pdf_path):
+                        await asyncio.to_thread(os.unlink, converted_pdf_path)
                     await asyncio.to_thread(os.unlink, tmp_path)
             else:
                 print(f"Unsupported file type: {file_extension}")

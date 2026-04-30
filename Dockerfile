@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     poppler-utils \
+    libreoffice \
     && rm -rf /var/lib/apt/lists/*
 
 ENV MAX_JOBS=1
