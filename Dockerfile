@@ -7,6 +7,7 @@ COPY . .
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     gcc \
+    git \
     libffi-dev \
     libxml2-dev \
     libxslt1-dev \

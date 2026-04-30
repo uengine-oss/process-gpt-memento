@@ -25,6 +25,9 @@ PyMuPDF>=1.26.0
 Pillow==10.0.1
 requests>=2.31.0
 chromadb
+onnxruntime==1.18.1
 markdown>=3.8.2
 beautifulsoup4==4.12.3
 pdfplumber>=0.10.0
+extract-hwp @ git+https://github.com/thlee/extract-hwp.git
+olefile>=0.47

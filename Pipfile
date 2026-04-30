@@ -26,7 +26,8 @@ setuptools = "==39.1.0"
 requests = "*"
 pymupdf = "*"
 docx = "*"
-extract-hwp = ">=0.1.0"
+extract-hwp = {git = "https://github.com/thlee/extract-hwp.git"}
+olefile = ">=0.47"
 
 [dev-packages]
 
