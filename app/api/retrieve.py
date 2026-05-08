@@ -242,6 +242,261 @@ async def list_documents(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/documents/chunks-by-file-path")
+async def get_chunks_by_file_path(
+    tenant_id: str,
+    file_path: str,
+    room_id: Optional[str] = None,
+    limit: int = Query(default=200, ge=1, le=2000),
+):
+    """특정 storage file_path의 청크 본문/메타를 반환한다."""
+    try:
+        query = (
+            supabase.table("documents")
+            .select("content, metadata")
+            .eq("metadata->>tenant_id", tenant_id)
+            .eq("metadata->>file_path", file_path)
+            .limit(limit)
+        )
+        if room_id:
+            query = query.eq("metadata->>room_id", room_id)
+
+        response = query.execute()
+        rows = response.data or []
+
+        chunks = []
+        for row in rows:
+            meta = row.get("metadata") or {}
+            if meta.get("type") == "image_analysis":
+                continue
+            if room_id and str(meta.get("room_id") or "") != str(room_id):
+                continue
+            chunks.append(
+                {
+                    "page_content": row.get("content") or "",
+                    "metadata": meta,
+                }
+            )
+
+        chunks.sort(key=lambda c: int((c.get("metadata") or {}).get("chunk_index") or 0))
+        return {
+            "tenant_id": tenant_id,
+            "file_path": file_path,
+            "room_id": room_id,
+            "total_chunks": len(chunks),
+            "chunks": chunks,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _candidate_file_paths(file_path: str) -> List[str]:
+    """
+    메멘토는 storage 업로드 시 `files/{uuid}.{ext}` 형태로 file_path를 저장한다.
+    하지만 work-assistant-agent MCP는 `/files/` 마커 이후 부분만 잘라
+    `{uuid}.{ext}` 형태로 path를 전달하기도 한다.
+    두 형태 모두에서 청크를 찾을 수 있도록 후보 경로를 생성한다.
+    """
+    raw = (file_path or "").strip().rstrip("?")
+    if not raw:
+        return []
+
+    candidates: List[str] = [raw]
+    if not raw.startswith("files/"):
+        candidates.append(f"files/{raw.lstrip('/')}")
+    elif raw.startswith("files/"):
+        candidates.append(raw[len("files/"):])
+
+    # dedupe but preserve order
+    seen: set = set()
+    out: List[str] = []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+@router.get("/documents/chunks-with-embeddings")
+async def get_chunks_with_embeddings(
+    tenant_id: str,
+    file_path: Optional[str] = None,
+    file_name: Optional[str] = None,
+    room_id: Optional[str] = None,
+    include_embeddings: bool = True,
+    limit: int = Query(default=2000, ge=1, le=5000),
+):
+    """
+    pdf2bpmn 등 다운스트림 에이전트가 메멘토의 청크와 임베딩을 그대로 재사용할 수 있도록
+    file_path 또는 file_name 기준으로 (1) Supabase documents의 본문/메타와
+    (2) Chroma에 저장된 임베딩 벡터를 합쳐서 반환한다.
+
+    매칭 우선순위:
+      1) file_path (memento storage 경로). `files/` prefix 유무에 모두 대응.
+      2) file_name (동일 tenant 내에서 unique한 케이스가 일반적).
+
+    응답 형식:
+      {
+        "tenant_id", "file_path", "file_name", "room_id",
+        "total_chunks", "embedding_count",
+        "chunks": [{"page_content", "metadata", "embedding"|null}, ...]
+      }
+    """
+    if not file_path and not file_name:
+        raise HTTPException(status_code=400, detail="file_path 또는 file_name 중 하나는 필수입니다.")
+
+    try:
+        rows: List[dict] = []
+
+        if file_path:
+            for candidate in _candidate_file_paths(file_path):
+                query = (
+                    supabase.table("documents")
+                    .select("id, content, metadata")
+                    .eq("metadata->>tenant_id", tenant_id)
+                    .eq("metadata->>file_path", candidate)
+                    .limit(limit)
+                )
+                if room_id:
+                    query = query.eq("metadata->>room_id", room_id)
+                response = query.execute()
+                if response.data:
+                    rows = response.data
+                    break
+
+        if not rows and file_name:
+            query = (
+                supabase.table("documents")
+                .select("id, content, metadata")
+                .eq("metadata->>tenant_id", tenant_id)
+                .eq("metadata->>file_name", file_name)
+                .limit(limit)
+            )
+            if room_id:
+                query = query.eq("metadata->>room_id", room_id)
+            response = query.execute()
+            rows = response.data or []
+
+        text_rows: List[dict] = []
+        for row in rows:
+            meta = row.get("metadata") or {}
+            if meta.get("type") == "image_analysis":
+                continue
+            if room_id and str(meta.get("room_id") or "") != str(room_id):
+                continue
+            text_rows.append(row)
+
+        text_rows.sort(key=lambda c: int((c.get("metadata") or {}).get("chunk_index") or 0))
+
+        embeddings_map: dict = {}
+        if include_embeddings and text_rows:
+            row_ids = [str(r.get("id") or "") for r in text_rows if r.get("id")]
+            if row_ids:
+                try:
+                    from app.services.vector_store import get_vector_store
+
+                    vsm = get_vector_store()
+                    fetched = await asyncio.to_thread(
+                        vsm.collection.get,
+                        ids=row_ids,
+                        include=["embeddings"],
+                    )
+                    fetched_ids = list(fetched.get("ids") or [])
+                    fetched_embs = list(fetched.get("embeddings") or [])
+                    for i, rid in enumerate(fetched_ids):
+                        if i < len(fetched_embs):
+                            emb = fetched_embs[i]
+                            if emb is not None:
+                                try:
+                                    embeddings_map[str(rid)] = list(emb)
+                                except Exception:
+                                    embeddings_map[str(rid)] = None
+                except Exception as e:
+                    logger.warning("[chunks-with-embeddings] Chroma 임베딩 조회 실패: %s", e)
+
+        chunks: List[dict] = []
+        for row in text_rows:
+            rid = str(row.get("id") or "")
+            chunk_payload = {
+                "page_content": row.get("content") or "",
+                "metadata": row.get("metadata") or {},
+            }
+            if include_embeddings:
+                chunk_payload["embedding"] = embeddings_map.get(rid)
+            chunks.append(chunk_payload)
+
+        embedding_count = sum(1 for c in chunks if c.get("embedding"))
+        logger.info(
+            "[/documents/chunks-with-embeddings] tenant=%r file_path=%r file_name=%r "
+            "room_id=%r → chunks=%d embeddings=%d",
+            tenant_id, file_path, file_name, room_id, len(chunks), embedding_count,
+        )
+
+        return {
+            "tenant_id": tenant_id,
+            "file_path": file_path,
+            "file_name": file_name,
+            "room_id": room_id,
+            "total_chunks": len(chunks),
+            "embedding_count": embedding_count,
+            "chunks": chunks,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("[/documents/chunks-with-embeddings] failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/documents/chunks-by-file-name")
+async def get_chunks_by_file_name(
+    tenant_id: str,
+    file_name: str,
+    room_id: Optional[str] = None,
+    limit: int = Query(default=200, ge=1, le=2000),
+):
+    """특정 file_name의 청크 본문/메타를 반환한다."""
+    try:
+        query = (
+            supabase.table("documents")
+            .select("content, metadata")
+            .eq("metadata->>tenant_id", tenant_id)
+            .eq("metadata->>file_name", file_name)
+            .limit(limit)
+        )
+        if room_id:
+            query = query.eq("metadata->>room_id", room_id)
+
+        response = query.execute()
+        rows = response.data or []
+
+        chunks = []
+        for row in rows:
+            meta = row.get("metadata") or {}
+            if meta.get("type") == "image_analysis":
+                continue
+            if room_id and str(meta.get("room_id") or "") != str(room_id):
+                continue
+            chunks.append(
+                {
+                    "page_content": row.get("content") or "",
+                    "metadata": meta,
+                }
+            )
+
+        chunks.sort(key=lambda c: int((c.get("metadata") or {}).get("chunk_index") or 0))
+        return {
+            "tenant_id": tenant_id,
+            "file_name": file_name,
+            "room_id": room_id,
+            "total_chunks": len(chunks),
+            "chunks": chunks,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/preview/pdf-highlight")
 async def preview_pdf_highlight(
     tenant_id: str,
