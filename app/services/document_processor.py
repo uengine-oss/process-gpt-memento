@@ -158,11 +158,11 @@ def _extract_text_from_hwp_or_hwpx(file_path: str, file_extension: str) -> Tuple
 
 
 class DocumentProcessor:
-    def __init__(self, chunk_size: int = 2000, chunk_overlap: int = 400):
+    def __init__(self, chunk_size: int | None = None, chunk_overlap: int | None = None):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        # Chunking strategy is selected via CHUNKER_STRATEGY env var
-        # (recursive / fixed_token / markdown_header / semantic / hybrid).
+        # Chunking strategy is selected via chunkers/config.py (STRATEGY 값).
+        # chunk_size/chunk_overlap이 None이면 config.py + PER_STRATEGY_OVERRIDES 값을 사용한다.
         self.chunker = get_chunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
         self._openai_client: Optional[OpenAI] = None
 

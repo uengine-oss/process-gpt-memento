@@ -77,6 +77,15 @@ EMBEDDING_PROVIDERS: Dict[str, Dict[str, Any]] = {
         "model_env": ["CUSTOM_EMBEDDING_MODEL"],
         "client": "custom_encode_text",
     },
+    "self": {
+        "base_url": None,
+        "model": "Qwen/Qwen3-Embedding-0.6B",
+        "api_key_env": [],
+        "base_url_env": [],
+        "model_env": ["SELF_EMBEDDING_MODEL"],
+        "device_env": "SELF_EMBEDDING_DEVICE",
+        "client": "self",
+    },
 }
 
 
@@ -150,19 +159,25 @@ def resolve_embedding_config(model_override: Optional[str] = None) -> Dict[str, 
         raise ValueError(f"Unknown MEMENTO_EMBEDDING_PROVIDER: {provider}")
     spec = EMBEDDING_PROVIDERS[provider]
 
-    base_url = _first_env(spec["base_url_env"]) or spec["base_url"]
+    base_url = _first_env(spec.get("base_url_env") or []) or spec.get("base_url")
     if provider == "custom" and not base_url:
         raise ValueError("MEMENTO_EMBEDDING_PROVIDER=custom requires CUSTOM_EMBEDDING_BASE_URL")
 
-    return {
+    cfg: Dict[str, Any] = {
         "provider": provider,
         "base_url": base_url,
-        "api_key": _first_env(spec["api_key_env"]),
-        "model": model_override or _first_env(spec["model_env"]) or spec["model"],
+        "api_key": _first_env(spec.get("api_key_env") or []),
+        "model": model_override or _first_env(spec.get("model_env") or []) or spec["model"],
         "timeout": float(os.getenv("EMBEDDING_TIMEOUT_SEC") or EMBEDDING_TIMEOUT_SEC),
         "client": spec["client"],
         "extra_headers": _openrouter_headers() if provider == "openrouter" else {},
     }
+
+    if provider == "self":
+        device_env = spec.get("device_env", "SELF_EMBEDDING_DEVICE")
+        cfg["device"] = os.getenv(device_env, "cuda")
+
+    return cfg
 
 
 def chroma_persist_directory() -> str:

@@ -202,8 +202,78 @@ class CustomEncodeTextEmbeddings:
         return self._request_one(text)
 
 
-def create_embeddings(model: Optional[str] = None):
+class SelfHostedEmbeddings:
+    """로컬 GPU/CPU에서 sentence-transformers 모델을 직접 실행하는 임베딩 클라이언트.
+
+    Qwen3-Embedding 계열 모델을 지원하며, query 인코딩 시 모델 권장 instruction
+    prefix를 자동으로 적용한다.
+    """
+
+    _QWEN3_QUERY_PROMPT = (
+        "Instruct: Given a query, retrieve relevant passages that answer the query\nQuery: "
+    )
+
+    def __init__(self, model: str, device: str = "cuda"):
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise ImportError(
+                "sentence-transformers 패키지가 필요합니다: pip install sentence-transformers"
+            ) from exc
+
+        import torch
+
+        print(f"[SelfHostedEmbeddings] 모델 로딩: {model} (device={device}, dtype=float16)")
+        # FP16으로 로딩: 모델 VRAM 절반 절감 + 추론 속도 향상
+        model_kwargs = {"torch_dtype": torch.float16} if device == "cuda" else {}
+        self._model = SentenceTransformer(model, device=device, model_kwargs=model_kwargs)
+        self._device = device
+        self._model_name = model
+        self._is_qwen3 = "qwen3" in model.lower()
+        print(f"[SelfHostedEmbeddings] 모델 로딩 완료")
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        embeddings = self._model.encode(
+            texts,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        )
+        return embeddings.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        # Qwen3-Embedding 모델은 query 인코딩 시 instruction prefix 권장
+        if self._is_qwen3:
+            prompt_texts = [self._QWEN3_QUERY_PROMPT + text]
+        else:
+            prompt_texts = [text]
+
+        embedding = self._model.encode(
+            prompt_texts,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            normalize_embeddings=True,
+        )
+        return embedding[0].tolist()
+
+
+import threading as _threading
+
+_embeddings_instance = None
+_embeddings_lock = _threading.Lock()
+
+
+def _new_embeddings_instance(model: Optional[str] = None):
+    """Provider 설정에 따라 새 임베딩 인스턴스를 생성하는 내부 팩토리."""
     cfg = resolve_embedding_config(model_override=model)
+
+    if cfg["client"] == "self":
+        return SelfHostedEmbeddings(
+            model=cfg["model"],
+            device=cfg.get("device", "cuda"),
+        )
 
     if cfg["client"] == "custom_encode_text":
         return CustomEncodeTextEmbeddings(
@@ -220,3 +290,21 @@ def create_embeddings(model: Optional[str] = None):
         timeout=cfg["timeout"],
         extra_headers=cfg["extra_headers"],
     )
+
+
+def get_embeddings(model: Optional[str] = None):
+    """임베딩 인스턴스 싱글턴 getter.
+
+    provider 종류(self/custom/openai)에 관계없이 프로세스 전체에서 동일한
+    인스턴스를 반환한다. 처음 호출 시에만 모델/클라이언트를 초기화한다.
+    """
+    global _embeddings_instance
+    if _embeddings_instance is None:
+        with _embeddings_lock:
+            if _embeddings_instance is None:
+                _embeddings_instance = _new_embeddings_instance(model)
+    return _embeddings_instance
+
+
+# 하위 호환: 기존 코드가 create_embeddings()를 직접 import해 쓰는 곳을 위한 alias.
+create_embeddings = get_embeddings

@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.auth import router as auth_router
 from app.api.debug import router as debug_router
 from app.api.ingest import router as ingest_router
+from app.api.knowledge_admin import router as knowledge_admin_router
 from app.api.query import router as query_router
 from app.api.retrieve import router as retrieve_router
 from app.core.logging_setup import attach_to_uvicorn_loggers
@@ -20,6 +21,8 @@ from app.plugins.chunkers import log_active_strategy as log_chunker_strategy
 from app.plugins.parsers import log_active_strategy as log_parser_strategy
 from app.plugins.retrievers import log_active_strategy as log_retriever_strategy
 from app.services.llm import log_provider_config
+from app.services.rag_chain import get_rag_chain
+from app.services.vector_store import get_vector_store
 
 
 app = FastAPI(title="Memento Service API", description="API for document processing and querying")
@@ -55,6 +58,7 @@ app.include_router(retrieve_router)
 app.include_router(query_router)
 app.include_router(debug_router)
 app.include_router(ingest_router)
+app.include_router(knowledge_admin_router)
 
 
 @app.on_event("startup")
@@ -68,4 +72,11 @@ async def _log_startup_config():
             tracemalloc.start(25)
             print("tracemalloc started (depth=25)", flush=True)
     log_memory_snapshot("startup")
+
+    # 서버 시작 시 싱글턴 인스턴스를 즉시 초기화 (lazy 로딩 방지 및 race condition 제거)
+    print("Pre-initializing VectorStore and RAGChain...", flush=True)
+    await asyncio.to_thread(get_vector_store)
+    await asyncio.to_thread(get_rag_chain)
+    print("Pre-initialization complete.", flush=True)
+
     asyncio.create_task(memory_log_loop())
