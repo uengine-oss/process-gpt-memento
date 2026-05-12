@@ -401,8 +401,10 @@ async def get_chunks_with_embeddings(
                         ids=row_ids,
                         include=["embeddings"],
                     )
-                    fetched_ids = list(fetched.get("ids") or [])
-                    fetched_embs = list(fetched.get("embeddings") or [])
+                    _f_ids = fetched.get("ids")
+                    fetched_ids = list(_f_ids) if _f_ids is not None else []
+                    _f_embs = fetched.get("embeddings")
+                    fetched_embs = list(_f_embs) if _f_embs is not None else []
                     for i, rid in enumerate(fetched_ids):
                         if i < len(fetched_embs):
                             emb = fetched_embs[i]
