@@ -18,14 +18,14 @@ STRATEGY: str = "recursive"
 
 
 # --- 공통 파라미터 (대부분 문자 단위, fixed_token만 토큰 단위) --------------
-CHUNK_SIZE: int = 2000
-CHUNK_OVERLAP: int = 400
+CHUNK_SIZE: int = 800
+CHUNK_OVERLAP: int = 100
 
 
 # --- 전략별 파라미터 -------------------------------------------------------
 # STRATEGY 값에 해당하는 항목만 사용되고, 나머지는 무시됨.
 
-SEMANTIC_SIM_THRESHOLD: float = 0.75   # 낮을수록 청크가 커짐, 높을수록 작아짐
+SEMANTIC_SIM_THRESHOLD: float = 0.78   # 낮을수록 청크가 커짐, 높을수록 작아짐
 SEMANTIC_MIN_SENTENCES: int = 2        # 청크당 최소 문장 수
 
 
@@ -34,6 +34,6 @@ SEMANTIC_MIN_SENTENCES: int = 2        # 청크당 최소 문장 수
 PER_STRATEGY_OVERRIDES: dict = {
     # "fixed_token":     {"chunk_size": 500,  "chunk_overlap": 100},
     # "markdown_header": {"chunk_size": 2500, "chunk_overlap": 300},
-    # "semantic":        {"chunk_size": 1800, "chunk_overlap": 0},
-    # "hybrid":          {"chunk_size": 2000, "chunk_overlap": 400},
+    # "semantic":        {"chunk_size": 800,  "chunk_overlap": 100},
+    # "hybrid":          {"chunk_size": 800,  "chunk_overlap": 100},
 }

@@ -543,12 +543,15 @@ class RAGChain:
 
 
 _rag_chain_instance: Optional["RAGChain"] = None
+_rag_chain_lock = __import__("threading").Lock()
 
 
 def get_rag_chain() -> "RAGChain":
     global _rag_chain_instance
     if _rag_chain_instance is None:
-        _rag_chain_instance = RAGChain()
+        with _rag_chain_lock:
+            if _rag_chain_instance is None:
+                _rag_chain_instance = RAGChain()
     return _rag_chain_instance
 
 

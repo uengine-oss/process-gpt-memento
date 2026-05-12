@@ -19,6 +19,13 @@ from app.core.supabase_client import supabase
 from app.schemas import ProcessRequest
 from app.services.document_processor import get_document_processor
 from app.services.google_drive_loader import GoogleDriveLoader
+from app.services.knowledge_files import (
+    INDEX_STATUS_FAILED,
+    INDEX_STATUS_INDEXED,
+    INDEX_STATUS_PROCESSING,
+    mark_status as kf_mark_status,
+    upsert_drive_files as kf_upsert_drive_files,
+)
 from app.services.rag_chain import get_rag_chain
 from app.services.ingest.image import process_image_file
 from app.services.ingest.state import (
@@ -60,6 +67,15 @@ async def run_drive_folder_async(
 
         for file in new_files:
             try:
+                # 처리 시작 기록
+                if file.get("id"):
+                    await kf_mark_status(
+                        tenant_id=tenant_id,
+                        source_type="drive",
+                        source_ref=file["id"],
+                        status=INDEX_STATUS_PROCESSING,
+                    )
+
                 file_mime_type = file.get("mimeType", "")
                 is_image = file_mime_type in IMAGE_MIME_TYPES
 
@@ -104,6 +120,12 @@ async def run_drive_folder_async(
                         "success": True,
                     })
                     drive_jobs[job_id]["processed"] += 1
+                    await kf_mark_status(
+                        tenant_id=tenant_id,
+                        source_type="drive",
+                        source_ref=file["id"],
+                        status=INDEX_STATUS_INDEXED,
+                    )
                 else:
                     drive_jobs[job_id]["results"].append({
                         "file_id": file["id"],
@@ -112,6 +134,13 @@ async def run_drive_folder_async(
                         "error": "No content extracted",
                     })
                     drive_jobs[job_id]["failed"] += 1
+                    await kf_mark_status(
+                        tenant_id=tenant_id,
+                        source_type="drive",
+                        source_ref=file["id"],
+                        status=INDEX_STATUS_FAILED,
+                        error="No content extracted",
+                    )
             except Exception as e:
                 drive_jobs[job_id]["results"].append({
                     "file_id": file["id"],
@@ -120,6 +149,14 @@ async def run_drive_folder_async(
                     "error": str(e),
                 })
                 drive_jobs[job_id]["failed"] += 1
+                if file.get("id"):
+                    await kf_mark_status(
+                        tenant_id=tenant_id,
+                        source_type="drive",
+                        source_ref=file["id"],
+                        status=INDEX_STATUS_FAILED,
+                        error=str(e),
+                    )
                 print(f"Error processing file {file.get('name', 'unknown')}: {e}")
 
         if all_documents:
@@ -275,9 +312,22 @@ async def process_google_drive(request: ProcessRequest):
         if not files:
             return {"message": f"No documents found in Google Drive folder for tenant {request.tenant_id}"}
 
+        # 발견된 파일 전체를 knowledge_files에 동기화 (메타 갱신, 신규는 pending으로 추가)
+        await kf_upsert_drive_files(request.tenant_id, files)
+
         rag = get_rag_chain()
         processed_files = await rag.get_processed_files(request.tenant_id)
         new_files = [f for f in files if f["id"] not in processed_files]
+
+        # 이미 인덱싱된 파일은 indexed 상태로 보정 (status가 잘못 남아있을 수 있음)
+        already_processed = [f for f in files if f["id"] in processed_files]
+        for f in already_processed:
+            await kf_mark_status(
+                tenant_id=request.tenant_id,
+                source_type="drive",
+                source_ref=f["id"],
+                status=INDEX_STATUS_INDEXED,
+            )
 
         if not new_files:
             return {"message": f"No new documents to process for tenant {request.tenant_id}"}

@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from langchain.schema import Document
 from supabase import create_client
 
-from app.services.llm import create_embeddings
+from app.services.llm import get_embeddings
 from app.core import config
 
 
@@ -54,7 +54,7 @@ class VectorStoreManager:
             os.getenv("SUPABASE_URL"),
             os.getenv("SUPABASE_KEY"),
         )
-        self.embeddings = create_embeddings()
+        self.embeddings = get_embeddings()
         self.supabase_write_embedding = config.supabase_write_embedding()
         self.supabase_dummy_embedding_dimensions = (
             config.supabase_dummy_embedding_dimensions()
@@ -408,20 +408,47 @@ class VectorStoreManager:
     def _build_chroma_where(
         self, filter: Optional[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
+        """filter dict 를 Chroma where 절로 변환.
+
+        지원 키:
+            - 일반 metadata 키 (primitive value): equality 매칭
+            - ``_exclude_chunk_ids`` (list value): chunk_id ``$nin`` (NOT IN) 절 추가.
+              caller 가 이미 본 청크들을 임베딩 검색 단계에서 제외해 top_k 정확 보장.
+        """
         if not filter:
             return None
 
         where: Dict[str, Any] = {}
+        exclude_ids: List[str] = []
         for key, value in filter.items():
             if value is None:
                 continue
+            if key == "_exclude_chunk_ids":
+                if isinstance(value, (list, tuple, set)):
+                    exclude_ids = [str(x) for x in value if x]
+                continue
+            # list value → $in (예: file_id=[A, B] → 그 파일들 중 검색)
+            if isinstance(value, (list, tuple, set)):
+                values = [_normalize_str(v) for v in value if v is not None]
+                if not values:
+                    continue
+                if len(values) == 1:
+                    where[key] = values[0]
+                else:
+                    where[key] = {"$in": values}
+                continue
             if isinstance(value, PRIMITIVE_METADATA_TYPES):
                 where[key] = _normalize_str(value)
-        if not where:
+
+        clauses: List[Dict[str, Any]] = [{k: v} for k, v in where.items()]
+        if exclude_ids:
+            clauses.append({"chunk_id": {"$nin": exclude_ids}})
+
+        if not clauses:
             return None
-        if len(where) == 1:
-            return where
-        return {"$and": [{key: value} for key, value in where.items()]}
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$and": clauses}
 
     def _similarity_search_sync(
         self,
@@ -569,6 +596,47 @@ class VectorStoreManager:
             print(f"Error fetching chunks metadata: {e}")
             return []
 
+    async def get_chunks_by_file_id(
+        self, tenant_id: str, file_id: str
+    ) -> List[Dict[str, Any]]:
+        """주어진 file_id의 모든 청크를 content + metadata와 함께 반환.
+
+        작은 문서(청크 수가 적은 경우)는 RAG 없이 통째로 컨텍스트에 주입할 때 사용.
+        """
+        try:
+            return await asyncio.to_thread(
+                self._get_chunks_by_file_id_sync, tenant_id, file_id
+            )
+        except Exception as e:
+            print(f"Error in get_chunks_by_file_id: {e}")
+            return []
+
+    def _get_chunks_by_file_id_sync(
+        self, tenant_id: str, file_id: str
+    ) -> List[Dict[str, Any]]:
+        try:
+            response = (
+                self.supabase.table("documents")
+                .select("content, metadata")
+                .eq("metadata->>tenant_id", tenant_id)
+                .eq("metadata->>file_id", file_id)
+                .order("metadata->>chunk_index")
+                .execute()
+            )
+            results = []
+            for row in response.data or []:
+                meta = row.get("metadata") or {}
+                if meta.get("type") == "image_analysis":
+                    continue
+                results.append({
+                    "content": row.get("content") or "",
+                    "metadata": meta,
+                })
+            return results
+        except Exception as e:
+            print(f"Error in _get_chunks_by_file_id_sync: {e}")
+            return []
+
     def _get_all_chunks_metadata_sync(
         self, tenant_id: str, file_name: str, drive_folder_id: Optional[str] = None
     ) -> List[Dict[str, Any]]:
@@ -605,10 +673,13 @@ class VectorStoreManager:
 
 
 _vector_store_instance: Optional["VectorStoreManager"] = None
+_vector_store_lock = __import__("threading").Lock()
 
 
 def get_vector_store() -> "VectorStoreManager":
     global _vector_store_instance
     if _vector_store_instance is None:
-        _vector_store_instance = VectorStoreManager()
+        with _vector_store_lock:
+            if _vector_store_instance is None:
+                _vector_store_instance = VectorStoreManager()
     return _vector_store_instance

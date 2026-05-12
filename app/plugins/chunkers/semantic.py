@@ -103,9 +103,9 @@ class SemanticChunker(BaseChunker):
         documents: List[Document],
         file_name: Optional[str] = None,
     ) -> List[Document]:
-        from app.services.llm import create_embeddings
+        from app.services.llm import get_embeddings
 
-        embedder = create_embeddings()
+        embedder = get_embeddings()
 
         out: List[Document] = []
         for doc in documents:

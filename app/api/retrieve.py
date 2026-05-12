@@ -28,6 +28,54 @@ def _summarize_doc(doc: Document, max_chars: int = 200) -> str:
     return f"[{file_name}#{chunk_idx}] {body}"
 
 
+# 작은 문서로 간주하여 청크 전체를 통째로 컨텍스트에 주입할 임계치(청크 개수)
+SMALL_DOC_CHUNK_THRESHOLD = 15
+
+
+@router.get("/search")
+async def search(
+    query: str,
+    tenant_id: str,
+    file_ids: Optional[List[str]] = Query(default=None),
+    top_k: int = Query(default=5, ge=1, le=50),
+    exclude_chunk_ids: Optional[List[str]] = Query(default=None),
+):
+    """엄격한 벡터 검색. ``top_k`` 만큼만 반환. magic 없음.
+
+    필터:
+        - ``tenant_id`` 필수
+        - ``file_ids`` 옵셔널 — 1개 이상이면 그 파일들 중에서 검색 (``$in``).
+          비우면 tenant 전체에서 검색.
+        - ``exclude_chunk_ids`` 옵셔널 — 이 chunk_id 들은 결과에서 제외하고 top_k 채움.
+
+    /retrieve 와 달리 small-doc 통째 반환 / glossary merge / room/proc_inst 분기 등
+    *암묵적 동작이 일절 없음*. 단일 호출에 단일 top_k — 다중 파일이어도 합쳐서 top_k.
+    """
+    if not query or not tenant_id:
+        raise HTTPException(status_code=400, detail="query, tenant_id required")
+
+    metadata_filter: dict = {"tenant_id": tenant_id}
+    cleaned_files = [str(x) for x in (file_ids or []) if x]
+    if cleaned_files:
+        metadata_filter["file_id"] = cleaned_files
+    excluded = [str(x) for x in (exclude_chunk_ids or []) if x]
+    if excluded:
+        metadata_filter["_exclude_chunk_ids"] = excluded
+
+    try:
+        rag = get_rag_chain()
+        result = await rag.retrieve(query, metadata_filter, top_k=top_k)
+        docs: List[Document] = (result.get("source_documents") or [])[:top_k]
+        logger.info(
+            "[/search] tenant=%s file_ids=%s q=%r top_k=%d excluded=%d → %d chunks",
+            tenant_id, cleaned_files or None, query[:80], top_k, len(excluded), len(docs),
+        )
+        return {"response": docs}
+    except Exception as e:
+        logger.exception("[/search] failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/retrieve")
 async def retrieve(
     query: str,
@@ -37,33 +85,75 @@ async def retrieve(
     top_k: int = Query(default=5, ge=1, le=100),
     drive_folder_id: Optional[str] = None,
     room_id: Optional[str] = None,
-    file_name: Optional[str] = None,
+    file_ids: Optional[List[str]] = Query(default=None),
 ):
     logger.info(
-        "[/retrieve] params: query=%r tenant_id=%r room_id=%r file_name=%r proc_inst_id=%r drive_folder_id=%r all_docs=%s top_k=%d",
-        query, tenant_id, room_id, file_name, proc_inst_id, drive_folder_id, all_docs, top_k,
+        "[/retrieve] params: query=%r tenant_id=%r room_id=%r file_ids=%s proc_inst_id=%r drive_folder_id=%r all_docs=%s top_k=%d",
+        query, tenant_id, room_id, file_ids, proc_inst_id, drive_folder_id, all_docs, top_k,
     )
     try:
         rag = get_rag_chain()
         docs: List[Document] = []
         did_retrieve = False
 
-        if room_id and file_name:
-            # room + file_name 조합: 글로벌 머지 없이 정확히 그 파일만
-            metadata_filter = {"tenant_id": tenant_id, "room_id": room_id, "file_name": file_name}
-            if drive_folder_id:
-                metadata_filter["drive_folder_id"] = drive_folder_id
-            result = await rag.retrieve(query, metadata_filter, top_k=top_k)
-            docs = result.get("source_documents") or []
+        # ============================================================
+        # 사용자가 명시적으로 선택한 파일들로 좁히는 경로 (Phase 2)
+        #   - 작은 문서(청크 ≤ SMALL_DOC_CHUNK_THRESHOLD): 전체 청크 통째로 컨텍스트
+        #   - 큰 문서: file_id 단일 필터로 RAG retrieve top_k
+        # ============================================================
+        unique_file_ids = list(dict.fromkeys([fid for fid in (file_ids or []) if fid]))
+
+        if unique_file_ids:
+            from app.services.vector_store import get_vector_store
+
+            vsm = get_vector_store()
+            seen_keys: set = set()
+
+            def _push_doc(d: Document) -> None:
+                meta = d.metadata or {}
+                key = (
+                    str(meta.get("file_id") or ""),
+                    str(meta.get("chunk_index") or meta.get("chunk_id") or ""),
+                )
+                if key in seen_keys:
+                    return
+                seen_keys.add(key)
+                docs.append(d)
+
+            for fid in unique_file_ids:
+                try:
+                    chunks = await vsm.get_chunks_by_file_id(tenant_id, fid)
+                except Exception as e:
+                    logger.warning("[/retrieve] get_chunks_by_file_id failed for %s: %s", fid, e)
+                    chunks = []
+
+                if not chunks:
+                    # 청크가 없으면 RAG로라도 시도 (메타 인덱스 누락 등 대비)
+                    fallback = await rag.retrieve(
+                        query,
+                        {"tenant_id": tenant_id, "file_id": fid},
+                        top_k=top_k,
+                    )
+                    for d in (fallback.get("source_documents") or []):
+                        _push_doc(d)
+                    continue
+
+                if len(chunks) <= SMALL_DOC_CHUNK_THRESHOLD:
+                    # 작은 문서: 모든 청크 그대로 사용
+                    for c in chunks:
+                        _push_doc(Document(page_content=c["content"], metadata=c["metadata"]))
+                else:
+                    # 큰 문서: file_id 단일 필터로 RAG retrieve
+                    sub = await rag.retrieve(
+                        query,
+                        {"tenant_id": tenant_id, "file_id": fid},
+                        top_k=top_k,
+                    )
+                    for d in (sub.get("source_documents") or []):
+                        _push_doc(d)
+
             did_retrieve = True
-        elif file_name:
-            # 파일명 단독 필터: 테넌트 + file_name
-            metadata_filter = {"tenant_id": tenant_id, "file_name": file_name}
-            if drive_folder_id:
-                metadata_filter["drive_folder_id"] = drive_folder_id
-            result = await rag.retrieve(query, metadata_filter, top_k=top_k)
-            docs = result.get("source_documents") or []
-            did_retrieve = True
+
         elif room_id:
             room_filter = {"tenant_id": tenant_id, "room_id": room_id}
             global_filter = {"tenant_id": tenant_id, "knowledge_scope": "global"}
@@ -207,37 +297,56 @@ async def list_documents(
     drive_folder_id: Optional[str] = None,
     include_images: bool = False,
 ):
-    """특정 폴더(옵션) 내 문서명 목록을 반환."""
+    """테넌트의 내부 지식공간 파일 목록을 knowledge_files에서 조회한다.
+
+    응답:
+        files: [file_name, ...]                       (역호환)
+        file_details: [{file_name, drive_folder_name, ...}, ...]   (확장 메타 포함)
+        total: 개수
+    """
     try:
-        query = (
-            supabase.table("documents")
-            .select("metadata")
-            .eq("metadata->>tenant_id", tenant_id)
-        )
+        from app.services.knowledge_files import list_for_tenant
+
+        rows = await list_for_tenant(tenant_id)
         if drive_folder_id:
-            query = query.eq("metadata->>drive_folder_id", drive_folder_id)
-        response = query.execute()
+            rows = [r for r in rows if r.get("drive_folder_id") == drive_folder_id]
 
         file_names: List[str] = []
-        file_folder_map: dict = {}
-        for row in response.data or []:
-            meta = row.get("metadata") or {}
-            if not include_images and meta.get("type") == "image_analysis":
+        file_details: List[dict] = []
+        for r in rows:
+            name = r.get("file_name")
+            if not name:
                 continue
-            name = meta.get("file_name")
-            if name:
-                name = str(name)
-                file_names.append(name)
-                if name not in file_folder_map:
-                    folder = meta.get("drive_folder_name") or ""
-                    file_folder_map[name] = str(folder)
+            mime = r.get("mime_type") or ""
+            if not include_images and mime.startswith("image/"):
+                continue
+            file_names.append(str(name))
+            file_details.append({
+                # 역호환 필드
+                "file_name": name,
+                "drive_folder_name": r.get("folder_path") or "",
+                # 확장 필드 (프론트 picker에서 사용)
+                "source_type": r.get("source_type"),
+                "source_ref": r.get("source_ref"),
+                "folder_path": r.get("folder_path") or "",
+                "drive_folder_id": r.get("drive_folder_id"),
+                "mime_type": mime,
+                "size_bytes": r.get("size_bytes"),
+                "modified_time": r.get("modified_time"),
+                "owner": r.get("owner"),
+                "uploaded_by_uid": r.get("uploaded_by_uid"),
+                "uploaded_by_name": r.get("uploaded_by_name"),
+                "index_status": r.get("index_status"),
+                "index_error": r.get("index_error"),
+                "indexed_at": r.get("indexed_at"),
+                "updated_at": r.get("updated_at"),
+            })
 
-        unique_files = list(dict.fromkeys(file_names))
-        file_details = [
-            {"file_name": f, "drive_folder_name": file_folder_map.get(f, "")}
-            for f in unique_files
-        ]
-        return {"files": unique_files, "file_details": file_details, "total": len(unique_files)}
+        return {
+            "files": file_names,
+            "file_details": file_details,
+            "total": len(file_details),
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

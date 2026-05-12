@@ -313,6 +313,9 @@ class GoogleDriveLoader:
 
         folder_mime = "application/vnd.google-apps.folder"
         allowed_types = set(file_types or [])
+        # 루트 직하에서 일괄 인덱싱 대상에서 제외할 폴더명
+        # - 'instances': 워크아이템 산출물이 자동 저장되는 곳 (process_output에서 별도로 인덱싱)
+        EXCLUDED_ROOT_SUBFOLDERS = {"instances"}
         results: List[dict] = []
 
         async def _list_children(parent_id: str, parent_folder_name: str = "") -> None:
@@ -322,7 +325,7 @@ class GoogleDriveLoader:
                     request = self.service.files().list(
                         q=f"'{parent_id}' in parents and trashed=false",
                         spaces="drive",
-                        fields="nextPageToken, files(id, name, mimeType)",
+                        fields="nextPageToken, files(id, name, mimeType, size, modifiedTime, owners(displayName,emailAddress))",
                         pageToken=page_token,
                     )
                     response = await asyncio.wait_for(
@@ -333,6 +336,9 @@ class GoogleDriveLoader:
                         if item.get("mimeType") == folder_mime:
                             # 하위 폴더 재귀: 폴더 경로를 이어 붙임
                             sub_name = item.get("name", "")
+                            # 루트 직하 제외 폴더는 트리 자체를 건너뜀
+                            if parent_id == folder_id and sub_name in EXCLUDED_ROOT_SUBFOLDERS:
+                                continue
                             sub_path = f"{parent_folder_name}/{sub_name}" if parent_folder_name else sub_name
                             await _list_children(item["id"], sub_path)
                             continue
