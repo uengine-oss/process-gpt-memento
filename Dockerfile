@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     poppler-utils \
     libreoffice \
+    vim \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 ENV MAX_JOBS=1

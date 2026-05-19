@@ -163,6 +163,19 @@ async def mark_status(
         logger.warning("[knowledge_files] mark_status failed (%s): %s", status, e)
 
 
+VALID_DOC_ROLES = ("content", "glossary", "template", "reference", "dataset")
+
+
+def normalize_doc_role(role: Optional[str]) -> str:
+    """클라이언트가 보낸 doc_role 값 정규화 — 미지정/오타는 'content' 폴백."""
+    r = (role or "").strip().lower()
+    return r if r in VALID_DOC_ROLES else "content"
+
+
+# 내부 호환용 alias (기존 코드가 underscore 버전 import 한 경우 대비)
+_normalize_doc_role = normalize_doc_role
+
+
 async def register_uploaded_file(
     tenant_id: str,
     storage_path: str,
@@ -175,6 +188,7 @@ async def register_uploaded_file(
     file_hash: Optional[str] = None,
     uploaded_by_uid: Optional[str] = None,
     uploaded_by_name: Optional[str] = None,
+    doc_role: Optional[str] = None,
 ) -> None:
     """직접 업로드한 파일을 knowledge_files에 등록한다 (source_type='upload')."""
     payload = {
@@ -190,6 +204,7 @@ async def register_uploaded_file(
         "uploaded_by_name": uploaded_by_name,
         "file_hash": file_hash,
         "index_status": initial_status,
+        "doc_role": _normalize_doc_role(doc_role),
         "modified_time": datetime.utcnow().isoformat(),
     }
     try:
@@ -207,22 +222,112 @@ async def delete_entry(
     source_type: str,
     source_ref: str,
 ) -> Dict[str, Any]:
-    """파일 1개를 RAG 인덱스/메타에서 완전 제거.
+    """파일 1개를 RAG 인덱스/메타에서 *완전* 제거 — 더미 데이터 누수 0 목표.
 
-    수행 작업:
-      1) documents 테이블에서 file_id = source_ref AND tenant_id 청크 삭제
-      2) processed_files 테이블에서 동일 키 삭제
-      3) source_type='upload'면 storage 'files' 버킷에서 객체 삭제
-      4) knowledge_files row 삭제
+    정리 대상 (모두):
+      1) documents 테이블 청크 본문 (metadata.file_id 매칭)
+      2) documents 테이블 이미지-분석 본문 (metadata.type='image_analysis' AND
+         metadata.document_id ∈ 위 청크 id들)
+      3) Chroma 컬렉션 임베딩 (청크 + 이미지-분석)
+      4) document_pages 테이블 페이지 본문
+      5) document_images 테이블 이미지 메타 (document_id ∈ 위 청크 id들)
+      6) processed_files
+      7) Storage 'files' 버킷의 원본 파일 (upload만)
+      8) Storage extracted_images/<tenant>/<file_id>/ 폴더의 추출 이미지들
+      9) knowledge_files row
+
+    실패는 격리 — 한 단계 실패해도 나머지 단계 계속 진행. 각 단계 성공 여부는 result 에.
     """
     result: Dict[str, Any] = {
         "documents_deleted": False,
+        "image_analysis_documents_deleted": False,
+        "chroma_deleted": False,
+        "pages_deleted": False,
+        "document_images_deleted": False,
         "processed_files_deleted": False,
         "storage_deleted": False,
+        "extracted_images_deleted": False,
         "knowledge_row_deleted": False,
     }
 
-    # 1. documents (RAG 청크) 삭제
+    # 0a. 청크 row id 미리 수집 — document_images / 이미지-분석 행 삭제 시 FK 역할
+    chunk_ids: List[str] = []
+    try:
+        resp = await asyncio.to_thread(
+            supabase.table("documents")
+            .select("id")
+            .eq("metadata->>tenant_id", tenant_id)
+            .eq("metadata->>file_id", source_ref)
+            .execute
+        )
+        chunk_ids = [str(r.get("id")) for r in (resp.data or []) if r.get("id")]
+    except Exception as e:
+        logger.warning("[knowledge_files] collect chunk ids failed: %s", e)
+
+    # 0b. 이미지-분석 documents row id 수집 (metadata.document_id ∈ chunk_ids)
+    #     이미지-분석 행은 자기 metadata.file_id 가 없어서 file_id 직접 매칭 불가 →
+    #     parent 청크 id 통해 역추적.
+    image_doc_ids: List[str] = []
+    if chunk_ids:
+        # PostgREST URL 길이 제한 대비 — 200개씩 배치
+        for start in range(0, len(chunk_ids), 200):
+            batch = chunk_ids[start:start + 200]
+            try:
+                resp = await asyncio.to_thread(
+                    supabase.table("documents")
+                    .select("id")
+                    .eq("metadata->>type", "image_analysis")
+                    .in_("metadata->>document_id", batch)
+                    .execute
+                )
+                image_doc_ids.extend(
+                    str(r.get("id")) for r in (resp.data or []) if r.get("id")
+                )
+            except Exception as e:
+                logger.warning(
+                    "[knowledge_files] collect image-analysis ids (batch %d) failed: %s",
+                    start // 200, e,
+                )
+
+    # 1. Chroma 임베딩 삭제 (documents row 삭제 *전*에 — 의존성은 없지만 보수적 순서)
+    try:
+        from app.services.vector_store import get_vector_store
+        vsm = get_vector_store()
+        # 청크 임베딩 — Chroma metadata 의 tenant_id + file_id 로 매칭
+        await asyncio.to_thread(
+            vsm.collection.delete,
+            where={"$and": [
+                {"tenant_id": tenant_id},
+                {"file_id": source_ref},
+            ]},
+        )
+        # 이미지-분석 임베딩 — file_id 가 없어서 row id 로 직접 삭제
+        if image_doc_ids:
+            for start in range(0, len(image_doc_ids), 500):
+                batch = image_doc_ids[start:start + 500]
+                await asyncio.to_thread(vsm.collection.delete, ids=batch)
+        result["chroma_deleted"] = True
+    except Exception as e:
+        logger.warning("[knowledge_files] delete Chroma embeddings failed: %s", e)
+
+    # 2. document_images 메타 삭제 (chunk_ids 기반)
+    if chunk_ids:
+        try:
+            for start in range(0, len(chunk_ids), 200):
+                batch = chunk_ids[start:start + 200]
+                await asyncio.to_thread(
+                    supabase.table("document_images")
+                    .delete()
+                    .in_("document_id", batch)
+                    .execute
+                )
+            result["document_images_deleted"] = True
+        except Exception as e:
+            logger.warning("[knowledge_files] delete document_images failed: %s", e)
+    else:
+        result["document_images_deleted"] = True  # 청크 없으면 정리할 것도 없음
+
+    # 3. documents 청크 본문 삭제
     try:
         await asyncio.to_thread(
             supabase.table("documents")
@@ -233,9 +338,41 @@ async def delete_entry(
         )
         result["documents_deleted"] = True
     except Exception as e:
-        logger.warning("[knowledge_files] delete documents failed: %s", e)
+        logger.warning("[knowledge_files] delete documents (chunks) failed: %s", e)
 
-    # 2. processed_files 삭제 (재인덱싱 가능하도록)
+    # 3b. documents 이미지-분석 본문 삭제
+    if image_doc_ids:
+        try:
+            for start in range(0, len(image_doc_ids), 200):
+                batch = image_doc_ids[start:start + 200]
+                await asyncio.to_thread(
+                    supabase.table("documents")
+                    .delete()
+                    .in_("id", batch)
+                    .execute
+                )
+            result["image_analysis_documents_deleted"] = True
+        except Exception as e:
+            logger.warning(
+                "[knowledge_files] delete image-analysis documents failed: %s", e,
+            )
+    else:
+        result["image_analysis_documents_deleted"] = True
+
+    # 4. document_pages 삭제 (Phase 1.1 신규 테이블)
+    try:
+        await asyncio.to_thread(
+            supabase.table("document_pages")
+            .delete()
+            .eq("tenant_id", tenant_id)
+            .eq("file_id", source_ref)
+            .execute
+        )
+        result["pages_deleted"] = True
+    except Exception as e:
+        logger.warning("[knowledge_files] delete document_pages failed: %s", e)
+
+    # 5. processed_files 삭제 (재인덱싱 가능하도록)
     try:
         await asyncio.to_thread(
             supabase.table("processed_files")
@@ -248,7 +385,7 @@ async def delete_entry(
     except Exception as e:
         logger.warning("[knowledge_files] delete processed_files failed: %s", e)
 
-    # 3. upload면 storage에서도 객체 삭제
+    # 6. Storage 'files' 버킷의 원본 (upload 만)
     if source_type == "upload":
         try:
             await asyncio.to_thread(
@@ -257,8 +394,36 @@ async def delete_entry(
             result["storage_deleted"] = True
         except Exception as e:
             logger.warning("[knowledge_files] delete storage object failed: %s", e)
+    else:
+        result["storage_deleted"] = True  # drive 등 외부 소스는 우리 storage 객체 없음
 
-    # 4. knowledge_files row 삭제
+    # 7. Storage extracted_images/<tenant>/<file_id>/ 폴더 정리
+    #    file_id 가 storage path(슬래시 포함)면 깊은 nested 폴더가 됨 — 그대로 처리.
+    try:
+        folder = f"extracted_images/{tenant_id}/{source_ref}"
+        objects = await asyncio.to_thread(
+            supabase.storage.from_("files").list, folder
+        )
+        if objects:
+            paths = [
+                f"{folder}/{obj['name']}"
+                for obj in objects
+                if isinstance(obj, dict) and obj.get("name")
+            ]
+            if paths:
+                # remove 는 한 호출에 여러 path OK — 다만 너무 많으면 분할
+                for start in range(0, len(paths), 100):
+                    await asyncio.to_thread(
+                        supabase.storage.from_("files").remove,
+                        paths[start:start + 100],
+                    )
+        result["extracted_images_deleted"] = True
+    except Exception as e:
+        logger.warning(
+            "[knowledge_files] delete extracted_images folder failed: %s", e,
+        )
+
+    # 8. knowledge_files row 삭제 — 마지막 (위 단계들이 source_ref 매칭에 의존)
     try:
         await asyncio.to_thread(
             supabase.table("knowledge_files")
@@ -272,6 +437,10 @@ async def delete_entry(
     except Exception as e:
         logger.warning("[knowledge_files] delete knowledge_files row failed: %s", e)
 
+    logger.info(
+        "[knowledge_files] delete_entry result tenant=%s ref=%s : %s",
+        tenant_id, source_ref, result,
+    )
     return result
 
 
@@ -414,9 +583,10 @@ async def rename_folder(
     tenant_id: str,
     old_path: str,
     new_path: str,
+    doc_role: Optional[str] = None,
 ) -> int:
-    """upload 소스의 폴더 이름을 변경.
-    - knowledge_files.folder_path prefix 치환
+    """upload 소스의 폴더 이름을 변경. doc_role 지정 시 해당 role 안에서만.
+    - knowledge_files.folder_path prefix 치환 (role scope)
     - storage 객체도 새 경로로 move
     - documents.metadata.file_id, processed_files.file_id 도 동기화
 
@@ -425,18 +595,21 @@ async def rename_folder(
     if not old_path or not new_path or old_path == new_path:
         return 0
 
+    role = _normalize_doc_role(doc_role) if doc_role else None
     affected = 0
 
     # 1) 정확히 그 폴더의 파일들
     try:
-        exact = await asyncio.to_thread(
+        eq = (
             supabase.table("knowledge_files")
             .select("source_ref, folder_path")
             .eq("tenant_id", tenant_id)
             .eq("source_type", "upload")
             .eq("folder_path", old_path)
-            .execute
         )
+        if role:
+            eq = eq.eq("doc_role", role)
+        exact = await asyncio.to_thread(eq.execute)
         for row in (exact.data or []):
             ok = await _move_one_file(tenant_id, row, new_path)
             if ok:
@@ -446,14 +619,16 @@ async def rename_folder(
 
     # 2) 하위 폴더 파일들 — folder_path가 old_path/로 시작
     try:
-        children = await asyncio.to_thread(
+        cq = (
             supabase.table("knowledge_files")
             .select("source_ref, folder_path")
             .eq("tenant_id", tenant_id)
             .eq("source_type", "upload")
             .like("folder_path", f"{old_path}/%")
-            .execute
         )
+        if role:
+            cq = cq.eq("doc_role", role)
+        children = await asyncio.to_thread(cq.execute)
         for row in (children.data or []):
             old_folder = row.get("folder_path") or ""
             new_folder = new_path + old_folder[len(old_path):]
@@ -464,7 +639,7 @@ async def rename_folder(
         logger.warning("[knowledge_files] rename children query failed: %s", e)
 
     # 3) knowledge_folders 메타 row도 같이 갱신 (빈 폴더 영속화)
-    await rename_folder_meta(tenant_id, old_path, new_path)
+    await rename_folder_meta(tenant_id, old_path, new_path, doc_role=role)
 
     return affected
 
@@ -473,31 +648,37 @@ async def list_files_in_folder_recursive(
     tenant_id: str,
     folder_path: str,
     source_type: str = "upload",
+    doc_role: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """특정 폴더 + 그 하위에 속한 파일 row 반환."""
+    """특정 폴더 + 그 하위에 속한 파일 row 반환. doc_role 지정 시 해당 role 안에서만."""
     rows: List[Dict[str, Any]] = []
+    role = _normalize_doc_role(doc_role) if doc_role else None
     try:
-        exact = await asyncio.to_thread(
+        eq = (
             supabase.table("knowledge_files")
             .select("source_type, source_ref, file_name, folder_path")
             .eq("tenant_id", tenant_id)
             .eq("source_type", source_type)
             .eq("folder_path", folder_path)
-            .execute
         )
+        if role:
+            eq = eq.eq("doc_role", role)
+        exact = await asyncio.to_thread(eq.execute)
         rows.extend(exact.data or [])
     except Exception as e:
         logger.warning("[knowledge_files] folder list exact failed: %s", e)
 
     try:
-        children = await asyncio.to_thread(
+        cq = (
             supabase.table("knowledge_files")
             .select("source_type, source_ref, file_name, folder_path")
             .eq("tenant_id", tenant_id)
             .eq("source_type", source_type)
             .like("folder_path", f"{folder_path}/%")
-            .execute
         )
+        if role:
+            cq = cq.eq("doc_role", role)
+        children = await asyncio.to_thread(cq.execute)
         rows.extend(children.data or [])
     except Exception as e:
         logger.warning("[knowledge_files] folder list children failed: %s", e)
@@ -505,29 +686,44 @@ async def list_files_in_folder_recursive(
     return rows
 
 
-async def list_folders_for_tenant(tenant_id: str) -> List[str]:
-    """knowledge_folders 테이블에서 빈 폴더 포함 모든 등록된 폴더 경로 반환."""
+async def list_folders_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
+    """knowledge_folders 테이블에서 빈 폴더 포함 모든 등록된 폴더 row 반환.
+
+    Returns:
+        [{"folder_path": str, "doc_role": str}, ...]
+    """
     try:
         result = await asyncio.to_thread(
             supabase.table("knowledge_folders")
-            .select("folder_path")
+            .select("folder_path, doc_role")
             .eq("tenant_id", tenant_id)
             .execute
         )
-        return [r["folder_path"] for r in (result.data or []) if r.get("folder_path")]
+        return [
+            {
+                "folder_path": r["folder_path"],
+                "doc_role": (r.get("doc_role") or "content"),
+            }
+            for r in (result.data or [])
+            if r.get("folder_path")
+        ]
     except Exception as e:
         logger.warning("[knowledge_folders] list failed: %s", e)
         return []
 
 
-async def create_folder(tenant_id: str, folder_path: str) -> bool:
+async def create_folder(tenant_id: str, folder_path: str, doc_role: Optional[str] = None) -> bool:
     folder_path = (folder_path or "").strip().strip("/")
     if not folder_path:
         return False
+    role = _normalize_doc_role(doc_role)
     try:
         await asyncio.to_thread(
             supabase.table("knowledge_folders")
-            .upsert({"tenant_id": tenant_id, "folder_path": folder_path}, on_conflict="tenant_id,folder_path")
+            .upsert(
+                {"tenant_id": tenant_id, "folder_path": folder_path, "doc_role": role},
+                on_conflict="tenant_id,doc_role,folder_path",
+            )
             .execute
         )
         return True
@@ -536,34 +732,43 @@ async def create_folder(tenant_id: str, folder_path: str) -> bool:
         return False
 
 
-async def rename_folder_meta(tenant_id: str, old_path: str, new_path: str) -> int:
+async def rename_folder_meta(
+    tenant_id: str,
+    old_path: str,
+    new_path: str,
+    doc_role: Optional[str] = None,
+) -> int:
     """knowledge_folders 테이블에서 폴더 row 자체와 자식 폴더들 prefix 치환.
-    rename_folder()에서 함께 호출됨.
+    rename_folder()에서 함께 호출됨. doc_role 지정 시 해당 role 안에서만 적용.
     """
     if not old_path or not new_path or old_path == new_path:
         return 0
+    role = _normalize_doc_role(doc_role) if doc_role else None
     affected = 0
     try:
-        # 정확 매치
-        await asyncio.to_thread(
+        q = (
             supabase.table("knowledge_folders")
             .update({"folder_path": new_path})
             .eq("tenant_id", tenant_id)
             .eq("folder_path", old_path)
-            .execute
         )
+        if role:
+            q = q.eq("doc_role", role)
+        await asyncio.to_thread(q.execute)
         affected += 1
     except Exception as e:
         logger.warning("[knowledge_folders] rename exact failed: %s", e)
 
     try:
-        children = await asyncio.to_thread(
+        cq = (
             supabase.table("knowledge_folders")
             .select("id, folder_path")
             .eq("tenant_id", tenant_id)
             .like("folder_path", f"{old_path}/%")
-            .execute
         )
+        if role:
+            cq = cq.eq("doc_role", role)
+        children = await asyncio.to_thread(cq.execute)
         for row in (children.data or []):
             old_p = row.get("folder_path") or ""
             new_p = new_path + old_p[len(old_path):]
@@ -583,27 +788,37 @@ async def rename_folder_meta(tenant_id: str, old_path: str, new_path: str) -> in
     return affected
 
 
-async def delete_folder_meta(tenant_id: str, folder_path: str) -> int:
-    """knowledge_folders에서 해당 폴더 + 모든 자식 폴더 row 삭제."""
+async def delete_folder_meta(
+    tenant_id: str,
+    folder_path: str,
+    doc_role: Optional[str] = None,
+) -> int:
+    """knowledge_folders에서 해당 폴더 + 모든 자식 폴더 row 삭제.
+    doc_role 지정 시 해당 role 안에서만 삭제.
+    """
     if not folder_path:
         return 0
+    role = _normalize_doc_role(doc_role) if doc_role else None
     try:
-        # 정확 매치
-        await asyncio.to_thread(
+        q1 = (
             supabase.table("knowledge_folders")
             .delete()
             .eq("tenant_id", tenant_id)
             .eq("folder_path", folder_path)
-            .execute
         )
-        # 자식 prefix
-        await asyncio.to_thread(
+        if role:
+            q1 = q1.eq("doc_role", role)
+        await asyncio.to_thread(q1.execute)
+
+        q2 = (
             supabase.table("knowledge_folders")
             .delete()
             .eq("tenant_id", tenant_id)
             .like("folder_path", f"{folder_path}/%")
-            .execute
         )
+        if role:
+            q2 = q2.eq("doc_role", role)
+        await asyncio.to_thread(q2.execute)
         return 1
     except Exception as e:
         logger.warning("[knowledge_folders] delete failed: %s", e)
@@ -664,6 +879,31 @@ async def get_entry(
         return None
 
 
+async def list_by_role(
+    tenant_id: str,
+    doc_role: str,
+    source_refs: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """tenant 안에서 doc_role 매칭 파일 row 반환 (옵션: source_refs로 추가 필터)."""
+    if not tenant_id or not doc_role:
+        return []
+    try:
+        q = (
+            supabase.table("knowledge_files")
+            .select("source_type, source_ref, file_name, folder_path, doc_role")
+            .eq("tenant_id", tenant_id)
+            .eq("doc_role", doc_role)
+        )
+        cleaned = [s for s in (source_refs or []) if s]
+        if cleaned:
+            q = q.in_("source_ref", cleaned)
+        result = await asyncio.to_thread(q.execute)
+        return list(result.data or [])
+    except Exception as e:
+        logger.warning("[knowledge_files] list_by_role(%s) failed: %s", doc_role, e)
+        return []
+
+
 async def list_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
     """프론트 picker용 — 테넌트의 모든 knowledge_files row 반환."""
     try:
@@ -673,7 +913,7 @@ async def list_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
                 "source_type, source_ref, file_name, folder_path, drive_folder_id, "
                 "mime_type, size_bytes, modified_time, owner, "
                 "uploaded_by_uid, uploaded_by_name, index_status, "
-                "index_error, indexed_at, updated_at"
+                "index_error, indexed_at, updated_at, doc_role"
             )
             .eq("tenant_id", tenant_id)
             .order("folder_path", desc=False)

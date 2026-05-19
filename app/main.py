@@ -13,8 +13,10 @@ from app.api.auth import router as auth_router
 from app.api.debug import router as debug_router
 from app.api.ingest import router as ingest_router
 from app.api.knowledge_admin import router as knowledge_admin_router
+from app.api.navigator import router as navigator_router
 from app.api.query import router as query_router
 from app.api.retrieve import router as retrieve_router
+from app.api.summary import router as summary_router
 from app.core.logging_setup import attach_to_uvicorn_loggers
 from app.core.memory_monitor import log_memory_snapshot, memory_log_loop
 from app.plugins.chunkers import log_active_strategy as log_chunker_strategy
@@ -59,6 +61,8 @@ app.include_router(query_router)
 app.include_router(debug_router)
 app.include_router(ingest_router)
 app.include_router(knowledge_admin_router)
+app.include_router(navigator_router)
+app.include_router(summary_router)
 
 
 @app.on_event("startup")
