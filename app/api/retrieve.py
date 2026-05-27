@@ -340,6 +340,7 @@ async def list_documents(
                 "index_error": r.get("index_error"),
                 "indexed_at": r.get("indexed_at"),
                 "updated_at": r.get("updated_at"),
+                "doc_role": r.get("doc_role") or "content",
             })
 
         return {
