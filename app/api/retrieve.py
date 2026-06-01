@@ -352,6 +352,79 @@ async def list_documents(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/documents/full-text")
+async def get_full_text(
+    tenant_id: str,
+    file_ids: List[str] = Query(...),
+):
+    """파일별 *원본 통째 텍스트* 반환 — RAG chunking 우회.
+
+    documents 테이블의 chunk 들을 file_id 별로 모아 ``chunk_index`` 순으로 concat.
+
+    *용도*: deepagents-lite 의 MOU 작성 흐름처럼 *작은 자료(사업개요)는 통째 컨텍스트*
+    를 원할 때. 호출자가 chunks 합치는 로직 복제하지 않게 서버에서 한 번에 제공.
+
+    Response:
+        ``{file_id: {file_name, full_text, chunk_count, total_chars}}``
+    """
+    if not tenant_id or not file_ids:
+        raise HTTPException(status_code=400, detail="tenant_id 와 file_ids 필수")
+
+    cleaned = [str(x).strip() for x in file_ids if x and str(x).strip()]
+    if not cleaned:
+        return {}
+
+    out: dict = {}
+    for fid in cleaned:
+        try:
+            response = (
+                supabase.table("documents")
+                .select("content, metadata")
+                .eq("metadata->>tenant_id", tenant_id)
+                .eq("metadata->>file_id", fid)
+                .limit(2000)
+                .execute()
+            )
+            rows = response.data or []
+        except Exception as exc:
+            logger.exception("[/documents/full-text] DB 조회 실패 file_id=%s: %s", fid, exc)
+            out[fid] = {"file_name": "", "full_text": "", "chunk_count": 0,
+                        "total_chars": 0, "error": str(exc)}
+            continue
+
+        # image_analysis 등 메타 chunk 제외
+        chunks = []
+        file_name = ""
+        for row in rows:
+            meta = row.get("metadata") or {}
+            if meta.get("type") == "image_analysis":
+                continue
+            if not file_name:
+                file_name = meta.get("file_name") or meta.get("source") or ""
+            chunks.append({
+                "content": row.get("content") or "",
+                "chunk_index": int(meta.get("chunk_index") or 0),
+            })
+
+        # chunk_index 순 정렬 + concat
+        chunks.sort(key=lambda c: c["chunk_index"])
+        full_text = "\n".join(c["content"] for c in chunks if c["content"]).strip()
+
+        out[fid] = {
+            "file_name": file_name,
+            "full_text": full_text,
+            "chunk_count": len(chunks),
+            "total_chars": len(full_text),
+        }
+
+    logger.info(
+        "[/documents/full-text] tenant=%s files=%d → sizes=%s",
+        tenant_id, len(out),
+        {fid: meta.get("total_chars") for fid, meta in out.items()},
+    )
+    return out
+
+
 @router.get("/documents/chunks-by-file-path")
 async def get_chunks_by_file_path(
     tenant_id: str,

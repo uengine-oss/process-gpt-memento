@@ -55,7 +55,7 @@ async def _resolve_admin(requester_uid: Optional[str], tenant_id: str) -> bool:
             .select("is_admin, role")
             .eq("id", requester_uid)
             .eq("tenant_id", tenant_id)
-            .maybeSingle()
+            .maybe_single()
             .execute()
         )
         if result.data:
