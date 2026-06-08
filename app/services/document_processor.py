@@ -216,21 +216,33 @@ class DocumentProcessor:
         return list(await asyncio.gather(*tasks))
 
     def _load_docx_with_python_docx(self, tmp_path: str, file_name: str) -> List[Document]:
-        """DOCX 텍스트 추출 paragraph + table 셀 텍스트."""
-        if docx is None:
-            raise RuntimeError("python-docx is not installed")
-        doc = docx.Document(tmp_path)
-        parts = []
-        for p in doc.paragraphs:
-            if p.text.strip():
-                parts.append(p.text)
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    if cell.text.strip():
-                        parts.append(cell.text)
-        text = "\n\n".join(parts) if parts else ""
-        return [Document(page_content=text)]
+        """DOCX 구조화 추출 — 표 마크다운 / 메모 위치 / placeholder / 이미지 *설명* 보존.
+
+        Vision LLM 호출 자동 (env vars CUSTOM_LLM_BASE_URL/API_KEY/MODEL 갖춰져 있으면).
+        env 없으면 parser 가 알아서 skip + 자리표시만 기록 (fail-open).
+        """
+        # 지연 import — 순환 회피 + parser 의존성 격리
+        from app.plugins.parsers.docx_structured import parse as parse_structured
+        import tempfile as _tempfile
+        with _tempfile.TemporaryDirectory() as tmp_img_dir:
+            result = parse_structured(tmp_path, out_dir=Path(tmp_img_dir), describe=True)
+        flat_text = result.get("flat_text") or ""
+        if not flat_text.strip():
+            # fallback — 빈 결과면 옛 평탄화 추출
+            if docx is None:
+                raise RuntimeError("python-docx is not installed")
+            doc = docx.Document(tmp_path)
+            parts = []
+            for p in doc.paragraphs:
+                if p.text.strip():
+                    parts.append(p.text)
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        if cell.text.strip():
+                            parts.append(cell.text)
+            flat_text = "\n\n".join(parts)
+        return [Document(page_content=flat_text)]
 
     async def load_document(self, file_content: bytes, file_name: str) -> Optional[List[Document]]:
         """Async: Load a document from memory (BytesIO object)."""
@@ -241,7 +253,8 @@ class DocumentProcessor:
 
             # Synap 원격 파서가 활성화되어 있고 지원 확장자이면 우선 시도.
             # 실패 시 아래 로컬 파서 분기로 자동 폴백한다.
-            if synap_supports(file_extension):
+            # 예외: .docx 는 자체 구조화 파서가 표·메모·이미지 위치 보존 우월하므로 Synap 우회.
+            if synap_supports(file_extension) and file_extension != ".docx":
                 data = await asyncio.to_thread(file_content.read)
                 try:
                     documents = await get_synap_parser().parse(data, file_name)

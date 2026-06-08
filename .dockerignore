@@ -1,0 +1,25 @@
+.git
+.gitignore
+.github
+.vscode
+
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# Local runtime
+*.sqlite
+*.db
+chroma_db/
+*.log
