@@ -105,6 +105,9 @@ class OpenAICompatibleEmbeddings:
         payload = {
             "model": self.model,
             "input": inputs,
+            # litellm 경유 시 litellm이 기본 base64를 주입해 openrouter가 거부(400)하므로
+            # 클라이언트가 명시적으로 float를 요청한다. OpenAI/openrouter 모두 float 지원.
+            "encoding_format": "float",
         }
 
         with httpx.Client(timeout=self.timeout) as client:
