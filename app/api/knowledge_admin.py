@@ -97,6 +97,15 @@ async def upload_knowledge_file(
     file_name = file.filename or "unknown"
     size_bytes = len(file_content)
 
+    # 검토 사례(legal_review)는 .docx 만 허용 — 메모(변호사 코멘트) 추출이 docx XML 한정.
+    # storage 업로드 전에 거부해 orphan 파일 방지.
+    from app.services.knowledge_files import normalize_doc_role as _norm_role_early
+    if _norm_role_early(doc_role) == "legal_review" and Path(file_name).suffix.lower() != ".docx":
+        raise HTTPException(
+            status_code=400,
+            detail="검토 사례는 .docx 파일만 업로드할 수 있습니다 (메모 추출이 docx 한정).",
+        )
+
     # SHA-256 해시 — 클라이언트가 보낸 값을 신뢰하지 않고 서버에서 재계산해 검증/저장
     computed_hash = hashlib.sha256(file_content).hexdigest()
     if file_hash and file_hash.lower() != computed_hash:
@@ -220,20 +229,33 @@ async def upload_knowledge_file(
                     )
 
                 if not skip_chunking_and_embedding:
-                    documents = await processor.process_documents(docs, {
-                        "storage_type": "storage",
-                        "file_path": storage_path,
-                        "file_name": file_name,
-                        "tenant_id": tenant_id,
-                    })
-                    for doc in documents:
-                        doc.metadata.update({
-                            "file_id": storage_path,
+                    if role_norm == "legal_review":
+                        # 검토 사례 — 조항 단위 구조화 청크(사업배경 1개 + 조항 N개, 메모 동승).
+                        # 일반 청킹(process_documents) 대신 전용 구조화기 사용.
+                        from app.services.legal_review import build_legal_review_documents
+                        documents = await asyncio.to_thread(
+                            build_legal_review_documents,
+                            file_content, file_name, storage_path, tenant_id,
+                        )
+                        logger.info(
+                            "[knowledge_admin] %s: legal_review 구조화 (chunks=%d)",
+                            file_name, len(documents or []),
+                        )
+                    else:
+                        documents = await processor.process_documents(docs, {
+                            "storage_type": "storage",
+                            "file_path": storage_path,
                             "file_name": file_name,
                             "tenant_id": tenant_id,
-                            "storage_type": "storage",
-                            "knowledge_scope": "global",
                         })
+                        for doc in documents:
+                            doc.metadata.update({
+                                "file_id": storage_path,
+                                "file_name": file_name,
+                                "tenant_id": tenant_id,
+                                "storage_type": "storage",
+                                "knowledge_scope": "global",
+                            })
 
         if skip_chunking_and_embedding:
             # glossary/template — 페이지 저장만으로 인덱싱 완료 처리.

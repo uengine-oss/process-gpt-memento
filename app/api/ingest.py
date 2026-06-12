@@ -12,7 +12,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from app.core.supabase_client import supabase
 from app.converters.form2docx import form_to_docx
 from app.converters.markdown import convert_markdown_to_docx
-from app.schemas import ProcessOutputRequest, ProcessRequest
+from app.schemas import ProcessOutputRequest, ProcessRequest, ProcessSessionFileRequest
 from app.services.document_processor import get_document_processor
 from app.services.google_drive_loader import GoogleDriveLoader
 from app.services.ingest.image import process_image_file
@@ -72,6 +72,122 @@ async def get_drive_indexing_status(tenant_id: str):
 @router.post("/process/database")
 async def process_database(request: ProcessRequest):
     return await process_database_records(request)
+
+
+@router.post("/process-session-file")
+async def process_session_file(request: ProcessSessionFileRequest):
+    """채팅 세션 첨부 파일 ingest — Supabase storage 에서 받아 청크 + 인덱싱 후 file_id 반환.
+
+    deepagents-lite 의 채팅 첨부 흐름에서 호출. URL 또는 storage path 받음.
+
+    동작:
+      1. file_url → storage path 추출 (또는 file_path 직접)
+      2. SupabaseStorageLoader 로 download → DocumentProcessor 청크
+      3. *명시적 file_id 부여* — ``session/{tenant_id}/{uuid}.{ext}``
+      4. rag.process_and_store_documents 호출 (vector store 인덱싱)
+      5. 응답: ``{file_id, file_name, tenant_id, chunks}``
+    """
+    import os as _os
+    import uuid as _uuid
+    from urllib.parse import urlparse
+
+    try:
+        # 1) storage path 결정 — file_path 우선, 없으면 URL 에서 추출
+        storage_path = (request.file_path or "").strip()
+        if not storage_path and request.file_url:
+            parsed = urlparse(request.file_url)
+            # Supabase: /storage/v1/object/public/{bucket}/{path...}
+            parts = parsed.path.split("/storage/v1/object/")
+            if len(parts) == 2:
+                tail = parts[1]
+                # tail 예: "public/files/files/uuid.pdf" → bucket=files 후 "files/uuid.pdf"
+                segs = tail.split("/", 2)
+                if len(segs) == 3:
+                    # segs[0]='public', segs[1]=bucket, segs[2]=path
+                    storage_path = segs[2]
+        if not storage_path:
+            raise HTTPException(status_code=400, detail="file_url 또는 file_path 필수 (URL 파싱 실패)")
+        # query string 제거 (?)
+        storage_path = storage_path.split("?")[0]
+
+        original_filename = request.file_name or _os.path.basename(storage_path)
+        file_extension = Path(original_filename).suffix.lower() or ".bin"
+
+        # 2) file_id 명시 부여 — *세션 첨부* 표시 위해 'session/' prefix
+        # storage path 가 이미 uuid 포함이면 그것 활용, 아니면 신규 uuid
+        path_basename = _os.path.basename(storage_path)
+        # path_basename 예: "b4a64e29-...pdf" 또는 "report.pdf"
+        # 확장자 분리해 uuid 추출
+        stem = Path(path_basename).stem
+        try:
+            _uuid.UUID(stem)
+            uuid_part = stem
+        except (ValueError, TypeError):
+            uuid_part = str(_uuid.uuid4())
+        file_id = f"session/{request.tenant_id}/{uuid_part}{file_extension}"
+
+        # 3) download + 청크
+        storage_loader = SupabaseStorageLoader()
+        image_extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]
+        is_image = file_extension in image_extensions
+
+        if is_image:
+            import asyncio as _asyncio
+            response = await _asyncio.to_thread(
+                storage_loader.supabase.storage.from_("files").download,
+                storage_path,
+            )
+            file_content = response if isinstance(response, bytes) else (
+                response.read() if hasattr(response, "read") else bytes(response)
+            )
+            documents = await process_image_file(
+                file_content, original_filename, file_id, request.tenant_id, None, storage_type="storage",
+            ) or []
+        else:
+            documents = await storage_loader.download_and_process_file(
+                storage_path,
+                metadata={"tenant_id": request.tenant_id, "original_filename": original_filename},
+                tenant_id=request.tenant_id,
+            )
+
+        if not documents:
+            raise HTTPException(status_code=400, detail="문서에서 청크 추출 실패 (빈 본문 또는 파싱 실패)")
+
+        # 4) 모든 chunk 에 file_id 박음 + doc_role
+        doc_role = (request.doc_role or "content").strip().lower()
+        for doc in documents:
+            try:
+                doc.metadata["file_id"] = file_id
+                doc.metadata["file_name"] = original_filename
+                doc.metadata["doc_role"] = doc_role
+                doc.metadata["source_kind"] = "session_attachment"
+            except Exception:
+                pass
+
+        rag = get_rag_chain()
+        ok = await rag.process_and_store_documents(documents, request.tenant_id)
+        if not ok:
+            raise HTTPException(status_code=500, detail="벡터 저장 실패")
+
+        # 5) processed_files 테이블에도 등록 (knowledge 조회 호환)
+        try:
+            await rag.save_processed_files([file_id], request.tenant_id, [original_filename])
+        except Exception as exc:
+            print(f"[process-session-file] save_processed_files 실패 (계속): {exc}")
+
+        return {
+            "file_id": file_id,
+            "file_name": original_filename,
+            "tenant_id": request.tenant_id,
+            "chunks": len(documents),
+            "doc_role": doc_role,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[process-session-file] 실패: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("/process-output")

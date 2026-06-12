@@ -70,12 +70,16 @@ EMBEDDING_PROVIDERS: Dict[str, Dict[str, Any]] = {
         "client": "openai_compatible",
     },
     "custom": {
+        # 사내 GPU 임베딩 서버. bge-m3 (TEI) 가 nginx 30000/v1 로 OpenAI 호환 /v1/embeddings 제공.
+        # base_url 은 .../v1 까지 지정 (client 가 {base_url}/embeddings 호출).
+        # 구버전엔 K-Cloud /encode_text 서버(client=custom_encode_text)였으나 bge-m3 는
+        # OpenAI 호환이라 openai_compatible 로 변경.
         "base_url": None,
-        "model": "Qwen3-Embedding-4B",
+        "model": "BAAI/bge-m3",
         "api_key_env": ["CUSTOM_EMBEDDING_API_KEY"],
         "base_url_env": ["CUSTOM_EMBEDDING_BASE_URL"],
         "model_env": ["CUSTOM_EMBEDDING_MODEL"],
-        "client": "custom_encode_text",
+        "client": "openai_compatible",
     },
     "self": {
         "base_url": None,

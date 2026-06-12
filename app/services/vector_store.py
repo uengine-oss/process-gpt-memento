@@ -156,20 +156,44 @@ class VectorStoreManager:
             return False
 
     def _embed_texts(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings in batches to avoid provider token limits."""
-        embed_batch_size = 50
-        embeddings: List[List[float]] = []
-        total_batches = (len(texts) - 1) // embed_batch_size + 1 if texts else 0
+        """Embed in small batches with adaptive split.
 
-        for batch_start in range(0, len(texts), embed_batch_size):
-            batch_texts = texts[batch_start : batch_start + embed_batch_size]
-            batch_embeddings = self.embeddings.embed_documents(batch_texts)
-            embeddings.extend(batch_embeddings)
-            print(
-                f"Embedded batch {batch_start // embed_batch_size + 1}/{total_batches} "
-                f"({len(batch_texts)} docs)"
-            )
+        사내 bge-m3(TEI) 는 sglang 과 GPU 를 공유해 가용 VRAM 이 빠듯하다. 큰 배치는
+        CUDA OOM(HTTP 424 Backend error)을 유발하므로 기본 배치를 작게 두고(EMBEDDING_BATCH_SIZE,
+        기본 8), 배치 임베딩 실패 시 절반으로 쪼개 1까지 재귀 재시도한다. VRAM 변동(동시 인제스트
+        등)에도 자동 적응. OpenAI 등 큰 배치 허용 provider 는 EMBEDDING_BATCH_SIZE 를 키우면 됨.
+        """
+        if not texts:
+            return []
+        try:
+            target = max(1, int(os.getenv("EMBEDDING_BATCH_SIZE", "8")))
+        except ValueError:
+            target = 8
+
+        embeddings: List[List[float]] = []
+        total_batches = (len(texts) - 1) // target + 1
+        for bi, start in enumerate(range(0, len(texts), target), start=1):
+            batch_texts = texts[start : start + target]
+            embeddings.extend(self._embed_batch_adaptive(batch_texts))
+            print(f"Embedded batch {bi}/{total_batches} ({len(batch_texts)} docs)")
         return embeddings
+
+    def _embed_batch_adaptive(self, batch: List[str]) -> List[List[float]]:
+        """배치 임베딩. 실패 시(예: GPU OOM) 절반으로 쪼개 재귀 재시도 — 1까지 줄여도 실패면 raise."""
+        if not batch:
+            return []
+        try:
+            return self.embeddings.embed_documents(batch)
+        except Exception as exc:  # noqa: BLE001
+            if len(batch) == 1:
+                print(f"[vector_store] embed 단일 텍스트 실패 (len={len(batch[0])}): {exc}")
+                raise
+            mid = len(batch) // 2
+            print(
+                f"[vector_store] embed batch={len(batch)} 실패({type(exc).__name__}) "
+                f"→ {mid}+{len(batch) - mid} 분할 재시도"
+            )
+            return self._embed_batch_adaptive(batch[:mid]) + self._embed_batch_adaptive(batch[mid:])
 
     def _build_supabase_payload(
         self,

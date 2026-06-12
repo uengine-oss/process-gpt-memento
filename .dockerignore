@@ -10,6 +10,8 @@
 *.p12
 *.pfx
 
+test/
+
 # Python
 __pycache__/
 *.pyc

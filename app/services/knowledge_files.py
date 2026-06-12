@@ -163,7 +163,7 @@ async def mark_status(
         logger.warning("[knowledge_files] mark_status failed (%s): %s", status, e)
 
 
-VALID_DOC_ROLES = ("content", "glossary", "template", "reference", "dataset")
+VALID_DOC_ROLES = ("content", "glossary", "template", "reference", "dataset", "legal_review")
 
 
 def normalize_doc_role(role: Optional[str]) -> str:
