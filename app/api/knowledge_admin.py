@@ -95,7 +95,11 @@ async def upload_knowledge_file(
     knowledge_files 테이블에 source_type='upload'로 등록한 후 RAG 인덱싱한다.
     """
     file_content = await file.read()
-    file_name = file.filename or "unknown"
+    # 폴더 업로드(webkitdirectory) 등에서 filename 이 *전체 상대경로* 로 오는 경우가 있다
+    # (예: 'mock-corpus/A_.../01.선순위/Credit Agreement.pdf'). 폴더 구조는 folder_path 로 따로
+    # 저장하므로 file_name 은 항상 *basename* 으로 정규화한다 — 그래야 grep/page 의 file_name
+    # 해석(_resolve_file_id)이 동작한다. 클라이언트가 무엇을 보내든 방어(서버가 단일 진실).
+    file_name = (file.filename or "unknown").replace("\\", "/").rstrip("/").split("/")[-1] or "unknown"
     size_bytes = len(file_content)
 
     # doc_role(분류)별 허용 확장자 정책 — storage 업로드 전에 거부해 orphan 파일 방지.
@@ -159,6 +163,21 @@ async def upload_knowledge_file(
         uploaded_by_name=(uploaded_by_name or None),
         doc_role=doc_role,
     )
+
+    # 2-1) knowledge_folders 레지스트리에도 폴더(+조상) 등록.
+    # "+폴더" 버튼으로 만든 폴더처럼, *업로드*로 생긴 폴더도 레지스트리에 남긴다(불일치 제거).
+    # 폴더 업로드 시 nested 경로의 모든 단계를 등록해 트리와 일치시킨다. idempotent upsert.
+    _fp = (folder_path or "").strip().strip("/")
+    if _fp:
+        _acc: list[str] = []
+        for _seg in [s for s in _fp.split("/") if s]:
+            _acc.append(_seg)
+            try:
+                await kf_create_folder(
+                    tenant_id=tenant_id, folder_path="/".join(_acc), doc_role=doc_role
+                )
+            except Exception as _e:
+                logger.warning("[knowledge_admin] folder register failed (%s): %s", "/".join(_acc), _e)
 
     # 3) 콘텐츠 추출 + RAG 인덱싱
     # ── doc_role 별 인덱싱 정책 ──
@@ -521,7 +540,7 @@ async def create_knowledge_folder(
 async def refresh_folder_cards(
     background_tasks: BackgroundTasks,
     tenant_id: str = Form(...),
-    folder_paths: Optional[List[str]] = Form(None),
+    folder_paths: List[str] = Form([]),
     doc_role: Optional[str] = Form(None),
 ):
     """업로드/삭제 *배치 후* 영향받은 폴더 카드만 갱신 — storm 없는 자동 경로.
