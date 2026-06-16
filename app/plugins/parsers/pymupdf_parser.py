@@ -216,10 +216,7 @@ class PyMuPDFParser(BaseParser):
                 if not data:
                     continue
                 ext = (base.get("ext") or "png").lower()
-                mime = {
-                    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-                    "gif": "image/gif", "bmp": "image/bmp", "webp": "image/webp",
-                }.get(ext, "image/png")
+                mime = vision.guess_image_mime(ext)
                 out.append({"xref": xref, "bytes": data, "mime": mime, "y": y, "bbox": bbox})
             except Exception as exc:
                 print(f"[vision] 이미지 xref={xref} 추출 실패: {exc}")

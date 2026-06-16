@@ -29,7 +29,9 @@ SYNAP_URL: str = os.getenv("SYNAP_URL", "")
 
 # ---- Synap 동작 파라미터 (코드 상수) -----------------------------------
 SYNAP_OUTPUT_TYPE: str = "md"
-SYNAP_EXTENSIONS: tuple[str, ...] = (".hwp", ".hwpx", ".pdf", ".docx", ".pptx", ".xlsx")
+# Synap 라우팅 대상: 정책상 .hwp 전용.
+# (바이너리 HWP 는 이미지/표 추출이 어려워 DA OCR 사용. pdf/docx/hwpx/pptx/xlsx 는 각자 독자 파서.)
+SYNAP_EXTENSIONS: tuple[str, ...] = (".hwp",)
 SYNAP_POLL_INTERVAL: float = 1.0       # 상태 폴링 간격(초)
 SYNAP_POLL_TIMEOUT: float = 300.0      # 상태 폴링 최대 대기(초)
 SYNAP_REQUEST_TIMEOUT: float = 60.0    # 개별 HTTP 요청 타임아웃(초)

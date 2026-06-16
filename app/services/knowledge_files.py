@@ -176,6 +176,35 @@ def normalize_doc_role(role: Optional[str]) -> str:
 _normalize_doc_role = normalize_doc_role
 
 
+# ── 업로드 허용 확장자 정책 (doc_role 별) ──────────────────────────────────
+# 지식베이스 업로드는 분류(doc_role)별로 받는 확장자를 제한한다.
+#   content/glossary/reference : 일반 문서 (pdf/hwp/hwpx/doc/docx/pptx/txt)
+#   template (양식)            : 편집형 양식만 (hwpx/docx)
+#   dataset (데이터)           : 정량 데이터만 (xlsx)
+#   legal_review (검토 사례)   : 변호사 메모 추출이 docx XML 한정 → docx 만
+_DOC_EXTS: tuple = (".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".pptx", ".txt")
+ROLE_ALLOWED_EXTENSIONS: Dict[str, tuple] = {
+    "content": _DOC_EXTS,
+    "glossary": _DOC_EXTS,
+    "reference": _DOC_EXTS,
+    "template": (".hwpx", ".docx"),
+    "dataset": (".xlsx",),
+    "legal_review": (".docx",),
+}
+
+
+def allowed_extensions_for_role(role: Optional[str]) -> tuple:
+    """해당 doc_role 에서 업로드 허용되는 확장자 튜플."""
+    return ROLE_ALLOWED_EXTENSIONS.get(normalize_doc_role(role), _DOC_EXTS)
+
+
+def is_extension_allowed_for_role(file_name: str, role: Optional[str]) -> bool:
+    """file_name 의 확장자가 해당 doc_role 에서 허용되는지."""
+    name = file_name or ""
+    ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+    return ext in allowed_extensions_for_role(role)
+
+
 async def register_uploaded_file(
     tenant_id: str,
     storage_path: str,

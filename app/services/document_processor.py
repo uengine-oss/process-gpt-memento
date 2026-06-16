@@ -2,7 +2,6 @@
 Document loader and processor
 """
 import os
-import re
 import docx
 import uuid
 import tempfile
@@ -31,7 +30,7 @@ from langchain_community.document_loaders import (
     TextLoader
 )
 import fitz  # PyMuPDF for PDF image extraction
-from app.services.file_to_pdf import convert_to_pdf, FileToPdfError
+from app.services.file_to_pdf import convert_to_pdf, convert_to_docx, FileToPdfError
 
 # Allow loading vendored extract_hwp when the installed extract-hwp package has no module (PyPI 0.1.0 packaging bug)
 _vendor_dir = Path(__file__).resolve().parents[2] / "vendor"
@@ -41,118 +40,29 @@ if _vendor_dir.is_dir() and str(_vendor_dir) not in __import__("sys").path:
 
 def _extract_text_from_hwp_or_hwpx(file_path: str, file_extension: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Extract text from HWP or HWPX file. Uses extract_hwp if available; otherwise .hwpx via zip+xml.
-    PyPI extract-hwp 0.1.0 ships no module (packaging bug). For .hwp either install from Git or add
-    vendor: clone https://github.com/thlee/extract-hwp and copy src/extract_hwp into vendor/.
+    Extract text from HWP or HWPX file.
+      - .hwpx → app 측 구조화 파서(hwpx_structured): 텍스트 + 표(마크다운) + 이미지(VLM 설명) inline.
+      - .hwp  → vendored extract_hwp(HWP 5.0/OLE). 미설치 시 설치 안내.
     Returns (text, error_message); error_message is None on success.
+    PyPI extract-hwp 0.1.0 ships no module (packaging bug); .hwp 는 Git 설치 또는 vendor 사용.
     """
-    try:
-        from extract_hwp import extract_text_from_hwp
-        return extract_text_from_hwp(file_path)
-    except ModuleNotFoundError:
-        pass  # extract-hwp not installed or broken (PyPI 0.1.0 has no module); use fallback
-
-    if file_extension == ".hwp":
-        return (
-            None,
-            "HWP 파일 처리를 위해 extract-hwp를 GitHub에서 설치해 주세요: uv pip install \"extract-hwp @ git+https://github.com/thlee/extract-hwp.git\" (또는 vendor 폴더에 소스 추가)",
-        )
-
     if file_extension == ".hwpx":
         try:
-            import xml.etree.ElementTree as ET
-
-            def _ltag(elem):
-                t = elem.tag
-                return t.split('}', 1)[1] if '}' in t else t
-
-            def _collect_t(elem):
-                parts = []
-                for n in elem.iter():
-                    if _ltag(n) == 'tbl':
-                        continue
-                    if _ltag(n) == 't' and n.text:
-                        parts.append(n.text)
-                return "".join(parts)
-
-            def _tbl_to_md(tbl):
-                cells = []
-                for tr in tbl:
-                    if _ltag(tr) != 'tr':
-                        continue
-                    for tc in tr:
-                        if _ltag(tc) != 'tc':
-                            continue
-                        row = col = 0
-                        for cc in tc:
-                            tag = _ltag(cc)
-                            if tag == 'cellAddr':
-                                for k, v in cc.attrib.items():
-                                    if 'colAddr' in k: col = int(v)
-                                    if 'rowAddr' in k: row = int(v)
-                        tp = []
-                        for sub in tc.iter():
-                            if _ltag(sub) == 't' and sub.text:
-                                tp.append(sub.text)
-                        cells.append((row, col, " ".join("".join(tp).split())))
-                if not cells:
-                    return ""
-                mr = max(r + 1 for r, c, t in cells)
-                mc = max(c + 1 for r, c, t in cells)
-                grid = [[""] * mc for _ in range(mr)]
-                for r, c, t in cells:
-                    grid[r][c] = t
-                cw = [max(3, *(len(grid[r][c]) for r in range(mr))) for c in range(mc)]
-                lines = []
-                for r in range(mr):
-                    lines.append("| " + " | ".join(grid[r][c].ljust(cw[c]) for c in range(mc)) + " |")
-                    if r == 0:
-                        lines.append("| " + " | ".join("-" * cw[c] for c in range(mc)) + " |")
-                return "\n".join(lines)
-
-            def _walk(elem, results):
-                tag = _ltag(elem)
-                if tag == 'tbl':
-                    md = _tbl_to_md(elem)
-                    if md:
-                        results.append(md)
-                    return
-                if tag == 'p':
-                    has_tbl = any(_ltag(d) == 'tbl' for d in elem.iter() if d is not elem)
-                    if has_tbl:
-                        for ch in elem:
-                            _walk(ch, results)
-                    else:
-                        text = _collect_t(elem)
-                        if text.strip():
-                            results.append(text)
-                    return
-                for ch in elem:
-                    _walk(ch, results)
-
-            with zipfile.ZipFile(file_path, "r") as z:
-                names = z.namelist()
-                section_files = sorted(n for n in names if "Contents/section" in n and n.endswith(".xml"))
-                if not section_files:
-                    content_name = next((n for n in names if "contents" in n.lower() and n.endswith(".xml")), None)
-                    if not content_name:
-                        return (None, "HWPX: section or contents XML not found")
-                    with z.open(content_name) as f:
-                        raw = f.read().decode("utf-8", errors="replace")
-                    text = re.sub(r"<[^>]+>", " ", raw)
-                    text = re.sub(r"\s+", " ", text).strip()
-                    return (text, None)
-                sections = []
-                for section_file in section_files:
-                    with z.open(section_file) as f:
-                        root = ET.fromstring(f.read())
-                    parts = []
-                    _walk(root, parts)
-                    if parts:
-                        sections.append("\n\n".join(parts))
-                return ("\n\n".join(sections), None)
+            from app.plugins.parsers.hwpx_structured import parse as parse_hwpx
+            text = parse_hwpx(file_path, describe=True)
+            return (text, None)
         except Exception as e:
             return (None, str(e))
+
+    if file_extension == ".hwp":
+        try:
+            from extract_hwp import extract_text_from_hwp
+            return extract_text_from_hwp(file_path)
+        except ModuleNotFoundError:
+            return (
+                None,
+                "HWP 파일 처리를 위해 extract-hwp를 GitHub에서 설치해 주세요: uv pip install \"extract-hwp @ git+https://github.com/thlee/extract-hwp.git\" (또는 vendor 폴더에 소스 추가)",
+            )
 
     return (None, f"Unsupported extension: {file_extension}")
 
@@ -251,10 +161,10 @@ class DocumentProcessor:
 
             documents = None
 
-            # Synap 원격 파서가 활성화되어 있고 지원 확장자이면 우선 시도.
-            # 실패 시 아래 로컬 파서 분기로 자동 폴백한다.
-            # 예외: .docx 는 자체 구조화 파서가 표·메모·이미지 위치 보존 우월하므로 Synap 우회.
-            if synap_supports(file_extension) and file_extension != ".docx":
+            # Synap 원격 파서(OCR/DA)는 정책상 .hwp 전용으로만 사용한다(SYNAP_EXTENSIONS).
+            # HWP 바이너리는 이미지/표 추출이 어려워 Synap DA 로 OCR; 실패 시 로컬(extract_hwp 텍스트)로 폴백.
+            # pdf/docx/hwpx/pptx/xlsx 는 각자 독자 파서가 우월하므로 Synap 우회.
+            if synap_supports(file_extension):
                 data = await asyncio.to_thread(file_content.read)
                 try:
                     documents = await get_synap_parser().parse(data, file_name)
@@ -286,15 +196,55 @@ class DocumentProcessor:
                     )
                 finally:
                     await asyncio.to_thread(os.unlink, tmp_path)
+            elif file_extension == '.doc':
+                # 레거시 바이너리 .doc: LibreOffice 로 .docx 변환 후 docx 구조화 파서 재사용
+                # (메모/표/이미지 VLM 보존). 서버에 LibreOffice(soffice) 필요.
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.doc') as tmp:
+                    await asyncio.to_thread(tmp.write, file_content.read())
+                    tmp_path = tmp.name
+                converted_docx_path = None
+                try:
+                    try:
+                        converted_docx_path = await asyncio.to_thread(
+                            convert_to_docx, tmp_path, os.path.dirname(tmp_path)
+                        )
+                    except FileToPdfError as conv_err:
+                        print(f"[doc] LibreOffice .docx 변환 실패 for {file_name}: {conv_err}")
+                        return None
+                    documents = await asyncio.to_thread(
+                        self._load_docx_with_python_docx, converted_docx_path, file_name
+                    )
+                finally:
+                    if converted_docx_path and os.path.exists(converted_docx_path):
+                        await asyncio.to_thread(os.unlink, converted_docx_path)
+                    await asyncio.to_thread(os.unlink, tmp_path)
             elif file_extension == '.pptx':
-                # Save BytesIO to temporary file
+                # pptx → LibreOffice 로 PDF 변환 후 PDF 파서(슬라이드 이미지/도식도 Vision OCR).
+                # 서버에 LibreOffice(soffice) 필요.
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.pptx') as tmp:
                     await asyncio.to_thread(tmp.write, file_content.read())
                     tmp_path = tmp.name
+                converted_pdf_path = None
                 try:
-                    loader = UnstructuredPowerPointLoader(tmp_path, mode="single")
-                    documents = await asyncio.to_thread(loader.load)
+                    try:
+                        converted_pdf_path = await asyncio.to_thread(
+                            convert_to_pdf, tmp_path, os.path.dirname(tmp_path)
+                        )
+                    except FileToPdfError as conv_err:
+                        print(f"[pptx] LibreOffice PDF 변환 실패 for {file_name}: {conv_err}")
+                        return None
+                    with open(converted_pdf_path, "rb") as f:
+                        pdf_bytes = await asyncio.to_thread(f.read)
+                    documents = await get_pdf_parser().parse(
+                        pdf_bytes, f"{Path(file_name).stem}.pdf"
+                    )
                 finally:
+                    if (
+                        converted_pdf_path
+                        and converted_pdf_path != tmp_path
+                        and os.path.exists(converted_pdf_path)
+                    ):
+                        await asyncio.to_thread(os.unlink, converted_pdf_path)
                     await asyncio.to_thread(os.unlink, tmp_path)
             elif file_extension == '.xlsx':
                 # Save BytesIO to temporary file

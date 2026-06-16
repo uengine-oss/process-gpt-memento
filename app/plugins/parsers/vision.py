@@ -1,20 +1,23 @@
-"""PDF Vision(멀티모달 LLM) 헬퍼 — 내부 PoC용.
+"""문서 공용 Vision(멀티모달 LLM) 헬퍼 — PDF·DOCX 파서가 공유한다.
 
-두 가지 호출:
+세 가지 진입점:
   1. ``ocr_page_image`` — 텍스트 레이어 없는 스캔/이미지 페이지를 통째로 OCR
-     (본문은 받아쓰고 도식은 ``[도식: ...]`` 으로 설명).
-  2. ``describe_image`` — 텍스트 레이어가 있는 페이지에 삽입된 개별 그림/도식을 설명.
-     (텍스트는 파서가 뽑고, 그림만 VLM 으로 돌려 *그림 자리에* inline 삽입하는 용도.)
+     (본문은 받아쓰고 도식은 ``[도식: ...]`` 으로 설명). PDF 전용.
+  2. ``describe_image`` — 본문에 삽입된 개별 그림/도식/사진을 설명.
+     (텍스트는 파서가 뽑고, 그림만 VLM 으로 돌려 *그림 자리에* inline 삽입.)
+     PDF·DOCX 공통. ``prompt`` 인자로 문서별 프롬프트 override 가능(기본=범용).
+  3. ``run_parallel`` — (key, thunk) 목록을 ThreadPool 로 병렬 실행(VISION_MAX_WORKERS).
 
 provider 설정은 memento 의 ``resolve_llm_config()`` 사용(openai/openrouter/custom 공통).
-활성화는 전용 토글 ``MEMENTO_PDF_VISION`` (기본 on) — 이미지 추출-업로드 경로와 무관.
+폐쇄망에서는 ``MEMENTO_LLM_PROVIDER=custom`` + ``CUSTOM_LLM_*`` 로 동작.
+PDF 페이지 OCR/그림 처리 토글은 ``PDF_VISION_ENABLED`` 상수(기본 on).
 """
 from __future__ import annotations
 
 import base64
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -121,9 +124,26 @@ def ocr_page_image(png_bytes: bytes) -> str:
     return _vlm_call(png_bytes, UNIFIED_OCR_PROMPT, "image/png", max_tokens=OCR_MAX_TOKENS)
 
 
-def describe_image(image_bytes: bytes, mime_type: str = "image/png") -> str:
-    """본문 페이지에 삽입된 그림 → 설명 텍스트."""
-    return _vlm_call(image_bytes, DESCRIBE_IMAGE_PROMPT, mime_type, max_tokens=DESCRIBE_MAX_TOKENS)
+def describe_image(
+    image_bytes: bytes, mime_type: str = "image/png", prompt: Optional[str] = None
+) -> str:
+    """본문에 삽입된 그림 → 설명 텍스트. ``prompt`` 미지정 시 범용 프롬프트 사용."""
+    return _vlm_call(
+        image_bytes, prompt or DESCRIBE_IMAGE_PROMPT, mime_type, max_tokens=DESCRIBE_MAX_TOKENS
+    )
+
+
+_IMAGE_MIME_BY_EXT = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "bmp": "image/bmp", "webp": "image/webp",
+}
+
+
+def guess_image_mime(name_or_ext: str) -> str:
+    """파일명 또는 확장자 → image MIME. 미지원/미상은 image/png 로 폴백."""
+    raw = name_or_ext or ""
+    raw = raw.rsplit(".", 1)[-1] if "." in raw else raw
+    return _IMAGE_MIME_BY_EXT.get(raw.strip().lower(), "image/png")
 
 
 def run_parallel(tasks: List[Tuple[str, Callable[[], str]]]) -> Dict[str, str]:

@@ -3,7 +3,7 @@
 - PDF 로컬 파서: `get_pdf_parser()` (pymupdf / pdfplumber)
 - 원격 파서(Synap DocuAnalyzer): `get_synap_parser()` / `is_synap_enabled()`
   - 외부 회사 내부망에서 제공하는 DA 엔진을 사용해야 할 때 활성화.
-  - hwp/hwpx/pdf/docx/pptx/xlsx 등 지원 확장자에 대해 로컬 파서 대신 우선 시도.
+  - 정책상 .hwp 전용 라우팅(SYNAP_EXTENSIONS). pdf/docx/hwpx 등은 각자 독자 파서 사용.
 """
 from typing import Dict, Optional, Type
 

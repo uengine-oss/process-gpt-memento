@@ -33,20 +33,31 @@ logger = logging.getLogger(__name__)
 # 헬퍼 — file_name → file_id (source_ref) 해석
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _resolve_file_id(tenant_id: str, file_name: str) -> Optional[str]:
-    """동일 tenant 안에서 file_name 매칭되는 첫 knowledge_files row 의 source_ref 반환.
+async def _resolve_file_id(
+    tenant_id: str,
+    file_name: str,
+    folder_path: Optional[str] = None,
+) -> Optional[str]:
+    """동일 tenant 안에서 file_name 매칭되는 knowledge_files row 의 source_ref 반환.
 
-    동일 이름 파일이 여러 개면 가장 최근 modified 한 거 선택.
+    ``folder_path`` 가 주어지면 *그 폴더 안* 의 파일로 한정한다. 대규모 코퍼스(동일 골격의
+    여러 사업)에서 ``Credit Agreement.docx``·``감사보고서.pdf`` 처럼 폴더만 다른 *동명 파일*
+    이 흔하므로, folder_path 없이 file_name 만으로 해석하면 "가장 최근 것"으로 *조용히 엉뚱한
+    사업 문서* 를 읽는 버그가 난다. 에이전트는 항상 folder_path 를 같이 넘긴다.
+
+    동명 파일이 (그 폴더 안에서도) 여러 개면 가장 최근 modified 한 거 선택.
     """
     try:
-        result = await asyncio.to_thread(
+        q = (
             supabase.table("knowledge_files")
-            .select("source_ref, source_type, modified_time, indexed_at")
+            .select("source_ref, source_type, folder_path, modified_time, indexed_at")
             .eq("tenant_id", tenant_id)
             .eq("file_name", file_name)
-            .order("modified_time", desc=True)
-            .limit(1)
-            .execute
+        )
+        if folder_path is not None and str(folder_path).strip() != "":
+            q = q.eq("folder_path", str(folder_path).strip().strip("/"))
+        result = await asyncio.to_thread(
+            q.order("modified_time", desc=True).limit(1).execute
         )
         rows = result.data or []
         if not rows:
@@ -54,8 +65,8 @@ async def _resolve_file_id(tenant_id: str, file_name: str) -> Optional[str]:
         return rows[0].get("source_ref")
     except Exception as e:
         logger.warning(
-            "[navigator] resolve file_id failed (tenant=%s, name=%s): %s",
-            tenant_id, file_name, e,
+            "[navigator] resolve file_id failed (tenant=%s, name=%s, folder=%s): %s",
+            tenant_id, file_name, folder_path, e,
         )
         return None
 
@@ -294,6 +305,7 @@ async def document_grep(
     tenant_id: str,
     file_name: str,
     pattern: str,
+    folder_path: Optional[str] = Query(default=None),
     regex: bool = Query(default=False),
     case_sensitive: bool = Query(default=False),
     context_lines: int = Query(default=0, ge=0, le=_GREP_MAX_CONTEXT_LINES),
@@ -303,6 +315,7 @@ async def document_grep(
 
     Args:
         tenant_id, file_name: 필수.
+        folder_path: 동명 파일 구별용(옵션). 주면 *그 폴더 안* 파일로 한정.
         pattern: 검색 패턴. ``regex=false``(기본)면 literal substring, ``true``면 정규식.
         case_sensitive: 기본 False (대소문자 무시).
         context_lines: 매칭 라인 좌/우로 같이 돌려줄 라인 수(0~5).
@@ -314,7 +327,7 @@ async def document_grep(
     if not tenant_id or not file_name or not pattern:
         raise HTTPException(status_code=400, detail="tenant_id, file_name, pattern required")
 
-    file_id = await _resolve_file_id(tenant_id, file_name)
+    file_id = await _resolve_file_id(tenant_id, file_name, folder_path)
     if not file_id:
         return {
             "response": [],
@@ -451,12 +464,14 @@ async def document_page(
     tenant_id: str,
     file_name: str,
     pages: str,
+    folder_path: Optional[str] = Query(default=None),
 ):
     """페이지 범위 본문 반환.
 
     Args:
         tenant_id, file_name: 필수.
         pages: ``"5"`` / ``"5-8"`` / ``"5,7,12"`` / ``"3-5,9"`` 형식. 한 번 호출 최대 10페이지.
+        folder_path: 동명 파일 구별용(옵션). 주면 *그 폴더 안* 파일로 한정.
 
     Returns:
         ``{"file_name", "pages": [{"page_number", "content"}, ...]}``
@@ -476,7 +491,7 @@ async def document_page(
             ),
         )
 
-    file_id = await _resolve_file_id(tenant_id, file_name)
+    file_id = await _resolve_file_id(tenant_id, file_name, folder_path)
     if not file_id:
         return {
             "file_name": file_name,

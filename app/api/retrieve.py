@@ -32,11 +32,52 @@ def _summarize_doc(doc: Document, max_chars: int = 200) -> str:
 SMALL_DOC_CHUNK_THRESHOLD = 15
 
 
+async def _resolve_subtree_file_ids(
+    tenant_id: str, folder_paths: List[str]
+) -> List[str]:
+    """folder_path(들) 의 *subtree* 에 속한 파일들의 source_ref(=file_id) 목록.
+
+    각 폴더 자신 + 하위(``folder_path == p`` 또는 ``folder_path like p/%``). scoped RAG 폴백을
+    선택된 폴더 안으로 좁히는 데 쓴다. 대규모 코퍼스 cross-contamination 방어의 핵심.
+    """
+    out: set[str] = set()
+    for raw in folder_paths:
+        p = (raw or "").strip().strip("/")
+        if not p:
+            continue
+        try:
+            eq = await asyncio.to_thread(
+                supabase.table("knowledge_files")
+                .select("source_ref")
+                .eq("tenant_id", tenant_id)
+                .eq("folder_path", p)
+                .execute
+            )
+            for r in (eq.data or []):
+                if r.get("source_ref"):
+                    out.add(str(r["source_ref"]))
+            ch = await asyncio.to_thread(
+                supabase.table("knowledge_files")
+                .select("source_ref")
+                .eq("tenant_id", tenant_id)
+                .like("folder_path", f"{p}/%")
+                .limit(20_000)
+                .execute
+            )
+            for r in (ch.data or []):
+                if r.get("source_ref"):
+                    out.add(str(r["source_ref"]))
+        except Exception as e:
+            logger.warning("[/search] subtree resolve failed for %r: %s", p, e)
+    return sorted(out)
+
+
 @router.get("/search")
 async def search(
     query: str,
     tenant_id: str,
     file_ids: Optional[List[str]] = Query(default=None),
+    folder_paths: Optional[List[str]] = Query(default=None),
     top_k: int = Query(default=5, ge=1, le=50),
     exclude_chunk_ids: Optional[List[str]] = Query(default=None),
 ):
@@ -46,6 +87,8 @@ async def search(
         - ``tenant_id`` 필수
         - ``file_ids`` 옵셔널 — 1개 이상이면 그 파일들 중에서 검색 (``$in``).
           비우면 tenant 전체에서 검색.
+        - ``folder_paths`` 옵셔널 — 이 폴더(들)의 subtree 로 검색을 좁힌다. file_ids 도 주면
+          *교집합*. 에이전트가 file_id(uuid) 대신 folder_path 만 다루며 scoped RAG 를 도는 경로.
         - ``exclude_chunk_ids`` 옵셔널 — 이 chunk_id 들은 결과에서 제외하고 top_k 채움.
 
     /retrieve 와 달리 small-doc 통째 반환 / glossary merge / room/proc_inst 분기 등
@@ -56,6 +99,23 @@ async def search(
 
     metadata_filter: dict = {"tenant_id": tenant_id}
     cleaned_files = [str(x) for x in (file_ids or []) if x]
+
+    cleaned_folders = [str(x) for x in (folder_paths or []) if x]
+    if cleaned_folders:
+        subtree_ids = await _resolve_subtree_file_ids(tenant_id, cleaned_folders)
+        if cleaned_files:
+            # file_ids ∩ subtree — 선택 자료 중 그 폴더 안에 있는 것만.
+            allow = set(cleaned_files)
+            cleaned_files = [fid for fid in subtree_ids if fid in allow]
+        else:
+            cleaned_files = subtree_ids
+        if not cleaned_files:
+            logger.info(
+                "[/search] folder_paths=%s → subtree 0 files (no match) → empty result",
+                cleaned_folders,
+            )
+            return {"response": []}
+
     if cleaned_files:
         metadata_filter["file_id"] = cleaned_files
     excluded = [str(x) for x in (exclude_chunk_ids or []) if x]

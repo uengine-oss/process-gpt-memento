@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
 from app.api.debug import router as debug_router
+from app.api.folders import router as folders_router
 from app.api.ingest import router as ingest_router
 from app.api.knowledge_admin import router as knowledge_admin_router
 from app.api.legal_review import router as legal_review_router
@@ -64,6 +65,7 @@ app.include_router(ingest_router)
 app.include_router(knowledge_admin_router)
 app.include_router(legal_review_router)
 app.include_router(navigator_router)
+app.include_router(folders_router)
 app.include_router(summary_router)
 
 

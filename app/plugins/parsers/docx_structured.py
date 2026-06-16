@@ -44,9 +44,7 @@ CLI:
 """
 from __future__ import annotations
 
-import base64
 import json
-import os
 import re
 import sys
 import zipfile
@@ -276,80 +274,6 @@ def parse_blocks(document_xml: bytes, rels: Dict[str, str]) -> List[Dict[str, An
 # 이미지 추출 + (옵션) Vision LLM 설명
 # ─────────────────────────────────────────────────────────────────────────────
 
-VISION_PROMPT = (
-    "이 이미지는 MOU 계약 작성용 사업개요서에 포함된 *사업구도/조직도/도식* 입니다. "
-    "다음을 한국어로 정리:\n"
-    "1. 등장하는 *모든 법인·기관* (예: 한전, AEW, 사우디 아람코, Project Company 등) — 각각 *역할*\n"
-    "2. 법인 간 *관계·계약 흐름* (주주간계약 / EPC / O&M / 오프테이크 / 금융 등 — 화살표 방향 포함)\n"
-    "3. *지분율* 등 숫자가 있으면 그대로 인용\n\n"
-    "출력 형식:\n"
-    "- 마크다운 표 (필요 시): 법인 | 역할 | 지분율\n"
-    "- 그 뒤에 *계약 관계 요약* 2-3줄\n"
-    "원본 도식의 정확한 정보만 사용. 추측 금지."
-)
-
-
-def describe_image_with_vision_llm(image_bytes: bytes, mime_type: str = "image/png") -> str:
-    """OpenAI 호환 API 의 vision endpoint 호출.
-
-    env vars:
-      CUSTOM_LLM_BASE_URL, CUSTOM_LLM_API_KEY, CUSTOM_LLM_MODEL
-
-    사용자가 deepagents-lite 의 frentis-ai-model 이 멀티모달이라 명시.
-    실패 시 빈 문자열 + stderr 로그.
-    """
-    base_url = os.getenv("CUSTOM_LLM_BASE_URL", "").rstrip("/")
-    api_key = os.getenv("CUSTOM_LLM_API_KEY", "not-needed")
-    model = os.getenv("CUSTOM_LLM_MODEL", "")
-    if not base_url or not model:
-        print("[vision] env vars (CUSTOM_LLM_BASE_URL/MODEL) 미설정 — skip", file=sys.stderr)
-        return ""
-    # base64
-    b64 = base64.b64encode(image_bytes).decode("ascii")
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": VISION_PROMPT},
-                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
-                ],
-            },
-        ],
-        "temperature": 0.2,
-        "max_tokens": 4096,
-        # Qwen3 reasoning 비활성 — content 채우게 (deepagents-lite 의 _build_docx_model 과 동일)
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
-    try:
-        import urllib.request
-        req = urllib.request.Request(
-            f"{base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        choices = data.get("choices") or []
-        if not choices:
-            return ""
-        msg = choices[0].get("message") or {}
-        content = msg.get("content")
-        # content 비어있으면 reasoning_content fallback (Qwen3 thinking 모드 미차단 시)
-        if not content:
-            content = msg.get("reasoning_content") or ""
-        if isinstance(content, list):
-            content = "".join(p.get("text","") if isinstance(p, dict) else str(p) for p in content)
-        return str(content).strip()
-    except Exception as exc:
-        print(f"[vision] 호출 실패: {exc}", file=sys.stderr)
-        return ""
-
-
 def _iter_image_entries(blocks: List[Dict[str, Any]]):
     """모든 image entry 를 등장 순서로 iterate (paragraph + table cell)."""
     for b in blocks:
@@ -369,13 +293,13 @@ def extract_images_and_describe(
     out_dir: Path,
     describe: bool,
 ) -> None:
-    """blocks 안 이미지 entry 추출 + (옵션) 설명. **vision 호출은 ThreadPoolExecutor 병렬**.
+    """blocks 안 이미지 entry 추출 + (옵션) 설명.
 
     in-place: 모든 image entry 에 ``extracted_path``, ``size_bytes``, ``description`` 추가.
 
-    Env vars:
-        DOCX_VISION_MAX_WORKERS — 동시 vision 호출 수 (기본 4). LLM 서버 부담 제한.
-        DOCX_VISION_TIMEOUT_SEC — 각 호출 timeout (기본 180s, urllib 의존). 미사용.
+    설명(describe=True)은 PDF 와 동일한 공용 vision 헬퍼(``app.plugins.parsers.vision``)에
+    위임한다 — LLM 설정은 ``resolve_llm_config()``(폐쇄망 custom 포함), 동시 호출 수는
+    ``vision.VISION_MAX_WORKERS`` 상수로 제어.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -416,42 +340,23 @@ def extract_images_and_describe(
         return
 
     # 2단계 — vision LLM 호출 *병렬*. media_path 별 1회만 (dedup).
-    import os as _os
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    max_workers = max(1, int(_os.getenv("DOCX_VISION_MAX_WORKERS", "4")))
+    # PDF 파서와 동일한 공용 vision 헬퍼에 위임 (resolve_llm_config 기반, 동시성=VISION_MAX_WORKERS).
+    # 지연 import — describe 안 쓰는 standalone 경로의 app 의존성 격리.
+    from app.plugins.parsers import vision
 
-    def _describe_one(media_path: str, data: bytes) -> tuple[str, str]:
-        fname = Path(media_path).name
-        ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
-        mime = {"png":"image/png","jpg":"image/jpeg","jpeg":"image/jpeg",
-                "gif":"image/gif","bmp":"image/bmp"}.get(ext, "application/octet-stream")
-        print(f"[vision] {fname} → 멀티모달 호출 시작", file=sys.stderr)
-        try:
-            desc = describe_image_with_vision_llm(data, mime_type=mime)
-        except Exception as exc:
-            print(f"[vision] {fname} 실패: {exc}", file=sys.stderr)
-            desc = ""
-        print(f"[vision] {fname} → 완료 ({len(desc)}ch)", file=sys.stderr)
-        return media_path, desc
-
-    print(
-        f"[vision] {len(seen_bytes)}개 이미지 병렬 처리 시작 (max_workers={max_workers})",
-        file=sys.stderr,
-    )
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [
-            pool.submit(_describe_one, mp, data)
-            for mp, data in seen_bytes.items()
-        ]
-        for fut in as_completed(futures):
-            try:
-                media_path, desc = fut.result()
-            except Exception as exc:
-                print(f"[vision] future 실패: {exc}", file=sys.stderr)
-                continue
-            # 같은 media_path 의 모든 entry 에 description 복사
-            for e in entries_by_media.get(media_path) or []:
-                e["description"] = desc
+    print(f"[vision] {len(seen_bytes)}개 이미지 병렬 처리 시작", file=sys.stderr)
+    tasks = [
+        (
+            media_path,
+            (lambda d=data, m=vision.guess_image_mime(media_path): vision.describe_image(d, mime_type=m)),
+        )
+        for media_path, data in seen_bytes.items()
+    ]
+    results = vision.run_parallel(tasks)
+    for media_path, desc in results.items():
+        # 같은 media_path 의 모든 entry 에 description 복사
+        for e in entries_by_media.get(media_path) or []:
+            e["description"] = desc
 
 
 # ─────────────────────────────────────────────────────────────────────────────

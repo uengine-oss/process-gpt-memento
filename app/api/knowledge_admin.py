@@ -6,9 +6,9 @@ import hashlib
 import io
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Query, UploadFile
 
 from app.services.document_processor import get_document_processor
 from app.services.knowledge_files import (
@@ -80,6 +80,7 @@ async def check_knowledge_file_hash(
 
 @router.post("/knowledge/files/upload")
 async def upload_knowledge_file(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     tenant_id: str = Form(...),
     folder_path: Optional[str] = Form(None),
@@ -97,13 +98,24 @@ async def upload_knowledge_file(
     file_name = file.filename or "unknown"
     size_bytes = len(file_content)
 
-    # 검토 사례(legal_review)는 .docx 만 허용 — 메모(변호사 코멘트) 추출이 docx XML 한정.
-    # storage 업로드 전에 거부해 orphan 파일 방지.
-    from app.services.knowledge_files import normalize_doc_role as _norm_role_early
-    if _norm_role_early(doc_role) == "legal_review" and Path(file_name).suffix.lower() != ".docx":
+    # doc_role(분류)별 허용 확장자 정책 — storage 업로드 전에 거부해 orphan 파일 방지.
+    #   content/glossary/reference: pdf/hwp/hwpx/doc/docx/pptx/txt
+    #   template(양식): hwpx/docx · dataset(데이터): xlsx · legal_review(검토 사례): docx
+    from app.services.knowledge_files import (
+        normalize_doc_role as _norm_role_early,
+        allowed_extensions_for_role as _allowed_exts,
+        is_extension_allowed_for_role as _ext_ok,
+    )
+    if not _ext_ok(file_name, doc_role):
+        _allowed = ", ".join(_allowed_exts(doc_role))
+        _hint = (
+            " (검토 사례는 변호사 메모 추출이 docx XML 한정)"
+            if _norm_role_early(doc_role) == "legal_review"
+            else ""
+        )
         raise HTTPException(
             status_code=400,
-            detail="검토 사례는 .docx 파일만 업로드할 수 있습니다 (메모 추출이 docx 한정).",
+            detail=f"이 분류에서는 {_allowed} 형식만 업로드할 수 있습니다{_hint}.",
         )
 
     # SHA-256 해시 — 클라이언트가 보낸 값을 신뢰하지 않고 서버에서 재계산해 검증/저장
@@ -330,6 +342,9 @@ async def upload_knowledge_file(
             error=indexing_error,
         )
 
+    # 폴더 카드 갱신은 *업로드 배치 단위* 로 프론트가 `POST /knowledge/folders/refresh-cards`
+    # 를 1회 호출해 처리한다 (파일마다 재생성하는 storm 방지). 업로드 엔드포인트는 카드를
+    # 직접 만지지 않는다.
     return {
         "source_type": "upload",
         "source_ref": storage_path,
@@ -455,6 +470,37 @@ async def list_knowledge_folders(tenant_id: str = Query(...)):
     return {"folders": folders}
 
 
+@router.post("/knowledge/folders/build-cards")
+async def build_folder_cards(
+    background_tasks: BackgroundTasks,
+    tenant_id: str = Form(...),
+    doc_role: Optional[str] = Form(None),
+    requester_uid: Optional[str] = Form(None),
+    background: bool = Form(True),
+):
+    """폴더 카드 일괄 백필 — tenant 의 모든 폴더를 bottom-up 으로 1회 생성(멱등).
+
+    벌크 업로드 후 1회 실행하는 용도. signature 동일 폴더는 skip 하므로 재실행 안전.
+    폴더당 LLM 1회라 문서 수와 무관하게 비용 bounded. (관리자 전용)
+
+    Args:
+        doc_role: 옵션 — 특정 role 만. 미지정 시 등장한 모든 role.
+        background: True(기본)면 백그라운드 실행 후 즉시 응답. False 면 끝까지 기다려 요약 반환.
+    """
+    is_admin = await _resolve_admin(requester_uid, tenant_id)
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="관리자만 폴더 카드를 생성할 수 있습니다.")
+
+    from app.services.folder_cards import backfill_tenant
+
+    if background:
+        background_tasks.add_task(backfill_tenant, tenant_id, doc_role)
+        return {"ok": True, "scheduled": True, "tenant_id": tenant_id, "doc_role": doc_role}
+
+    result = await backfill_tenant(tenant_id, doc_role)
+    return {"ok": True, "scheduled": False, **result}
+
+
 @router.post("/knowledge/folders")
 async def create_knowledge_folder(
     tenant_id: str = Form(...),
@@ -469,6 +515,33 @@ async def create_knowledge_folder(
         tenant_id=tenant_id, folder_path=folder_path, doc_role=doc_role
     )
     return {"ok": ok, "folder_path": folder_path}
+
+
+@router.post("/knowledge/folders/refresh-cards")
+async def refresh_folder_cards(
+    background_tasks: BackgroundTasks,
+    tenant_id: str = Form(...),
+    folder_paths: Optional[List[str]] = Form(None),
+    doc_role: Optional[str] = Form(None),
+):
+    """업로드/삭제 *배치 후* 영향받은 폴더 카드만 갱신 — storm 없는 자동 경로.
+
+    프론트가 한 배치(업로드 N파일/삭제 N파일)가 끝난 뒤 *1회* 호출한다.
+    - ``folder_paths`` 주면 그 폴더들 + 조상만 bottom-up 재생성(``rebuild_folders``).
+    - 비우면 tenant 전체 backfill.
+    signature-skip 이라 실제 안 바뀐 폴더는 LLM 호출 없음. 백그라운드 실행 후 즉시 응답.
+    (멱등·파생 데이터라 관리자 게이트 없음. 안 바뀌면 비용 0이라 남용 위험도 낮음.)
+    """
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id required")
+    from app.services.folder_cards import backfill_tenant, rebuild_folders
+
+    cleaned = [str(p).strip().strip("/") for p in (folder_paths or []) if str(p or "").strip().strip("/")]
+    if cleaned:
+        background_tasks.add_task(rebuild_folders, tenant_id, cleaned, doc_role or "content")
+    else:
+        background_tasks.add_task(backfill_tenant, tenant_id, doc_role)
+    return {"ok": True, "scheduled": True, "folders": (len(cleaned) or "all")}
 
 
 @router.post("/knowledge/folders/rename")
@@ -535,5 +608,13 @@ async def delete_knowledge_folder(
 
     # knowledge_folders 메타 row도 정리 (빈 폴더 + 자식 폴더, role scope)
     await delete_folder_meta(tenant_id=tenant_id, folder_path=folder_path, doc_role=doc_role)
+
+    # 폴더 카드 정리: 삭제된 폴더 + 하위(subtree) 카드 행 제거 후, *부모* 카드 재생성
+    # (부모는 하위폴더 1개가 줄었으므로 요약/카운트 갱신 필요).
+    from app.services.folder_cards import delete_folder_cards, rebuild_folders
+    await delete_folder_cards(tenant_id=tenant_id, folder_path=folder_path, doc_role=doc_role)
+    _parent = folder_path.rsplit("/", 1)[0] if "/" in folder_path else ""
+    if _parent:
+        await rebuild_folders(tenant_id, [_parent], doc_role or "content")
 
     return {"ok": True, "deleted": deleted, "failed": failed, "total": len(rows)}

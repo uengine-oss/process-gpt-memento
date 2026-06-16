@@ -113,6 +113,20 @@ async def process_session_file(request: ProcessSessionFileRequest):
         original_filename = request.file_name or _os.path.basename(storage_path)
         file_extension = Path(original_filename).suffix.lower() or ".bin"
 
+        # 채팅 첨부 허용 확장자 — 지원 문서셋 + 이미지(비전). 그 외는 거부.
+        _CHAT_ALLOWED_EXTS = {
+            ".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".pptx", ".txt", ".xlsx",
+            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+        }
+        if file_extension not in _CHAT_ALLOWED_EXTS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"지원하지 않는 파일 형식입니다: {file_extension} "
+                    "(허용: pdf/hwp/hwpx/doc/docx/pptx/txt/xlsx/이미지)"
+                ),
+            )
+
         # 2) file_id 명시 부여 — *세션 첨부* 표시 위해 'session/' prefix
         # storage path 가 이미 uuid 포함이면 그것 활용, 아니면 신규 uuid
         path_basename = _os.path.basename(storage_path)
