@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from app.core.supabase_client import supabase
+from app.services.knowledge_files import compose_path
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -275,7 +276,7 @@ async def folders_open(
     try:
         eq = (
             supabase.table("knowledge_files")
-            .select("file_name, folder_path, doc_card, doc_role, mime_type")
+            .select("file_name, folder_path, path, doc_card, doc_role, mime_type")
             .eq("tenant_id", tenant_id)
             .eq("folder_path", fp)
         )
@@ -329,6 +330,7 @@ async def folders_open(
         {
             "file_name": r.get("file_name"),
             "folder_path": _norm(r.get("folder_path")),
+            "path": r.get("path") or compose_path(r.get("folder_path"), r.get("file_name")),
             "abstract": _abstract_of(r),
             "doc_role": r.get("doc_role") or "content",
             "n_pages": _n_pages_of(r),

@@ -389,6 +389,7 @@ async def list_documents(
                 "source_type": r.get("source_type"),
                 "source_ref": r.get("source_ref"),
                 "folder_path": r.get("folder_path") or "",
+                "path": r.get("path") or "",
                 "drive_folder_id": r.get("drive_folder_id"),
                 "mime_type": mime,
                 "size_bytes": r.get("size_bytes"),

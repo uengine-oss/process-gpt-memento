@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Query
 
 from app.core.supabase_client import supabase
+from app.services.knowledge_files import compose_path
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -35,38 +36,62 @@ logger = logging.getLogger(__name__)
 
 async def _resolve_file_id(
     tenant_id: str,
-    file_name: str,
+    *,
+    path: Optional[str] = None,
+    file_name: Optional[str] = None,
     folder_path: Optional[str] = None,
 ) -> Optional[str]:
-    """동일 tenant 안에서 file_name 매칭되는 knowledge_files row 의 source_ref 반환.
+    """문서 → knowledge_files.source_ref 해석.
 
-    ``folder_path`` 가 주어지면 *그 폴더 안* 의 파일로 한정한다. 대규모 코퍼스(동일 골격의
-    여러 사업)에서 ``Credit Agreement.docx``·``감사보고서.pdf`` 처럼 폴더만 다른 *동명 파일*
-    이 흔하므로, folder_path 없이 file_name 만으로 해석하면 "가장 최근 것"으로 *조용히 엉뚱한
-    사업 문서* 를 읽는 버그가 난다. 에이전트는 항상 folder_path 를 같이 넘긴다.
-
-    동명 파일이 (그 폴더 안에서도) 여러 개면 가장 최근 modified 한 거 선택.
+    우선순위(견고한 표준 경로):
+    1) ``path`` (전체 상대경로 핸들) **정확 매칭**. 에이전트가 도구 출력의 path 를 *그대로 복사*해
+       넘기는 경로. 동명 파일도 path 가 사업별로 유일하므로 자동 구별 — 재조합 슬립 없음.
+    2) path 정확 매칭 실패 시: path 의 **basename 으로 file_name 매칭**(most-recent) — 모델이 path 를
+       살짝 틀리거나 레거시 행(path NULL)일 때의 폴백(이중 방어).
+    3) path 없이 ``file_name`` (+옵션 folder_path) — 레거시/`/document/raw` 호환.
+    다중이면 modified_time desc 로 가장 최근.
     """
+    def _ref(rows):
+        return rows[0].get("source_ref") if rows else None
+
     try:
-        q = (
-            supabase.table("knowledge_files")
-            .select("source_ref, source_type, folder_path, modified_time, indexed_at")
-            .eq("tenant_id", tenant_id)
-            .eq("file_name", file_name)
-        )
-        if folder_path is not None and str(folder_path).strip() != "":
-            q = q.eq("folder_path", str(folder_path).strip().strip("/"))
-        result = await asyncio.to_thread(
-            q.order("modified_time", desc=True).limit(1).execute
-        )
-        rows = result.data or []
-        if not rows:
+        p = (path or "").strip().strip("/")
+        if p:
+            r = await asyncio.to_thread(
+                supabase.table("knowledge_files")
+                .select("source_ref, modified_time")
+                .eq("tenant_id", tenant_id).eq("path", p)
+                .order("modified_time", desc=True).limit(1).execute
+            )
+            ref = _ref(r.data or [])
+            if ref:
+                return ref
+            basename = p.rsplit("/", 1)[-1]
+            if basename:
+                r2 = await asyncio.to_thread(
+                    supabase.table("knowledge_files")
+                    .select("source_ref, modified_time")
+                    .eq("tenant_id", tenant_id).eq("file_name", basename)
+                    .order("modified_time", desc=True).limit(1).execute
+                )
+                return _ref(r2.data or [])
             return None
-        return rows[0].get("source_ref")
+
+        if file_name:
+            q = (
+                supabase.table("knowledge_files")
+                .select("source_ref, modified_time")
+                .eq("tenant_id", tenant_id).eq("file_name", file_name)
+            )
+            if folder_path is not None and str(folder_path).strip() != "":
+                q = q.eq("folder_path", str(folder_path).strip().strip("/"))
+            r = await asyncio.to_thread(q.order("modified_time", desc=True).limit(1).execute)
+            return _ref(r.data or [])
+        return None
     except Exception as e:
         logger.warning(
-            "[navigator] resolve file_id failed (tenant=%s, name=%s, folder=%s): %s",
-            tenant_id, file_name, folder_path, e,
+            "[navigator] resolve failed (tenant=%s path=%s name=%s): %s",
+            tenant_id, path, file_name, e,
         )
         return None
 
@@ -100,7 +125,7 @@ async def catalog(
         query = (
             supabase.table("knowledge_files")
             .select(
-                "source_ref, source_type, file_name, folder_path, mime_type, "
+                "source_ref, source_type, file_name, folder_path, path, mime_type, "
                 "size_bytes, modified_time, indexed_at, index_status, doc_card, doc_role"
             )
             .eq("tenant_id", tenant_id)
@@ -124,6 +149,7 @@ async def catalog(
                 "file_id": r.get("source_ref"),
                 "file_name": r.get("file_name"),
                 "folder_path": r.get("folder_path") or "",
+                "path": r.get("path") or compose_path(r.get("folder_path"), r.get("file_name")),
                 "mime_type": r.get("mime_type"),
                 "size_bytes": r.get("size_bytes"),
                 "modified_time": r.get("modified_time"),
@@ -303,9 +329,8 @@ def _build_snippet(
 @router.get("/document/grep")
 async def document_grep(
     tenant_id: str,
-    file_name: str,
+    path: str,
     pattern: str,
-    folder_path: Optional[str] = Query(default=None),
     regex: bool = Query(default=False),
     case_sensitive: bool = Query(default=False),
     context_lines: int = Query(default=0, ge=0, le=_GREP_MAX_CONTEXT_LINES),
@@ -314,8 +339,9 @@ async def document_grep(
     """한 문서 안에서 패턴 매칭 위치 찾기.
 
     Args:
-        tenant_id, file_name: 필수.
-        folder_path: 동명 파일 구별용(옵션). 주면 *그 폴더 안* 파일로 한정.
+        tenant_id: 필수.
+        path: **문서의 전체 상대경로 핸들** (open_folder/survey 출력의 path 그대로). 동명 파일도
+            path 가 사업별로 유일해 정확 구별. 서버가 path → source_ref 로 해석.
         pattern: 검색 패턴. ``regex=false``(기본)면 literal substring, ``true``면 정규식.
         case_sensitive: 기본 False (대소문자 무시).
         context_lines: 매칭 라인 좌/우로 같이 돌려줄 라인 수(0~5).
@@ -324,17 +350,18 @@ async def document_grep(
     Returns:
         ``{"response": [{file_name, page, line, snippet, context}, ...], "total_matches": N, "truncated": bool}``
     """
-    if not tenant_id or not file_name or not pattern:
-        raise HTTPException(status_code=400, detail="tenant_id, file_name, pattern required")
+    if not tenant_id or not path or not pattern:
+        raise HTTPException(status_code=400, detail="tenant_id, path, pattern required")
 
-    file_id = await _resolve_file_id(tenant_id, file_name, folder_path)
+    file_id = await _resolve_file_id(tenant_id, path=path)
     if not file_id:
         return {
             "response": [],
             "total_matches": 0,
             "truncated": False,
-            "error": f"file_name '{file_name}' not found in tenant '{tenant_id}'",
+            "error": f"path '{path}' not found in tenant '{tenant_id}'",
         }
+    file_name = path  # 표시/인용용 (페이지 조회는 file_id 기준)
 
     # 패턴 컴파일 (regex 모드면 정규식, 아니면 literal escape)
     try:
@@ -462,22 +489,22 @@ def _parse_page_range(spec: str, n_pages_hint: Optional[int] = None) -> List[int
 @router.get("/document/page")
 async def document_page(
     tenant_id: str,
-    file_name: str,
+    path: str,
     pages: str,
-    folder_path: Optional[str] = Query(default=None),
 ):
     """페이지 범위 본문 반환.
 
     Args:
-        tenant_id, file_name: 필수.
+        tenant_id: 필수.
+        path: **문서의 전체 상대경로 핸들** (open_folder/survey 출력의 path 그대로). 서버가
+            path → source_ref 로 해석. 동명 파일도 path 가 사업별로 유일해 정확 구별.
         pages: ``"5"`` / ``"5-8"`` / ``"5,7,12"`` / ``"3-5,9"`` 형식. 한 번 호출 최대 10페이지.
-        folder_path: 동명 파일 구별용(옵션). 주면 *그 폴더 안* 파일로 한정.
 
     Returns:
         ``{"file_name", "pages": [{"page_number", "content"}, ...]}``
     """
-    if not tenant_id or not file_name or not pages:
-        raise HTTPException(status_code=400, detail="tenant_id, file_name, pages required")
+    if not tenant_id or not path or not pages:
+        raise HTTPException(status_code=400, detail="tenant_id, path, pages required")
 
     page_numbers = _parse_page_range(pages)
     if not page_numbers:
@@ -491,12 +518,13 @@ async def document_page(
             ),
         )
 
-    file_id = await _resolve_file_id(tenant_id, file_name, folder_path)
+    file_id = await _resolve_file_id(tenant_id, path=path)
+    file_name = path  # 응답 표시용 (페이지 조회는 file_id 기준)
     if not file_id:
         return {
             "file_name": file_name,
             "pages": [],
-            "error": f"file_name '{file_name}' not found in tenant '{tenant_id}'",
+            "error": f"path '{path}' not found in tenant '{tenant_id}'",
         }
 
     try:

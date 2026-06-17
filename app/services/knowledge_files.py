@@ -43,6 +43,17 @@ def sanitize_storage_folder_path(folder_path: str) -> str:
         return ""
     return "/".join(_sanitize_storage_segment(p) for p in folder_path.split("/") if p)
 
+
+def compose_path(folder_path: Optional[str], file_name: Optional[str]) -> str:
+    """folder_path + file_name → 전체 상대경로(에이전트가 다루는 *단일 핸들*).
+
+    folder_path 비면 file_name 만. 앞/끝 슬래시 정리. file_name 은 basename 가정.
+    예: ("mock-corpus/A/05", "Credit Agreement.pdf") → "mock-corpus/A/05/Credit Agreement.pdf"
+    """
+    fp = (folder_path or "").strip().strip("/")
+    fn = (file_name or "").strip()
+    return f"{fp}/{fn}" if fp else fn
+
 INDEX_STATUS_PENDING = "pending"
 INDEX_STATUS_PROCESSING = "processing"
 INDEX_STATUS_INDEXED = "indexed"
@@ -91,6 +102,7 @@ async def upsert_drive_files(
             "source_ref": file_id,
             "file_name": file_name,
             "folder_path": f.get("drive_folder_name") or "",
+            "path": compose_path(f.get("drive_folder_name"), file_name),
             "drive_folder_id": f.get("drive_folder_id"),
             "mime_type": f.get("mimeType"),
             "size_bytes": _safe_int(f.get("size")),
@@ -124,6 +136,7 @@ async def upsert_drive_files(
                 .update({
                     "file_name": r["file_name"],
                     "folder_path": r["folder_path"],
+                    "path": r["path"],
                     "drive_folder_id": r["drive_folder_id"],
                     "mime_type": r["mime_type"],
                     "size_bytes": r["size_bytes"],
@@ -226,6 +239,7 @@ async def register_uploaded_file(
         "source_ref": storage_path,
         "file_name": file_name,
         "folder_path": folder_path or "",
+        "path": compose_path(folder_path, file_name),
         "mime_type": mime_type,
         "size_bytes": size_bytes,
         "owner": owner,
@@ -558,6 +572,7 @@ async def _move_one_file(
     old_ref = row.get("source_ref") or ""
     if not old_ref:
         return False
+    _fname = row.get("file_name") or ""  # path 컬럼 동기화용 (rename select 에 file_name 포함)
 
     # storage path 구조: knowledge/{tenant}/{sanitize(folder_path)}/{uuid}.ext
     # source_ref의 마지막 segment(= uuid 파일명)만 떼서 새 folder 아래에 붙임
@@ -575,7 +590,7 @@ async def _move_one_file(
         try:
             await asyncio.to_thread(
                 supabase.table("knowledge_files")
-                .update({"folder_path": new_folder_path})
+                .update({"folder_path": new_folder_path, "path": compose_path(new_folder_path, _fname)})
                 .eq("tenant_id", tenant_id)
                 .eq("source_type", "upload")
                 .eq("source_ref", old_ref)
@@ -593,7 +608,7 @@ async def _move_one_file(
     try:
         await asyncio.to_thread(
             supabase.table("knowledge_files")
-            .update({"folder_path": new_folder_path, "source_ref": new_ref})
+            .update({"folder_path": new_folder_path, "source_ref": new_ref, "path": compose_path(new_folder_path, _fname)})
             .eq("tenant_id", tenant_id)
             .eq("source_type", "upload")
             .eq("source_ref", old_ref)
@@ -631,7 +646,7 @@ async def rename_folder(
     try:
         eq = (
             supabase.table("knowledge_files")
-            .select("source_ref, folder_path")
+            .select("source_ref, folder_path, file_name")
             .eq("tenant_id", tenant_id)
             .eq("source_type", "upload")
             .eq("folder_path", old_path)
@@ -650,7 +665,7 @@ async def rename_folder(
     try:
         cq = (
             supabase.table("knowledge_files")
-            .select("source_ref, folder_path")
+            .select("source_ref, folder_path, file_name")
             .eq("tenant_id", tenant_id)
             .eq("source_type", "upload")
             .like("folder_path", f"{old_path}/%")
@@ -939,7 +954,7 @@ async def list_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
         result = await asyncio.to_thread(
             supabase.table("knowledge_files")
             .select(
-                "source_type, source_ref, file_name, folder_path, drive_folder_id, "
+                "source_type, source_ref, file_name, folder_path, path, drive_folder_id, "
                 "mime_type, size_bytes, modified_time, owner, "
                 "uploaded_by_uid, uploaded_by_name, index_status, "
                 "index_error, indexed_at, updated_at, doc_role"
