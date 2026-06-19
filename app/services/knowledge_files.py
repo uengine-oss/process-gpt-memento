@@ -908,7 +908,7 @@ async def get_entry(
             supabase.table("knowledge_files")
             .select(
                 "source_type, source_ref, file_name, folder_path, owner, "
-                "uploaded_by_uid, uploaded_by_name"
+                "uploaded_by_uid, uploaded_by_name, doc_role"
             )
             .eq("tenant_id", tenant_id)
             .eq("source_type", source_type)

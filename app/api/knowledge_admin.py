@@ -14,6 +14,7 @@ from app.services.document_processor import get_document_processor
 from app.services.knowledge_files import (
     INDEX_STATUS_FAILED,
     INDEX_STATUS_INDEXED,
+    INDEX_STATUS_PROCESSING,
     create_folder as kf_create_folder,
     delete_entry,
     delete_folder_meta,
@@ -78,118 +79,24 @@ async def check_knowledge_file_hash(
     return {"exists": bool(existing), "existing": existing}
 
 
-@router.post("/knowledge/files/upload")
-async def upload_knowledge_file(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    tenant_id: str = Form(...),
-    folder_path: Optional[str] = Form(None),
-    file_hash: Optional[str] = Form(None),
-    uploaded_by_uid: Optional[str] = Form(None),
-    uploaded_by_name: Optional[str] = Form(None),
-    doc_role: Optional[str] = Form(None),
-):
-    """설정 페이지에서 내부 지식공간 파일을 직접 업로드.
+async def _index_uploaded_file(
+    *,
+    tenant_id: str,
+    storage_path: str,
+    file_content: bytes,
+    file_name: str,
+    doc_role: Optional[str],
+    public_url: Optional[str] = None,
+) -> Optional[str]:
+    """스토리지에 올라온 파일을 파싱·인덱싱하고 ``index_status`` 를 갱신한다 (upload/reindex 공용).
 
-    실물 파일은 Supabase Storage 'files' 버킷의 'knowledge/{tenant}/' 아래에 저장하고,
-    knowledge_files 테이블에 source_type='upload'로 등록한 후 RAG 인덱싱한다.
+    반환: 실패 사유 문자열(str) 또는 ``None``(성공). 실패 시 ``mark_status(FAILED)`` 까지 처리.
+
+    ── doc_role 별 인덱싱 정책 ──
+      content/reference : 풀 파이프라인 (pages + abstract + 청킹 + 임베딩)
+      glossary/template : 페이지만 저장 (abstract·청킹·임베딩 skip)
+      dataset           : 페이지·청킹·임베딩 skip, workbook_card 만 추출해 doc_card 저장
     """
-    file_content = await file.read()
-    # 폴더 업로드(webkitdirectory) 등에서 filename 이 *전체 상대경로* 로 오는 경우가 있다
-    # (예: 'mock-corpus/A_.../01.선순위/Credit Agreement.pdf'). 폴더 구조는 folder_path 로 따로
-    # 저장하므로 file_name 은 항상 *basename* 으로 정규화한다 — 그래야 grep/page 의 file_name
-    # 해석(_resolve_file_id)이 동작한다. 클라이언트가 무엇을 보내든 방어(서버가 단일 진실).
-    file_name = (file.filename or "unknown").replace("\\", "/").rstrip("/").split("/")[-1] or "unknown"
-    size_bytes = len(file_content)
-
-    # doc_role(분류)별 허용 확장자 정책 — storage 업로드 전에 거부해 orphan 파일 방지.
-    #   content/glossary/reference: pdf/hwp/hwpx/doc/docx/pptx/txt
-    #   template(양식): hwpx/docx · dataset(데이터): xlsx · legal_review(검토 사례): docx
-    from app.services.knowledge_files import (
-        normalize_doc_role as _norm_role_early,
-        allowed_extensions_for_role as _allowed_exts,
-        is_extension_allowed_for_role as _ext_ok,
-    )
-    if not _ext_ok(file_name, doc_role):
-        _allowed = ", ".join(_allowed_exts(doc_role))
-        _hint = (
-            " (검토 사례는 변호사 메모 추출이 docx XML 한정)"
-            if _norm_role_early(doc_role) == "legal_review"
-            else ""
-        )
-        raise HTTPException(
-            status_code=400,
-            detail=f"이 분류에서는 {_allowed} 형식만 업로드할 수 있습니다{_hint}.",
-        )
-
-    # SHA-256 해시 — 클라이언트가 보낸 값을 신뢰하지 않고 서버에서 재계산해 검증/저장
-    computed_hash = hashlib.sha256(file_content).hexdigest()
-    if file_hash and file_hash.lower() != computed_hash:
-        logger.warning(
-            "[knowledge_admin] client hash mismatch (%s != %s) — using server-computed",
-            file_hash, computed_hash,
-        )
-    file_hash = computed_hash
-
-    # 1) Storage 업로드 — folder_path를 storage 경로에도 반영 (ASCII-safe로 변환)
-    storage_loader = SupabaseStorageLoader()
-    raw_folder_path = (folder_path or "").strip().strip("/")
-    safe_folder_segment = sanitize_storage_folder_path(raw_folder_path)
-    folder = (
-        f"knowledge/{tenant_id}/{safe_folder_segment}"
-        if safe_folder_segment
-        else f"knowledge/{tenant_id}"
-    )
-    try:
-        upload_result = await storage_loader.upload_file_to_storage(
-            file_content, file_name, folder_path=folder
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Storage upload failed: {e}")
-
-    storage_path = upload_result["file_path"]
-    public_url = upload_result.get("public_url")
-
-    # 2) knowledge_files 사전 등록 (processing)
-    await register_uploaded_file(
-        tenant_id=tenant_id,
-        storage_path=storage_path,
-        file_name=file_name,
-        folder_path=folder_path or "",
-        mime_type=file.content_type or "",
-        size_bytes=size_bytes,
-        file_hash=file_hash,
-        uploaded_by_uid=(uploaded_by_uid or None),
-        uploaded_by_name=(uploaded_by_name or None),
-        doc_role=doc_role,
-    )
-
-    # 2-1) knowledge_folders 레지스트리에도 폴더(+조상) 등록.
-    # "+폴더" 버튼으로 만든 폴더처럼, *업로드*로 생긴 폴더도 레지스트리에 남긴다(불일치 제거).
-    # 폴더 업로드 시 nested 경로의 모든 단계를 등록해 트리와 일치시킨다. idempotent upsert.
-    _fp = (folder_path or "").strip().strip("/")
-    if _fp:
-        _acc: list[str] = []
-        for _seg in [s for s in _fp.split("/") if s]:
-            _acc.append(_seg)
-            try:
-                await kf_create_folder(
-                    tenant_id=tenant_id, folder_path="/".join(_acc), doc_role=doc_role
-                )
-            except Exception as _e:
-                logger.warning("[knowledge_admin] folder register failed (%s): %s", "/".join(_acc), _e)
-
-    # 3) 콘텐츠 추출 + RAG 인덱싱
-    # ── doc_role 별 인덱싱 정책 ──
-    #   content   : 풀 파이프라인 (pages + abstract + 청킹 + 임베딩) — 기존 동작
-    #   reference : 풀 파이프라인 (인용 우선 자료, RAG 검색 대상)
-    #   glossary  : 페이지만 저장 (abstract·청킹·임베딩 모두 skip).
-    #               → /glossary/inline 이 페이지에서 본문 읽음. 의미검색 대상 아님(노이즈 방지).
-    #   template  : 페이지만 저장 (양식 자체는 placeholder 추출이 별도 단계).
-    #   dataset   : 페이지·청킹·임베딩 모두 skip. workbook_card 만 추출해 doc_card 컬럼에 저장.
-    #               → 채팅 시점에 data-analyst 서브에이전트가 sandbox 에서 원본 파일을 코드로 처리.
-    # 분기는 *이 endpoint 안에서만* 일어남 — 다른 ingest 경로 (Drive, /ingest/*, pipeline.py)
-    # 는 doc_role 인자가 없어 항상 'content' 동작. 사이드이펙트 없음.
     from app.services.knowledge_files import normalize_doc_role  # 동일 정규화 사용
     role_norm = normalize_doc_role(doc_role)
     skip_chunking_and_embedding = role_norm in ("glossary", "template", "dataset")
@@ -360,6 +267,119 @@ async def upload_knowledge_file(
             status=INDEX_STATUS_FAILED,
             error=indexing_error,
         )
+    return indexing_error
+
+
+@router.post("/knowledge/files/upload")
+async def upload_knowledge_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    tenant_id: str = Form(...),
+    folder_path: Optional[str] = Form(None),
+    file_hash: Optional[str] = Form(None),
+    uploaded_by_uid: Optional[str] = Form(None),
+    uploaded_by_name: Optional[str] = Form(None),
+    doc_role: Optional[str] = Form(None),
+):
+    """설정 페이지에서 내부 지식공간 파일을 직접 업로드.
+
+    실물 파일은 Supabase Storage 'files' 버킷의 'knowledge/{tenant}/' 아래에 저장하고,
+    knowledge_files 테이블에 source_type='upload'로 등록한 후 RAG 인덱싱한다.
+    """
+    file_content = await file.read()
+    # 폴더 업로드(webkitdirectory) 등에서 filename 이 *전체 상대경로* 로 오는 경우가 있다
+    # (예: 'mock-corpus/A_.../01.선순위/Credit Agreement.pdf'). 폴더 구조는 folder_path 로 따로
+    # 저장하므로 file_name 은 항상 *basename* 으로 정규화한다 — 그래야 grep/page 의 file_name
+    # 해석(_resolve_file_id)이 동작한다. 클라이언트가 무엇을 보내든 방어(서버가 단일 진실).
+    file_name = (file.filename or "unknown").replace("\\", "/").rstrip("/").split("/")[-1] or "unknown"
+    size_bytes = len(file_content)
+
+    # doc_role(분류)별 허용 확장자 정책 — storage 업로드 전에 거부해 orphan 파일 방지.
+    #   content/glossary/reference: pdf/hwp/hwpx/doc/docx/pptx/txt
+    #   template(양식): hwpx/docx · dataset(데이터): xlsx · legal_review(검토 사례): docx
+    from app.services.knowledge_files import (
+        normalize_doc_role as _norm_role_early,
+        allowed_extensions_for_role as _allowed_exts,
+        is_extension_allowed_for_role as _ext_ok,
+    )
+    if not _ext_ok(file_name, doc_role):
+        _allowed = ", ".join(_allowed_exts(doc_role))
+        _hint = (
+            " (검토 사례는 변호사 메모 추출이 docx XML 한정)"
+            if _norm_role_early(doc_role) == "legal_review"
+            else ""
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"이 분류에서는 {_allowed} 형식만 업로드할 수 있습니다{_hint}.",
+        )
+
+    # SHA-256 해시 — 클라이언트가 보낸 값을 신뢰하지 않고 서버에서 재계산해 검증/저장
+    computed_hash = hashlib.sha256(file_content).hexdigest()
+    if file_hash and file_hash.lower() != computed_hash:
+        logger.warning(
+            "[knowledge_admin] client hash mismatch (%s != %s) — using server-computed",
+            file_hash, computed_hash,
+        )
+    file_hash = computed_hash
+
+    # 1) Storage 업로드 — folder_path를 storage 경로에도 반영 (ASCII-safe로 변환)
+    storage_loader = SupabaseStorageLoader()
+    raw_folder_path = (folder_path or "").strip().strip("/")
+    safe_folder_segment = sanitize_storage_folder_path(raw_folder_path)
+    folder = (
+        f"knowledge/{tenant_id}/{safe_folder_segment}"
+        if safe_folder_segment
+        else f"knowledge/{tenant_id}"
+    )
+    try:
+        upload_result = await storage_loader.upload_file_to_storage(
+            file_content, file_name, folder_path=folder
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Storage upload failed: {e}")
+
+    storage_path = upload_result["file_path"]
+    public_url = upload_result.get("public_url")
+
+    # 2) knowledge_files 사전 등록 (processing)
+    await register_uploaded_file(
+        tenant_id=tenant_id,
+        storage_path=storage_path,
+        file_name=file_name,
+        folder_path=folder_path or "",
+        mime_type=file.content_type or "",
+        size_bytes=size_bytes,
+        file_hash=file_hash,
+        uploaded_by_uid=(uploaded_by_uid or None),
+        uploaded_by_name=(uploaded_by_name or None),
+        doc_role=doc_role,
+    )
+
+    # 2-1) knowledge_folders 레지스트리에도 폴더(+조상) 등록.
+    # "+폴더" 버튼으로 만든 폴더처럼, *업로드*로 생긴 폴더도 레지스트리에 남긴다(불일치 제거).
+    # 폴더 업로드 시 nested 경로의 모든 단계를 등록해 트리와 일치시킨다. idempotent upsert.
+    _fp = (folder_path or "").strip().strip("/")
+    if _fp:
+        _acc: list[str] = []
+        for _seg in [s for s in _fp.split("/") if s]:
+            _acc.append(_seg)
+            try:
+                await kf_create_folder(
+                    tenant_id=tenant_id, folder_path="/".join(_acc), doc_role=doc_role
+                )
+            except Exception as _e:
+                logger.warning("[knowledge_admin] folder register failed (%s): %s", "/".join(_acc), _e)
+
+    # 3) 콘텐츠 추출 + RAG 인덱싱 (upload/reindex 공용 헬퍼)
+    indexing_error = await _index_uploaded_file(
+        tenant_id=tenant_id,
+        storage_path=storage_path,
+        file_content=file_content,
+        file_name=file_name,
+        doc_role=doc_role,
+        public_url=public_url,
+    )
 
     # 폴더 카드 갱신은 *업로드 배치 단위* 로 프론트가 `POST /knowledge/folders/refresh-cards`
     # 를 1회 호출해 처리한다 (파일마다 재생성하는 storm 방지). 업로드 엔드포인트는 카드를
@@ -370,6 +390,72 @@ async def upload_knowledge_file(
         "file_name": file_name,
         "size_bytes": size_bytes,
         "public_url": public_url,
+        "indexed": indexing_error is None,
+        "error": indexing_error,
+    }
+
+
+@router.post("/knowledge/files/reindex")
+async def reindex_knowledge_file(
+    tenant_id: str = Form(...),
+    source_ref: str = Form(...),
+    source_type: str = Form("upload"),
+    requester_uid: Optional[str] = Form(None),
+):
+    """인덱싱 실패(``index_status='failed'``) 등인 업로드 파일을 *재인덱싱*.
+
+    스토리지의 원본을 다시 받아 업로드와 동일 파이프라인(``_index_uploaded_file``)으로 재처리.
+    임베딩 일시 과부하(429) 등 일시적 실패의 후속조치. 드라이브 소스는 미지원(원본이 외부).
+    권한: 관리자 또는 업로더 본인.
+    """
+    if source_type != "upload":
+        raise HTTPException(status_code=400, detail="재인덱싱은 업로드 파일만 지원합니다.")
+    entry = await get_entry(tenant_id, source_type, source_ref)
+    if not entry:
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+
+    # 권한 — 관리자이거나 본인이 올린 파일만 (삭제 권한 규칙과 동일)
+    is_admin = await _resolve_admin(requester_uid, tenant_id)
+    is_owner = bool(requester_uid) and str(entry.get("uploaded_by_uid") or "") == str(requester_uid)
+    if not (is_admin or is_owner):
+        raise HTTPException(status_code=403, detail="재인덱싱 권한이 없습니다 (관리자 또는 업로더 본인).")
+
+    file_name = entry.get("file_name") or Path(source_ref).name
+    doc_role = entry.get("doc_role")
+
+    # 진행중 표시 (UI 가 즉시 processing 으로 보이도록)
+    await mark_status(
+        tenant_id=tenant_id, source_type=source_type, source_ref=source_ref,
+        status=INDEX_STATUS_PROCESSING,
+    )
+
+    # 스토리지에서 원본 재다운로드 (source_ref = 'files' 버킷 내 경로)
+    try:
+        loader = SupabaseStorageLoader()
+        resp = await asyncio.to_thread(
+            loader.supabase.storage.from_("files").download, source_ref
+        )
+        file_content = resp if isinstance(resp, bytes) else (
+            resp.read() if hasattr(resp, "read") else bytes(resp)
+        )
+    except Exception as e:
+        await mark_status(
+            tenant_id=tenant_id, source_type=source_type, source_ref=source_ref,
+            status=INDEX_STATUS_FAILED, error=f"스토리지 다운로드 실패: {e}",
+        )
+        raise HTTPException(status_code=500, detail=f"스토리지 다운로드 실패: {e}")
+
+    indexing_error = await _index_uploaded_file(
+        tenant_id=tenant_id,
+        storage_path=source_ref,
+        file_content=file_content,
+        file_name=file_name,
+        doc_role=doc_role,
+    )
+    return {
+        "source_type": source_type,
+        "source_ref": source_ref,
+        "file_name": file_name,
         "indexed": indexing_error is None,
         "error": indexing_error,
     }
