@@ -49,15 +49,33 @@ async def _resolve_file_id(tenant_id: str, file_name: str) -> Optional[str]:
             .execute
         )
         rows = result.data or []
-        if not rows:
-            return None
-        return rows[0].get("source_ref")
+        if rows:
+            return rows[0].get("source_ref")
     except Exception as e:
         logger.warning(
             "[navigator] resolve file_id failed (tenant=%s, name=%s): %s",
             tenant_id, file_name, e,
         )
-        return None
+
+    # knowledge_files 가 없거나(로컬 dev) 매칭 실패 → processed_files(file_id=storage path) 폴백.
+    try:
+        pf = await asyncio.to_thread(
+            supabase.table("processed_files")
+            .select("file_id")
+            .eq("tenant_id", tenant_id)
+            .eq("file_name", file_name)
+            .limit(1)
+            .execute
+        )
+        pf_rows = pf.data or []
+        if pf_rows:
+            return pf_rows[0].get("file_id")
+    except Exception as e2:
+        logger.warning(
+            "[navigator] resolve file_id processed_files 폴백 실패 (tenant=%s, name=%s): %s",
+            tenant_id, file_name, e2,
+        )
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,6 +103,10 @@ async def catalog(
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id required")
 
+    cleaned_ids = [str(x) for x in (file_ids or []) if x]
+    cleaned_names = [str(x) for x in (file_names or []) if x]
+
+    out: List[Dict[str, Any]] = []
     try:
         query = (
             supabase.table("knowledge_files")
@@ -95,8 +117,6 @@ async def catalog(
             .eq("tenant_id", tenant_id)
         )
 
-        cleaned_ids = [str(x) for x in (file_ids or []) if x]
-        cleaned_names = [str(x) for x in (file_names or []) if x]
         if cleaned_ids:
             query = query.in_("source_ref", cleaned_ids)
         elif cleaned_names:
@@ -107,7 +127,6 @@ async def catalog(
         response = await asyncio.to_thread(query.execute)
         rows = response.data or []
 
-        out: List[Dict[str, Any]] = []
         for r in rows:
             out.append({
                 "file_id": r.get("source_ref"),
@@ -122,15 +141,51 @@ async def catalog(
                 "doc_card": r.get("doc_card"),
                 "doc_role": r.get("doc_role") or "content",
             })
-        logger.info(
-            "[/catalog] tenant=%s ids=%d names=%d → %d cards",
-            tenant_id, len(cleaned_ids), len(cleaned_names), len(out),
-        )
-        return {"response": out}
-
     except Exception as e:
-        logger.exception("[/catalog] failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        # knowledge_files 테이블이 없거나(PGRST205) 조회 실패해도 500 으로 죽지 않는다.
+        # 채팅 업로드 흐름에서는 processed_files 폴백으로 최소 카탈로그를 만든다.
+        logger.warning("[/catalog] knowledge_files 조회 실패 → processed_files 폴백: %s", e)
+
+    # knowledge_files 결과가 없으면 processed_files(임베딩 완료 파일)에서 최소 카드 구성.
+    # 업로드 직후(knowledge_files 미등록/테이블 부재) 에도 list_documents 가 동작하게 한다.
+    if not out:
+        try:
+            pf = supabase.table("processed_files").select(
+                "file_id, file_name, tenant_id"
+            ).eq("tenant_id", tenant_id)
+            if cleaned_ids:
+                pf = pf.in_("file_id", cleaned_ids)
+            elif cleaned_names:
+                pf = pf.in_("file_name", cleaned_names)
+            pf_resp = await asyncio.to_thread(pf.execute)
+            seen_pf: set = set()
+            for r in (pf_resp.data or []):
+                fid = r.get("file_id")
+                if not fid or fid in seen_pf:
+                    continue
+                seen_pf.add(fid)
+                out.append({
+                    "file_id": fid,
+                    "file_name": r.get("file_name"),
+                    "folder_path": "",
+                    "mime_type": None,
+                    "size_bytes": None,
+                    "modified_time": None,
+                    "indexed_at": None,
+                    "index_status": "indexed",
+                    "source_type": "upload",
+                    "doc_card": None,
+                    "doc_role": "content",
+                })
+        except Exception as e2:
+            logger.exception("[/catalog] processed_files 폴백도 실패: %s", e2)
+            raise HTTPException(status_code=500, detail=str(e2))
+
+    logger.info(
+        "[/catalog] tenant=%s ids=%d names=%d → %d cards",
+        tenant_id, len(cleaned_ids), len(cleaned_names), len(out),
+    )
+    return {"response": out}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

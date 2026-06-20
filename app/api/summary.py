@@ -44,15 +44,33 @@ async def _resolve_file_id(tenant_id: str, file_name: str) -> Optional[str]:
             .execute
         )
         rows = result.data or []
-        if not rows:
-            return None
-        return rows[0].get("source_ref")
+        if rows:
+            return rows[0].get("source_ref")
     except Exception as e:
         logger.warning(
             "[summary] resolve file_id failed (tenant=%s, name=%s): %s",
             tenant_id, file_name, e,
         )
-        return None
+
+    # knowledge_files 부재/실패 → processed_files(file_id=storage path) 폴백.
+    try:
+        pf = await asyncio.to_thread(
+            supabase.table("processed_files")
+            .select("file_id")
+            .eq("tenant_id", tenant_id)
+            .eq("file_name", file_name)
+            .limit(1)
+            .execute
+        )
+        pf_rows = pf.data or []
+        if pf_rows:
+            return pf_rows[0].get("file_id")
+    except Exception as e2:
+        logger.warning(
+            "[summary] resolve file_id processed_files 폴백 실패 (tenant=%s, name=%s): %s",
+            tenant_id, file_name, e2,
+        )
+    return None
 
 
 @router.get("/summarize")

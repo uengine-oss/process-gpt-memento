@@ -226,6 +226,25 @@ async def save_to_storage(
         storage_file_path = upload_result["file_path"]
         print(f"[ingest:save-to-storage] uploaded path={storage_file_path}")
 
+        # knowledge_files 에 사전 등록(source_type='upload', source_ref=storage path).
+        # /catalog(list_documents) 는 knowledge_files 를 source_ref 로 조회하므로,
+        # 이 등록이 없으면 임베딩은 돼도 문서 목록에 안 잡힌다.
+        try:
+            from app.services.knowledge_files import (
+                register_uploaded_file as _register_uploaded_file,
+            )
+            await _register_uploaded_file(
+                tenant_id=tenant_id,
+                storage_path=storage_file_path,
+                file_name=file_name,
+                folder_path="files",
+                mime_type=getattr(file, "content_type", "") or "",
+                size_bytes=len(file_content),
+            )
+            print(f"[ingest:save-to-storage] knowledge_files registered source_ref={storage_file_path}")
+        except Exception as _reg_exc:
+            print(f"[ingest:save-to-storage] knowledge_files register skipped: {_reg_exc}")
+
         file_extension = Path(file_name).suffix.lower()
         image_extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]
         is_image = file_extension in image_extensions
@@ -264,6 +283,15 @@ async def save_to_storage(
             docs = await processor.load_document(file_io, file_name)
             if not docs:
                 raise HTTPException(status_code=400, detail="Failed to load document")
+
+            # 페이지 단위 본문을 document_pages 에 저장 → read_document_page/grep_in_document
+            # 도구가 file_name 으로 본문을 읽을 수 있게 한다(knowledge_admin 업로드와 동일 동작).
+            try:
+                from app.services.document_pages import post_load_hook as _post_load_hook
+                await _post_load_hook(tenant_id, storage_file_path, docs)
+                print(f"[ingest:save-to-storage] document_pages 저장 pages={len(docs)} file_id={storage_file_path}")
+            except Exception as _pg_exc:
+                print(f"[ingest:save-to-storage] document_pages 저장 skipped: {_pg_exc}")
 
             documents = await processor.process_documents(docs, {
                 "storage_type": "storage",
@@ -310,6 +338,21 @@ async def save_to_storage(
             }
 
         await rag.save_processed_files([storage_file_path], tenant_id, [file_name])
+
+        # 임베딩 완료 → knowledge_files 상태를 indexed 로 마킹(목록/카탈로그 노출).
+        try:
+            from app.services.knowledge_files import (
+                mark_status as _mark_status,
+                INDEX_STATUS_INDEXED as _INDEX_STATUS_INDEXED,
+            )
+            await _mark_status(
+                tenant_id=tenant_id,
+                source_type="upload",
+                source_ref=storage_file_path,
+                status=_INDEX_STATUS_INDEXED,
+            )
+        except Exception as _mk_exc:
+            print(f"[ingest:save-to-storage] knowledge_files mark indexed skipped: {_mk_exc}")
 
         return {
             "message": "File uploaded, processed, and stored successfully",
