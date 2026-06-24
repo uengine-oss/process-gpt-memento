@@ -211,3 +211,38 @@ def supabase_dummy_embedding_dimensions() -> int:
 
 def memento_drive_folder_id() -> str:
     return _env("MEMENTO_DRIVE_FOLDER_ID", MEMENTO_DRIVE_FOLDER_ID)
+
+
+def supabase_public_url() -> str:
+    """브라우저(외부)에서 접근 가능한 Supabase base URL.
+
+    내부망 배포 시 ``SUPABASE_URL`` 은 ``http://kong:8000`` 같은 컨테이너 내부
+    hostname 이라 브라우저가 접근 못 한다. 외부 노출용 URL 을 ``SUPABASE_PUBLIC_URL``
+    (또는 ``API_EXTERNAL_URL``) 로 지정한다.
+    """
+    return (os.getenv("SUPABASE_PUBLIC_URL", "") or os.getenv("API_EXTERNAL_URL", "") or "").strip()
+
+
+def rewrite_storage_public_host(url: str) -> str:
+    """Storage URL 의 내부 host(``SUPABASE_URL``) 를 외부 접근용 host 로 교체.
+
+    내부망 배포에서 supabase 클라이언트가 만든 signed/public URL 은
+    ``http://kong:8000/storage/v1/...`` 처럼 컨테이너 내부 hostname 을 박는다.
+    이 URL 을 그대로 브라우저로 내려보내면 다운로드가 안 되므로
+    ``SUPABASE_PUBLIC_URL`` (또는 ``API_EXTERNAL_URL``) prefix 로 교체한다.
+
+    예:
+      INTERNAL: http://kong:8000/storage/v1/object/sign/files/...
+      PUBLIC:   http://<hostip>:8088/storage/v1/object/sign/files/...
+
+    내부/외부 URL 중 한 쪽이 비었거나 같으면 (= 공개 도메인 운영) 원본 그대로 반환.
+    """
+    if not url:
+        return url
+    internal = (os.getenv("SUPABASE_URL", "") or "").strip().rstrip("/")
+    public = supabase_public_url().rstrip("/")
+    if not internal or not public or internal == public:
+        return url
+    if url.startswith(internal):
+        return public + url[len(internal):]
+    return url

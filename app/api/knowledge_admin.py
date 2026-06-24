@@ -519,6 +519,11 @@ async def get_knowledge_file_url(
                 public = supabase.storage.from_("files").get_public_url(source_ref)
                 url = public.get("publicURL") if isinstance(public, dict) else str(public)
 
+            # 2-1) 내부망 배포 — signed/public URL 의 internal kong host 를 외부 접근용으로 교체.
+            # (안 하면 브라우저가 http://kong:8000/... 을 못 열어 다운로드 실패)
+            from app.core.config import rewrite_storage_public_host
+            url = rewrite_storage_public_host(url)
+
             # 3) 원본 파일명을 Content-Disposition으로 강제 — Supabase storage가 download 쿼리를 해석함
             if url and file_name:
                 sep = "&" if "?" in url else "?"
