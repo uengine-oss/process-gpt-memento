@@ -371,6 +371,24 @@ async def list_documents(
         if drive_folder_id:
             rows = [r for r in rows if r.get("drive_folder_id") == drive_folder_id]
 
+        # doc_role 별 요약(abstract) 적용 여부 — glossary/template/dataset 은 요약 없음(skip).
+        _SUMMARY_SKIP_ROLES = {"glossary", "template", "dataset"}
+
+        def _summary_status(r: dict) -> str:
+            """파일별 요약 상태: skipped | done | failed | pending."""
+            role = (r.get("doc_role") or "content").strip().lower()
+            if role in _SUMMARY_SKIP_ROLES:
+                return "skipped"
+            card = r.get("doc_card") if isinstance(r.get("doc_card"), dict) else {}
+            st = card.get("abstract_status")
+            if st in ("done", "failed"):
+                return st
+            # 구버전 데이터(abstract_status 없음) 호환: abstract 유무로 추론.
+            if card.get("abstract"):
+                return "done"
+            # 인덱싱은 끝났는데 abstract 가 없으면 요약 실패로 간주(재요약 대상).
+            return "failed" if r.get("index_status") == "indexed" else "pending"
+
         file_names: List[str] = []
         file_details: List[dict] = []
         for r in rows:
@@ -402,6 +420,8 @@ async def list_documents(
                 "indexed_at": r.get("indexed_at"),
                 "updated_at": r.get("updated_at"),
                 "doc_role": r.get("doc_role") or "content",
+                # 요약 상태 (프론트 요약 인디케이터/재요약 버튼용)
+                "summary_status": _summary_status(r),
             })
 
         return {

@@ -527,6 +527,23 @@ async def document_page(
             "error": f"path '{path}' not found in tenant '{tenant_id}'",
         }
 
+    # 다운로드 핸들 — 출처 칩에서 원본 파일을 내려받게 source_type/source_ref/실제 file_name 동봉.
+    # (source_ref = drive: google file_id / upload: storage_path)
+    storage_type = ""
+    real_file_name = ""
+    try:
+        meta_resp = await asyncio.to_thread(
+            supabase.table("knowledge_files")
+            .select("source_type, file_name")
+            .eq("tenant_id", tenant_id).eq("source_ref", file_id)
+            .limit(1).execute
+        )
+        meta_row = (meta_resp.data or [{}])[0] if meta_resp.data else {}
+        storage_type = str(meta_row.get("source_type") or "")
+        real_file_name = str(meta_row.get("file_name") or "")
+    except Exception as e:  # noqa: BLE001 — 다운로드 핸들 조회 실패가 페이지 반환을 막지 않게
+        logger.warning("[/document/page] source meta lookup failed: %s", e)
+
     try:
         resp = await asyncio.to_thread(
             supabase.table("document_pages")
@@ -550,7 +567,13 @@ async def document_page(
         "[/document/page] tenant=%s file=%s req=%s → pages=%d",
         tenant_id, file_name, pages, len(out_pages),
     )
-    return {"file_name": file_name, "pages": out_pages}
+    return {
+        "file_name": real_file_name or file_name,
+        "file_id": file_id,
+        "source_ref": file_id,
+        "storage_type": storage_type,
+        "pages": out_pages,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

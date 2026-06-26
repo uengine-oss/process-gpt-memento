@@ -260,8 +260,11 @@ async def update_doc_card(
     abstract = await _generate_abstract(page_docs)
     n_pages = sum(1 for d in page_docs if _normalize_page_text(d.page_content or ""))
 
+    # 요약 성공/실패를 명시적으로 기록 — abstract 가 null 인 채 indexed 로 묻히지 않게
+    # (프론트 '요약 실패' 인디케이터 + '다시 요약' 버튼, 폴더카드 재생성 판정의 근거).
     card: Dict[str, Any] = {
         "abstract": abstract,
+        "abstract_status": "done" if abstract else "failed",
         "n_pages": n_pages,
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "generation_model": _resolve_generation_model(),

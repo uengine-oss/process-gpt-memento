@@ -957,7 +957,7 @@ async def list_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
                 "source_type, source_ref, file_name, folder_path, path, drive_folder_id, "
                 "mime_type, size_bytes, modified_time, owner, "
                 "uploaded_by_uid, uploaded_by_name, index_status, "
-                "index_error, indexed_at, updated_at, doc_role"
+                "index_error, indexed_at, updated_at, doc_role, doc_card"
             )
             .eq("tenant_id", tenant_id)
             .order("folder_path", desc=False)

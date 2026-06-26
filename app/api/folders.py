@@ -244,6 +244,40 @@ async def folders_tree(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GET /folders/card  — 단일 폴더 카드(요약/토픽/엔티티/메타). 폴더 선택 시 요약 패널용.
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/folders/card")
+async def folder_card(
+    tenant_id: str,
+    folder_path: str,
+    doc_role: Optional[str] = Query(default=None),
+):
+    """단일 폴더의 카드를 반환. 카드가 아직 없으면 ``card=null`` (graceful)."""
+    if not tenant_id or not folder_path:
+        raise HTTPException(status_code=400, detail="tenant_id, folder_path required")
+    fp = _norm(folder_path)
+    role = (doc_role or "content").strip().lower() or "content"
+    try:
+        resp = await asyncio.to_thread(
+            supabase.table("knowledge_folder_cards")
+            .select("card, built_at")
+            .eq("tenant_id", tenant_id)
+            .eq("doc_role", role)
+            .eq("folder_path", fp)
+            .limit(1)
+            .execute
+        )
+        rows = resp.data or []
+    except Exception as e:
+        logger.debug("[/folders/card] unavailable (table missing?): %s", e)
+        return {"folder_path": fp, "card": None}
+    card = rows[0].get("card") if rows else None
+    built_at = rows[0].get("built_at") if rows else None
+    return {"folder_path": fp, "card": card if isinstance(card, dict) else None, "built_at": built_at}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GET /folders/open
 # ─────────────────────────────────────────────────────────────────────────────
 

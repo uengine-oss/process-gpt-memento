@@ -461,6 +461,91 @@ async def reindex_knowledge_file(
     }
 
 
+@router.post("/knowledge/files/resummarize")
+async def resummarize_knowledge_file(
+    background_tasks: BackgroundTasks,
+    tenant_id: str = Form(...),
+    source_ref: str = Form(...),
+    source_type: str = Form("upload"),
+    requester_uid: Optional[str] = Form(None),
+):
+    """파일의 *요약(abstract)만* 재생성한다 — 재파싱·재임베딩 없이 저장된 페이지 재사용.
+
+    요약 실패(``doc_card.abstract_status='failed'``)한 파일의 '다시 요약' 버튼용. 완료 후
+    해당 폴더 카드도 재생성(요약이 폴더 카드의 입력이므로). 권한: 관리자 또는 업로더 본인.
+    """
+    from app.core.supabase_client import supabase
+    from app.services.knowledge_files import normalize_doc_role
+    from app.services.document_pages import update_doc_card
+    from langchain.schema import Document
+
+    entry = await get_entry(tenant_id, source_type, source_ref)
+    if not entry:
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+
+    is_admin = await _resolve_admin(requester_uid, tenant_id)
+    is_owner = bool(requester_uid) and str(entry.get("uploaded_by_uid") or "") == str(requester_uid)
+    if not (is_admin or is_owner):
+        raise HTTPException(status_code=403, detail="재요약 권한이 없습니다 (관리자 또는 업로더 본인).")
+
+    role = normalize_doc_role(entry.get("doc_role"))
+    if role in ("glossary", "template", "dataset"):
+        raise HTTPException(status_code=400, detail="이 분류는 요약을 생성하지 않습니다.")
+
+    # 저장된 페이지 재사용 (재파싱/재임베딩 없음)
+    try:
+        res = await asyncio.to_thread(
+            supabase.table("document_pages")
+            .select("page_number, content")
+            .eq("tenant_id", tenant_id)
+            .eq("file_id", source_ref)
+            .order("page_number", desc=False)
+            .execute
+        )
+        rows = list(res.data or [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"페이지 조회 실패: {e}")
+    if not rows:
+        raise HTTPException(status_code=409, detail="저장된 페이지가 없습니다. 먼저 재인덱싱하세요.")
+
+    page_docs = [
+        Document(page_content=(r.get("content") or ""), metadata={"page_number": r.get("page_number")})
+        for r in rows
+    ]
+    await update_doc_card(tenant_id, source_ref, page_docs)
+
+    # 요약은 폴더 카드의 입력 → 해당 폴더(+조상) 카드 재생성 (백그라운드, fire-and-forget)
+    folder_path = (entry.get("folder_path") or "").strip().strip("/")
+    if folder_path:
+        from app.services.folder_cards import rebuild_folders
+        background_tasks.add_task(rebuild_folders, tenant_id, [folder_path], role)
+
+    # 실제 요약 성공 여부 재확인 (doc_card 직접 조회)
+    summarized = False
+    abstract_status = "failed"
+    try:
+        chk = await asyncio.to_thread(
+            supabase.table("knowledge_files")
+            .select("doc_card")
+            .eq("tenant_id", tenant_id)
+            .eq("source_ref", source_ref)
+            .limit(1)
+            .execute
+        )
+        card = ((chk.data or [{}])[0] or {}).get("doc_card") or {}
+        if isinstance(card, dict):
+            summarized = bool(card.get("abstract"))
+            abstract_status = card.get("abstract_status") or ("done" if summarized else "failed")
+    except Exception as e:
+        logger.warning("[knowledge_admin] resummarize verify failed: %s", e)
+
+    return {
+        "source_ref": source_ref,
+        "summarized": summarized,
+        "abstract_status": abstract_status,
+    }
+
+
 @router.get("/knowledge/files/url")
 async def get_knowledge_file_url(
     tenant_id: str = Query(...),
