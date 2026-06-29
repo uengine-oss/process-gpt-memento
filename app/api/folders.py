@@ -138,10 +138,56 @@ def _card_brief(card: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 # GET /folders/tree
 # ─────────────────────────────────────────────────────────────────────────────
 
+# source_ref IN 배치 크기 — 폴더 통째 선택 시 file_id 가 수천 개일 수 있어
+# GET URL 길이 / PostgREST 한도를 넘지 않게 나눠 조회한다.
+_IN_CHUNK = 150
+
+
+async def _fetch_kf_by_refs(
+    tenant_id: str,
+    select_cols: str,
+    refs: List[str],
+    *,
+    doc_role: Optional[str] = None,
+    folder_eq: Optional[str] = None,
+    folder_like: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """source_ref 화이트리스트로 knowledge_files 조회 (IN 청크 배치).
+
+    ★ 보안 경계 — refs(사용자가 선택한 file_id=source_ref) 밖의 자료는 절대 포함되지 않는다.
+    refs 가 크면 _IN_CHUNK 단위로 나눠 여러 번 조회 후 합친다.
+    """
+    refs = [str(x) for x in refs if x]
+    if not refs:
+        return []
+    out: List[Dict[str, Any]] = []
+    for i in range(0, len(refs), _IN_CHUNK):
+        chunk = refs[i:i + _IN_CHUNK]
+        q = (
+            supabase.table("knowledge_files")
+            .select(select_cols)
+            .eq("tenant_id", tenant_id)
+            .in_("source_ref", chunk)
+        )
+        if doc_role:
+            q = q.eq("doc_role", doc_role)
+        if folder_eq is not None:
+            q = q.eq("folder_path", folder_eq)
+        if folder_like is not None:
+            q = q.like("folder_path", folder_like)
+        if limit is not None:
+            q = q.limit(limit)
+        r = await asyncio.to_thread(q.execute)
+        out.extend(r.data or [])
+    return out
+
+
 @router.get("/folders/tree")
 async def folders_tree(
     tenant_id: str,
     roots: Optional[List[str]] = Query(default=None),
+    file_ids: Optional[List[str]] = Query(default=None),
     doc_role: Optional[str] = Query(default=None),
     depth: int = Query(default=_DEFAULT_TREE_DEPTH, ge=1, le=_MAX_TREE_DEPTH),
 ):
@@ -161,21 +207,28 @@ async def folders_tree(
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id required")
 
+    # ★ 보안 경계 — file_ids(=선택 source_ref) 가 오면 그 화이트리스트 안에서만 트리를 짠다.
+    #   (없으면 레거시/직접호출 하위호환으로 tenant 전체. deepagents 는 항상 보내고 빈 선택은 먼저 거부.)
+    allow = [str(x) for x in (file_ids or []) if x]
     try:
-        q = (
-            supabase.table("knowledge_files")
-            .select("file_name, folder_path, doc_card, doc_role")
-            .eq("tenant_id", tenant_id)
-        )
-        if doc_role:
-            q = q.eq("doc_role", doc_role)
-        resp = await asyncio.to_thread(q.limit(_TREE_FETCH_LIMIT).execute)
-        rows = resp.data or []
+        if allow:
+            rows = await _fetch_kf_by_refs(
+                tenant_id, "file_name, folder_path, doc_card, doc_role", allow, doc_role=doc_role
+            )
+        else:
+            q = (
+                supabase.table("knowledge_files")
+                .select("file_name, folder_path, doc_card, doc_role")
+                .eq("tenant_id", tenant_id)
+            )
+            if doc_role:
+                q = q.eq("doc_role", doc_role)
+            rows = (await asyncio.to_thread(q.limit(_TREE_FETCH_LIMIT).execute)).data or []
     except Exception as e:
         logger.exception("[/folders/tree] query failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    truncated = len(rows) >= _TREE_FETCH_LIMIT
+    truncated = (not allow) and len(rows) >= _TREE_FETCH_LIMIT
 
     # 집계 구조 빌드
     files_by_folder: Dict[str, List[Dict[str, Any]]] = {}
@@ -285,6 +338,7 @@ async def folder_card(
 async def folders_open(
     tenant_id: str,
     folder_path: str,
+    file_ids: Optional[List[str]] = Query(default=None),
     doc_role: Optional[str] = Query(default=None),
 ):
     """한 폴더의 직속 자식 — 하위폴더(카드 요약) + 문서(abstract) — 반환.
@@ -306,32 +360,46 @@ async def folders_open(
     if not fp:
         raise HTTPException(status_code=400, detail="folder_path empty")
 
+    # ★ 보안 경계 — file_ids(=선택 source_ref) 가 오면 그 화이트리스트 안의 문서/폴더만 노출.
+    allow = [str(x) for x in (file_ids or []) if x]
+
     # 직속 문서 (정확히 이 폴더)
     try:
-        eq = (
-            supabase.table("knowledge_files")
-            .select("file_name, folder_path, path, doc_card, doc_role, mime_type")
-            .eq("tenant_id", tenant_id)
-            .eq("folder_path", fp)
-        )
-        if doc_role:
-            eq = eq.eq("doc_role", doc_role)
-        direct_rows = (await asyncio.to_thread(eq.execute)).data or []
+        if allow:
+            direct_rows = await _fetch_kf_by_refs(
+                tenant_id, "file_name, folder_path, path, doc_card, doc_role, mime_type",
+                allow, doc_role=doc_role, folder_eq=fp,
+            )
+        else:
+            eq = (
+                supabase.table("knowledge_files")
+                .select("file_name, folder_path, path, doc_card, doc_role, mime_type")
+                .eq("tenant_id", tenant_id)
+                .eq("folder_path", fp)
+            )
+            if doc_role:
+                eq = eq.eq("doc_role", doc_role)
+            direct_rows = (await asyncio.to_thread(eq.execute)).data or []
     except Exception as e:
         logger.exception("[/folders/open] direct query failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
     # 하위 (descendant) — 하위폴더 집계용
     try:
-        cq = (
-            supabase.table("knowledge_files")
-            .select("folder_path")
-            .eq("tenant_id", tenant_id)
-            .like("folder_path", f"{fp}/%")
-        )
-        if doc_role:
-            cq = cq.eq("doc_role", doc_role)
-        desc_rows = (await asyncio.to_thread(cq.limit(_TREE_FETCH_LIMIT).execute)).data or []
+        if allow:
+            desc_rows = await _fetch_kf_by_refs(
+                tenant_id, "folder_path", allow, doc_role=doc_role, folder_like=f"{fp}/%",
+            )
+        else:
+            cq = (
+                supabase.table("knowledge_files")
+                .select("folder_path")
+                .eq("tenant_id", tenant_id)
+                .like("folder_path", f"{fp}/%")
+            )
+            if doc_role:
+                cq = cq.eq("doc_role", doc_role)
+            desc_rows = (await asyncio.to_thread(cq.limit(_TREE_FETCH_LIMIT).execute)).data or []
     except Exception as e:
         logger.exception("[/folders/open] descendant query failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))

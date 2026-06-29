@@ -331,6 +331,7 @@ async def document_grep(
     tenant_id: str,
     path: str,
     pattern: str,
+    file_ids: Optional[List[str]] = Query(default=None),
     regex: bool = Query(default=False),
     case_sensitive: bool = Query(default=False),
     context_lines: int = Query(default=0, ge=0, le=_GREP_MAX_CONTEXT_LINES),
@@ -360,6 +361,15 @@ async def document_grep(
             "total_matches": 0,
             "truncated": False,
             "error": f"path '{path}' not found in tenant '{tenant_id}'",
+        }
+    # ★ 보안 경계 — 선택 화이트리스트(file_ids=source_ref) 밖이면 본문 조회 거부.
+    _allow = [str(x) for x in (file_ids or []) if x]
+    if _allow and file_id not in _allow:
+        return {
+            "response": [],
+            "total_matches": 0,
+            "truncated": False,
+            "error": f"path '{path}' 는 선택한 자료 범위 밖입니다.",
         }
     file_name = path  # 표시/인용용 (페이지 조회는 file_id 기준)
 
@@ -491,6 +501,7 @@ async def document_page(
     tenant_id: str,
     path: str,
     pages: str,
+    file_ids: Optional[List[str]] = Query(default=None),
 ):
     """페이지 범위 본문 반환.
 
@@ -525,6 +536,14 @@ async def document_page(
             "file_name": file_name,
             "pages": [],
             "error": f"path '{path}' not found in tenant '{tenant_id}'",
+        }
+    # ★ 보안 경계 — 선택 화이트리스트(file_ids=source_ref) 밖이면 본문 조회 거부.
+    _allow = [str(x) for x in (file_ids or []) if x]
+    if _allow and file_id not in _allow:
+        return {
+            "file_name": file_name,
+            "pages": [],
+            "error": f"path '{path}' 는 선택한 자료 범위 밖입니다.",
         }
 
     # 다운로드 핸들 — 출처 칩에서 원본 파일을 내려받게 source_type/source_ref/실제 file_name 동봉.
