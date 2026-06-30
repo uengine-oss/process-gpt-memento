@@ -17,9 +17,11 @@ from app.services.knowledge_files import (
     INDEX_STATUS_PROCESSING,
     create_folder as kf_create_folder,
     delete_entry,
+    delete_entries_bulk,
     delete_folder_meta,
     find_by_hash,
     get_entry,
+    grant_folder_permission,
     list_files_in_folder_recursive,
     list_folders_for_tenant,
     mark_status,
@@ -370,6 +372,8 @@ async def upload_knowledge_file(
                 )
             except Exception as _e:
                 logger.warning("[knowledge_admin] folder register failed (%s): %s", "/".join(_acc), _e)
+        # 업로더 본인에게 업로드 대상 폴더 조회 권한 자동 부여 (leaf 만 — 조상은 트리에서 합성됨).
+        await grant_folder_permission(tenant_id, uploaded_by_uid, _fp)
 
     # 3) 콘텐츠 추출 + RAG 인덱싱 (upload/reindex 공용 헬퍼)
     indexing_error = await _index_uploaded_file(
@@ -701,6 +705,7 @@ async def create_knowledge_folder(
     tenant_id: str = Form(...),
     folder_path: str = Form(...),
     doc_role: Optional[str] = Form(None),
+    requester_uid: Optional[str] = Form(None),
 ):
     """빈 폴더 생성 (knowledge_folders에 row 추가). doc_role 미지정 시 'content'."""
     folder_path = (folder_path or "").strip().strip("/")
@@ -709,6 +714,8 @@ async def create_knowledge_folder(
     ok = await kf_create_folder(
         tenant_id=tenant_id, folder_path=folder_path, doc_role=doc_role
     )
+    # 생성자 본인에게 조회 권한 자동 부여 — 새로고침 후 본인이 만든 폴더가 안 보이던 결함 방지.
+    await grant_folder_permission(tenant_id, requester_uid, folder_path)
     return {"ok": ok, "folder_path": folder_path}
 
 
@@ -787,19 +794,15 @@ async def delete_knowledge_folder(
         source_type="upload",
         doc_role=doc_role,
     )
-    deleted = 0
+    # 파일별 delete_entry 루프(파일당 풀스캔 N회)는 대량 폴더에서 폭발 → 집합 기반 일괄 삭제로 대체.
+    entries = [
+        {"source_type": r.get("source_type") or "upload", "source_ref": r.get("source_ref") or ""}
+        for r in rows
+        if r.get("source_ref")
+    ]
+    bulk = await delete_entries_bulk(tenant_id=tenant_id, entries=entries)
+    deleted = bulk.get("total", len(entries))
     failed = 0
-    for r in rows:
-        try:
-            await delete_entry(
-                tenant_id=tenant_id,
-                source_type=r.get("source_type") or "upload",
-                source_ref=r.get("source_ref") or "",
-            )
-            deleted += 1
-        except Exception as e:
-            logger.warning("delete folder file failed (%s): %s", r.get("source_ref"), e)
-            failed += 1
 
     # knowledge_folders 메타 row도 정리 (빈 폴더 + 자식 폴더, role scope)
     await delete_folder_meta(tenant_id=tenant_id, folder_path=folder_path, doc_role=doc_role)

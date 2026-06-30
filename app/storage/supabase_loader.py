@@ -100,7 +100,10 @@ class SupabaseStorageLoader:
             # Get public URL
             public_url_response = self.supabase.storage.from_("files").get_public_url(full_path)
             public_url = public_url_response.get('publicURL', '') if isinstance(public_url_response, dict) else str(public_url_response)
-            
+            # 내부망 배포: kong:8000 등 내부 host 를 외부 접근용으로 교체 (브라우저 다운로드용).
+            from app.core.config import rewrite_storage_public_host
+            public_url = rewrite_storage_public_host(public_url)
+
             return {
                 'file_id': response.path,
                 'file_name': image_name,
@@ -153,7 +156,10 @@ class SupabaseStorageLoader:
             # Get public URL
             public_url_response = self.supabase.storage.from_("files").get_public_url(full_path)
             public_url = public_url_response.get('publicURL', '') if isinstance(public_url_response, dict) else str(public_url_response)
-            
+            # 내부망 배포: kong:8000 등 내부 host 를 외부 접근용으로 교체 (브라우저 다운로드용).
+            from app.core.config import rewrite_storage_public_host
+            public_url = rewrite_storage_public_host(public_url)
+
             return {
                 'file_path': full_path,
                 'file_name': file_name,

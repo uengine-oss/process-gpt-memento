@@ -375,16 +375,19 @@ async def list_documents(
         _SUMMARY_SKIP_ROLES = {"glossary", "template", "dataset"}
 
         def _summary_status(r: dict) -> str:
-            """파일별 요약 상태: skipped | done | failed | pending."""
+            """파일별 요약 상태: skipped | done | failed | pending.
+
+            list_for_tenant 가 doc_card 에서 abstract_status/abstract 를 평탄화해 주므로
+            여기서는 그 평탄 필드를 직접 읽는다.
+            """
             role = (r.get("doc_role") or "content").strip().lower()
             if role in _SUMMARY_SKIP_ROLES:
                 return "skipped"
-            card = r.get("doc_card") if isinstance(r.get("doc_card"), dict) else {}
-            st = card.get("abstract_status")
+            st = r.get("abstract_status")
             if st in ("done", "failed"):
                 return st
             # 구버전 데이터(abstract_status 없음) 호환: abstract 유무로 추론.
-            if card.get("abstract"):
+            if r.get("abstract"):
                 return "done"
             # 인덱싱은 끝났는데 abstract 가 없으면 요약 실패로 간주(재요약 대상).
             return "failed" if r.get("index_status") == "indexed" else "pending"
@@ -798,6 +801,8 @@ async def preview_pdf_highlight(
                 public_url_resp.get("publicURL", "")
                 if isinstance(public_url_resp, dict) else str(public_url_resp)
             )
+            from app.core.config import rewrite_storage_public_host
+            cached_url = rewrite_storage_public_host(cached_url)
             if cached_url:
                 return {
                     "url": cached_url,
@@ -859,6 +864,8 @@ async def preview_pdf_highlight(
         public_url_resp.get("publicURL", "")
         if isinstance(public_url_resp, dict) else str(public_url_resp)
     )
+    from app.core.config import rewrite_storage_public_host
+    public_url = rewrite_storage_public_host(public_url)
     return {
         "url": public_url,
         "cache_key": cache_key,

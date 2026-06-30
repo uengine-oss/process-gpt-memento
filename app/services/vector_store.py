@@ -20,6 +20,20 @@ load_dotenv()
 
 PRIMITIVE_METADATA_TYPES = (str, int, float, bool)
 
+# Chroma 는 로컬 PersistentClient(SQLite 백엔드)라 여러 스레드에서 *동시 쓰기* 하면
+# "database is locked" 등 충돌 위험이 있다. 임베딩/삽입을 to_thread 로 오프로드하면서
+# 동시 인덱싱이 가능해졌으므로, Chroma *쓰기* 구간만 이 락으로 직렬화한다.
+# (락 획득은 async — 이벤트 루프는 막지 않고, 실제 작업은 to_thread 안에서 돈다.
+#  읽기(similarity_search)는 동시 허용 — 직렬화하지 않는다.)
+_chroma_write_lock: Optional["asyncio.Lock"] = None
+
+
+def _get_chroma_write_lock() -> "asyncio.Lock":
+    global _chroma_write_lock
+    if _chroma_write_lock is None:
+        _chroma_write_lock = asyncio.Lock()
+    return _chroma_write_lock
+
 def _normalize_filename(value: Any) -> Any:
     if not isinstance(value, str):
         return value
@@ -110,7 +124,9 @@ class VectorStoreManager:
             texts = [doc.page_content or "" for doc in processed_documents]
             metadatas = [doc.metadata for doc in processed_documents]
             _emb_t0 = _time.perf_counter()
-            embeddings = self._embed_texts(texts)
+            # 임베딩은 동기 HTTP/GPU 호출이라 이벤트 루프에서 직접 돌리면 인덱싱 내내
+            # 다른 모든 요청(폴더 조회 등)이 멈춘다 → 워커 스레드로 오프로드해 루프를 비운다.
+            embeddings = await asyncio.to_thread(self._embed_texts, texts)
             print(
                 f"[vector_store] embeddings done: count={len(embeddings)} "
                 f"elapsed={int((_time.perf_counter()-_emb_t0)*1000)}ms"
@@ -128,18 +144,22 @@ class VectorStoreManager:
             batch_count = (total - 1) // batch_size + 1 if total else 0
             for bi, start in enumerate(range(0, total, batch_size), start=1):
                 end = start + batch_size
-                self._insert_source_documents_batch(
+                # Supabase insert / Chroma upsert 모두 동기 I/O — 루프 블로킹 방지로 스레드 오프로드.
+                await asyncio.to_thread(
+                    self._insert_source_documents_batch,
                     row_ids=row_ids[start:end],
                     texts=texts[start:end],
                     metadatas=metadatas[start:end],
                     embeddings=embeddings[start:end],
                 )
-                self._upsert_chroma_documents_batch(
-                    row_ids=row_ids[start:end],
-                    texts=texts[start:end],
-                    metadatas=metadatas[start:end],
-                    embeddings=embeddings[start:end],
-                )
+                async with _get_chroma_write_lock():
+                    await asyncio.to_thread(
+                        self._upsert_chroma_documents_batch,
+                        row_ids=row_ids[start:end],
+                        texts=texts[start:end],
+                        metadatas=metadatas[start:end],
+                        embeddings=embeddings[start:end],
+                    )
                 print(f"Saved batch {bi}/{batch_count} ({min(end, total) - start} docs)")
             print(
                 f"[vector_store] add_documents done: total={total} "
@@ -360,7 +380,10 @@ class VectorStoreManager:
 
                     if analysis_text and image_id not in saved_embedding_ids:
                         try:
-                            image_embedding = self.embeddings.embed_query(analysis_text)
+                            # 동기 임베딩 호출 — 루프 블로킹 방지로 스레드 오프로드.
+                            image_embedding = await asyncio.to_thread(
+                                self.embeddings.embed_query, analysis_text
+                            )
                             saved_embedding_ids.add(image_id)
 
                             image_document_row_id = str(uuid.uuid4())
@@ -380,18 +403,21 @@ class VectorStoreManager:
                                 ),
                                 "image_url": image_info.get("image_url", ""),
                             }
-                            self._insert_source_document(
+                            await asyncio.to_thread(
+                                self._insert_source_document,
                                 document_row_id=image_document_row_id,
                                 text=analysis_text,
                                 metadata=image_metadata,
                                 embedding=image_embedding,
                             )
-                            self._upsert_chroma_document(
-                                document_row_id=image_document_row_id,
-                                text=analysis_text,
-                                metadata=image_metadata,
-                                embedding=image_embedding,
-                            )
+                            async with _get_chroma_write_lock():
+                                await asyncio.to_thread(
+                                    self._upsert_chroma_document,
+                                    document_row_id=image_document_row_id,
+                                    text=analysis_text,
+                                    metadata=image_metadata,
+                                    embedding=image_embedding,
+                                )
                         except Exception as e:
                             print(f"Error generating embedding for image {image_id}: {e}")
 
@@ -403,7 +429,9 @@ class VectorStoreManager:
                         "image_url": image_info.get("image_url", ""),
                         "metadata": image_info.get("metadata", {}),
                     }
-                    self.supabase.table("document_images").insert(image_data).execute()
+                    await asyncio.to_thread(
+                        self.supabase.table("document_images").insert(image_data).execute
+                    )
                     total_images_saved += 1
 
             if total_images_saved:

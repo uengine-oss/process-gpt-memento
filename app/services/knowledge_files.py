@@ -487,6 +487,215 @@ async def delete_entry(
     return result
 
 
+def _chunked(seq: List[Any], size: int) -> List[List[Any]]:
+    """리스트를 size 단위 배치로 분할."""
+    return [seq[i:i + size] for i in range(0, len(seq), size)]
+
+
+async def delete_entries_bulk(
+    tenant_id: str,
+    entries: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """여러 파일을 *집합(set) 기반*으로 한 번에 삭제 — 폴더 삭제용 고속 경로.
+
+    delete_entry 를 파일마다 호출하면 파일당 4~5회의 풀스캔/round-trip 이 N번 쌓여
+    폴더 삭제가 폭발한다. 이 함수는 동일한 정리 대상(1~9단계)을 file_id/청크 id 리스트에
+    대한 IN 절 배치로 묶어 호출 수를 자릿수 단위로 줄인다.
+    (성능은 sql/perf_knowledge_indexes.sql 의 인덱스가 깔려 있어야 제대로 난다.)
+
+    Args:
+        entries: [{"source_type": ..., "source_ref": ...}, ...]
+    Returns:
+        {"total", "chunk_count", "image_doc_count", 단계별 ok 플래그}
+    """
+    # source_ref 중복 제거 + upload 분리(스토리지 원본은 upload 만 존재)
+    refs: List[str] = []
+    seen: set[str] = set()
+    upload_refs: List[str] = []
+    for e in entries:
+        ref = (e.get("source_ref") or "").strip()
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        refs.append(ref)
+        if (e.get("source_type") or "upload") == "upload":
+            upload_refs.append(ref)
+
+    result: Dict[str, Any] = {
+        "total": len(refs),
+        "chunk_count": 0,
+        "image_doc_count": 0,
+        "documents_deleted": False,
+        "image_analysis_documents_deleted": False,
+        "chroma_deleted": False,
+        "document_images_deleted": False,
+        "pages_deleted": False,
+        "processed_files_deleted": False,
+        "storage_deleted": False,
+        "knowledge_rows_deleted": False,
+    }
+    if not refs:
+        return result
+
+    _REF_BATCH = 200   # PostgREST URL 길이 대비 IN 절 배치
+    _ID_BATCH = 200
+    _CHROMA_BATCH = 256
+
+    # 0a. 청크 id 수집 (file_id IN refs) — image-분석/이미지메타 삭제의 FK
+    chunk_ids: List[str] = []
+    for batch in _chunked(refs, _REF_BATCH):
+        try:
+            resp = await asyncio.to_thread(
+                supabase.table("documents")
+                .select("id")
+                .eq("metadata->>tenant_id", tenant_id)
+                .in_("metadata->>file_id", batch)
+                .execute
+            )
+            chunk_ids.extend(str(r.get("id")) for r in (resp.data or []) if r.get("id"))
+        except Exception as e:
+            logger.warning("[knowledge_files] bulk collect chunk ids failed: %s", e)
+    result["chunk_count"] = len(chunk_ids)
+
+    # 0b. 이미지-분석 documents id 수집 (document_id ∈ chunk_ids)
+    image_doc_ids: List[str] = []
+    for batch in _chunked(chunk_ids, _ID_BATCH):
+        try:
+            resp = await asyncio.to_thread(
+                supabase.table("documents")
+                .select("id")
+                .eq("metadata->>type", "image_analysis")
+                .in_("metadata->>document_id", batch)
+                .execute
+            )
+            image_doc_ids.extend(str(r.get("id")) for r in (resp.data or []) if r.get("id"))
+        except Exception as e:
+            logger.warning("[knowledge_files] bulk collect image-analysis ids failed: %s", e)
+    result["image_doc_count"] = len(image_doc_ids)
+
+    # 1. Chroma 임베딩 삭제 (file_id $in 배치 + 이미지-분석은 id 로)
+    try:
+        from app.services.vector_store import get_vector_store
+        vsm = get_vector_store()
+        for batch in _chunked(refs, _CHROMA_BATCH):
+            await asyncio.to_thread(
+                vsm.collection.delete,
+                where={"$and": [
+                    {"tenant_id": tenant_id},
+                    {"file_id": {"$in": batch}},
+                ]},
+            )
+        for batch in _chunked(image_doc_ids, 500):
+            await asyncio.to_thread(vsm.collection.delete, ids=batch)
+        result["chroma_deleted"] = True
+    except Exception as e:
+        logger.warning("[knowledge_files] bulk delete Chroma embeddings failed: %s", e)
+
+    # 2. document_images 메타 삭제 (document_id ∈ chunk_ids)
+    try:
+        for batch in _chunked(chunk_ids, _ID_BATCH):
+            await asyncio.to_thread(
+                supabase.table("document_images").delete().in_("document_id", batch).execute
+            )
+        result["document_images_deleted"] = True
+    except Exception as e:
+        logger.warning("[knowledge_files] bulk delete document_images failed: %s", e)
+
+    # 3. documents 청크 본문 삭제 (file_id IN refs)
+    try:
+        for batch in _chunked(refs, _REF_BATCH):
+            await asyncio.to_thread(
+                supabase.table("documents")
+                .delete()
+                .eq("metadata->>tenant_id", tenant_id)
+                .in_("metadata->>file_id", batch)
+                .execute
+            )
+        result["documents_deleted"] = True
+    except Exception as e:
+        logger.warning("[knowledge_files] bulk delete documents (chunks) failed: %s", e)
+
+    # 3b. documents 이미지-분석 본문 삭제 (id 로)
+    try:
+        for batch in _chunked(image_doc_ids, _ID_BATCH):
+            await asyncio.to_thread(
+                supabase.table("documents").delete().in_("id", batch).execute
+            )
+        result["image_analysis_documents_deleted"] = True
+    except Exception as e:
+        logger.warning("[knowledge_files] bulk delete image-analysis documents failed: %s", e)
+
+    # 4. document_pages 삭제 (file_id IN refs — 실제 컬럼)
+    try:
+        for batch in _chunked(refs, _REF_BATCH):
+            await asyncio.to_thread(
+                supabase.table("document_pages")
+                .delete()
+                .eq("tenant_id", tenant_id)
+                .in_("file_id", batch)
+                .execute
+            )
+        result["pages_deleted"] = True
+    except Exception as e:
+        logger.warning("[knowledge_files] bulk delete document_pages failed: %s", e)
+
+    # 5. processed_files 삭제 (file_id IN refs — 실제 컬럼)
+    try:
+        for batch in _chunked(refs, _REF_BATCH):
+            await asyncio.to_thread(
+                supabase.table("processed_files")
+                .delete()
+                .eq("tenant_id", tenant_id)
+                .in_("file_id", batch)
+                .execute
+            )
+        result["processed_files_deleted"] = True
+    except Exception as e:
+        logger.warning("[knowledge_files] bulk delete processed_files failed: %s", e)
+
+    # 6. Storage — 'files' 버킷 원본(upload) + extracted_images 폴더
+    try:
+        for batch in _chunked(upload_refs, 100):
+            if batch:
+                await asyncio.to_thread(supabase.storage.from_("files").remove, batch)
+        for ref in upload_refs:
+            try:
+                folder = f"extracted_images/{tenant_id}/{ref}"
+                objects = await asyncio.to_thread(supabase.storage.from_("files").list, folder)
+                paths = [
+                    f"{folder}/{obj['name']}"
+                    for obj in (objects or [])
+                    if isinstance(obj, dict) and obj.get("name")
+                ]
+                for pbatch in _chunked(paths, 100):
+                    await asyncio.to_thread(supabase.storage.from_("files").remove, pbatch)
+            except Exception as e:
+                logger.warning("[knowledge_files] bulk delete extracted_images (%s) failed: %s", ref, e)
+        result["storage_deleted"] = True
+    except Exception as e:
+        logger.warning("[knowledge_files] bulk delete storage failed: %s", e)
+
+    # 7. knowledge_files row 삭제 (source_ref IN refs)
+    try:
+        for batch in _chunked(refs, _REF_BATCH):
+            await asyncio.to_thread(
+                supabase.table("knowledge_files")
+                .delete()
+                .eq("tenant_id", tenant_id)
+                .in_("source_ref", batch)
+                .execute
+            )
+        result["knowledge_rows_deleted"] = True
+    except Exception as e:
+        logger.warning("[knowledge_files] bulk delete knowledge_files rows failed: %s", e)
+
+    logger.info(
+        "[knowledge_files] delete_entries_bulk tenant=%s files=%d chunks=%d : %s",
+        tenant_id, len(refs), len(chunk_ids), result,
+    )
+    return result
+
+
 async def _update_documents_file_id(
     tenant_id: str, old_file_id: str, new_file_id: str
 ) -> None:
@@ -776,6 +985,32 @@ async def create_folder(tenant_id: str, folder_path: str, doc_role: Optional[str
         return False
 
 
+async def grant_folder_permission(
+    tenant_id: str, user_id: Optional[str], folder_path: str
+) -> None:
+    """폴더 생성/업로드 시 *생성자 본인* 에게 조회 권한을 자동 부여한다.
+
+    배경: 폴더 조회 권한(folder_permissions)은 관리자가 부여하는데, 일반 사용자가
+    직접 만든/올린 폴더는 권한이 없어 새로고침하면 본인에게도 안 보이던 결함이 있었다.
+    생성 시점에 본인 권한을 1행 자동 upsert 해 "내가 만든 건 내가 본다"를 보장한다.
+    (멱등 upsert. 관리자는 어차피 전체 조회라 무해. 서비스롤이라 RLS 영향 없음.)
+    """
+    fp = (folder_path or "").strip().strip("/")
+    if not tenant_id or not user_id or not fp:
+        return
+    try:
+        await asyncio.to_thread(
+            supabase.table("folder_permissions")
+            .upsert(
+                {"tenant_id": tenant_id, "user_id": user_id, "folder_path": fp},
+                on_conflict="tenant_id,user_id,folder_path",
+            )
+            .execute
+        )
+    except Exception as e:
+        logger.warning("[knowledge_files] grant_folder_permission failed (%s/%s): %s", user_id, fp, e)
+
+
 async def rename_folder_meta(
     tenant_id: str,
     old_path: str,
@@ -949,7 +1184,12 @@ async def list_by_role(
 
 
 async def list_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
-    """프론트 picker용 — 테넌트의 모든 knowledge_files row 반환."""
+    """프론트 picker용 — 테넌트의 모든 knowledge_files row 반환.
+
+    성능: doc_card 전체(요약/키포인트/TOC 등 무거운 JSON)를 끌어오면 5천+ row에서
+    DB→백엔드 전송이 폭발한다. 목록은 요약 *상태* 만 필요하므로 doc_card 에서
+    abstract_status / abstract 두 필드만 평탄화해 조회한다.
+    """
     try:
         result = await asyncio.to_thread(
             supabase.table("knowledge_files")
@@ -957,7 +1197,8 @@ async def list_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
                 "source_type, source_ref, file_name, folder_path, path, drive_folder_id, "
                 "mime_type, size_bytes, modified_time, owner, "
                 "uploaded_by_uid, uploaded_by_name, index_status, "
-                "index_error, indexed_at, updated_at, doc_role, doc_card"
+                "index_error, indexed_at, updated_at, doc_role, "
+                "abstract_status:doc_card->>abstract_status, abstract:doc_card->>abstract"
             )
             .eq("tenant_id", tenant_id)
             .order("folder_path", desc=False)
