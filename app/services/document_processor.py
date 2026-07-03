@@ -269,9 +269,19 @@ class DocumentProcessor:
 
             if documents is not None:
                 pass
-            elif file_extension == '.txt':
+            elif file_extension in (
+                '.txt', '.json', '.md', '.markdown', '.yaml', '.yml',
+                '.xml', '.html', '.htm', '.csv', '.tsv', '.log', '.ini',
+                '.toml', '.env', '.js', '.ts', '.jsx', '.tsx', '.py',
+                '.java', '.go', '.rs', '.sql', '.sh', '.c', '.cpp', '.h',
+            ):
+                # 텍스트 계열: 그대로 UTF-8 디코드하여 문서로 취급 (JSON/MD/코드 등)
                 content = await asyncio.to_thread(file_content.read)
-                content = content.decode('utf-8-sig')
+                if isinstance(content, bytes):
+                    try:
+                        content = content.decode('utf-8-sig')
+                    except UnicodeDecodeError:
+                        content = content.decode('utf-8', errors='replace')
                 documents = [Document(page_content=content)]
             elif file_extension == '.docx':
                 # Save BytesIO to temporary file
