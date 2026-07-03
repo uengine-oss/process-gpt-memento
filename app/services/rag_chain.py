@@ -10,6 +10,41 @@ from app.plugins.retrievers import get_retriever
 
 load_dotenv(override=True)
 
+import logging as _logging
+_logger = _logging.getLogger(__name__)
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+# ── 비전(이미지 분석) 안전장치 설정 ──────────────────────────────────────────
+# 이미지 분석은 문서당 이미지 수만큼 vision LLM 을 호출한다. 동시성을 올리면 빨라지지만
+# 비전 서버 과부하 위험 → (1) 프로세스 *전역* in-flight 상한 세마포어로 총량을 묶고,
+# (2) 개별 이미지 실패는 transient 면 백오프 재시도, 최종 실패는 스킵하되 로그로 표면화한다.
+# (여러 파일이 동시에 인덱싱돼도 비전 서버로 나가는 총 동시요청은 _VISION_MAX_INFLIGHT 이하)
+_VISION_MAX_INFLIGHT = _int_env("MEMENTO_VISION_MAX_INFLIGHT", 8)   # 전역 총 동시 호출 상한
+_VISION_RETRIES = _int_env("MEMENTO_VISION_MAX_RETRIES", 2)         # 개별 이미지 transient 재시도
+_vision_sem: Optional["asyncio.Semaphore"] = None
+
+
+def _get_vision_sem() -> "asyncio.Semaphore":
+    global _vision_sem
+    if _vision_sem is None:
+        _vision_sem = asyncio.Semaphore(_VISION_MAX_INFLIGHT)
+    return _vision_sem
+
+
+def _is_transient_err(msg: str) -> bool:
+    m = (msg or "").lower()
+    return any(k in m for k in (
+        "429", "rate limit", "too many requests", "timeout", "timed out",
+        "502", "503", "504", "connection", "econnreset", "temporarily", "overload", "424",
+    ))
+
 
 class RAGChain:
     def __init__(self):
@@ -468,31 +503,36 @@ class RAGChain:
     async def analyze_images_with_llm(
         self,
         images_data: List[Dict[str, Any]],
-        batch_size: int = 10,
-        concurrency: int = 5,
     ) -> List[Dict[str, Any]]:
-        """배치 단위로 Vision 분석. 배치 내 concurrency 만큼 동시 호출."""
-        analyzed: List[Dict[str, Any]] = []
+        """Vision 분석 — 전역 세마포어(_VISION_MAX_INFLIGHT)로 비전 서버 총 동시요청을 상한.
+
+        여러 파일이 동시에 인덱싱돼도 비전 서버로 나가는 총 in-flight 는 전역 상한 이하로 유지된다.
+        개별 이미지 실패는 _analyze_single_image 내부에서 transient 재시도 후 최종 실패 시 None 반환.
+        """
         total = len(images_data)
+        if not total:
+            return []
+        sem = _get_vision_sem()
 
-        for start in range(0, total, batch_size):
-            batch = images_data[start:start + batch_size]
-            sem = asyncio.Semaphore(concurrency)
+        async def analyze_one(image_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            async with sem:
+                return await self._analyze_single_image(image_info)
 
-            async def analyze_one(image_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-                async with sem:
-                    return await self._analyze_single_image(image_info)
-
-            batch_results = await asyncio.gather(
-                *[analyze_one(img) for img in batch],
-                return_exceptions=True,
-            )
-            for r in batch_results:
-                if isinstance(r, dict):
-                    analyzed.append(r)
-
-            print(f"Analyzed {min(start + batch_size, total)}/{total} images")
-
+        results = await asyncio.gather(
+            *[analyze_one(img) for img in images_data],
+            return_exceptions=True,
+        )
+        analyzed: List[Dict[str, Any]] = []
+        failed = 0
+        for r in results:
+            if isinstance(r, dict):
+                analyzed.append(r)
+            else:
+                failed += 1
+        # 조용한 손실 방지 — 스킵된 이미지 수를 표면화(동시성 과대/서버 과부하 신호)
+        if failed:
+            _logger.warning("[vision] 이미지 분석 스킵 %d/%d (transient 재시도 후에도 실패)", failed, total)
+        print(f"Analyzed {len(analyzed)}/{total} images (skipped {failed})")
         return analyzed
 
     async def _analyze_single_image(self, image_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -512,34 +552,42 @@ class RAGChain:
         )
         prompt_text = "이 이미지를 자세히 분석하고 설명해주세요. 문서의 일부라면 텍스트 내용, 차트, 그래프, 이미지 등을 포함하여 설명해주세요."
 
-        try:
-            if is_localhost:
-                async with httpx.AsyncClient() as client:
-                    image_response = await client.get(image_url)
-                    image_response.raise_for_status()
-                    image_bytes = image_response.content
-                image_b64 = base64.b64encode(image_bytes).decode('utf-8')
-                url_payload = f"data:{mime_type};base64,{image_b64}"
-            else:
-                url_payload = image_url
+        # transient(429/5xx/timeout/OOM) 실패는 지수 백오프로 재시도, 최종 실패 시 None(스킵).
+        last_err = None
+        for attempt in range(_VISION_RETRIES + 1):
+            try:
+                if is_localhost:
+                    async with httpx.AsyncClient() as client:
+                        image_response = await client.get(image_url)
+                        image_response.raise_for_status()
+                        image_bytes = image_response.content
+                    image_b64 = base64.b64encode(image_bytes).decode('utf-8')
+                    url_payload = f"data:{mime_type};base64,{image_b64}"
+                else:
+                    url_payload = image_url
 
-            response = await self.llm.ainvoke([{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt_text},
-                    {"type": "image_url", "image_url": {"url": url_payload}},
-                ],
-            }])
+                response = await self.llm.ainvoke([{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_text},
+                        {"type": "image_url", "image_url": {"url": url_payload}},
+                    ],
+                }])
 
-            return {
-                'image_id': image_info['image_id'],
-                'analysis': response.content,
-                'metadata': image_info['metadata'],
-                'image_url': image_url,
-            }
-        except Exception as e:
-            print(f"Error analyzing image {image_info.get('image_id')}: {e}")
-            return None
+                return {
+                    'image_id': image_info['image_id'],
+                    'analysis': response.content,
+                    'metadata': image_info['metadata'],
+                    'image_url': image_url,
+                }
+            except Exception as e:
+                last_err = e
+                if _is_transient_err(str(e)) and attempt < _VISION_RETRIES:
+                    await asyncio.sleep(min(20.0, 1.5 * (2 ** attempt)))
+                    continue
+                break
+        print(f"Error analyzing image {image_info.get('image_id')}: {last_err}")
+        return None
 
 
 _rag_chain_instance: Optional["RAGChain"] = None

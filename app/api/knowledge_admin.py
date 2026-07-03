@@ -14,7 +14,9 @@ from app.services.document_processor import get_document_processor
 from app.services.knowledge_files import (
     INDEX_STATUS_FAILED,
     INDEX_STATUS_INDEXED,
+    INDEX_STATUS_PENDING,
     INDEX_STATUS_PROCESSING,
+    clear_index_artifacts,
     create_folder as kf_create_folder,
     delete_entry,
     delete_entries_bulk,
@@ -112,6 +114,10 @@ async def _index_uploaded_file(
     documents = []
     indexing_error: Optional[str] = None
     try:
+        # 멱등성: 재시도/재시작 복구/재인덱싱 시 이전(부분) 산출물을 먼저 정리해 청크 중복 방지.
+        # 최초 인덱싱이면 사실상 no-op(인덱스 조회라 저렴). 스토리지 원본/knowledge_files row 는 유지.
+        await clear_index_artifacts(tenant_id, storage_path)
+
         if is_image:
             from app.services.ingest.image import process_image_file
             file_id = storage_path.replace("/", "_").replace("\\", "_")
@@ -261,14 +267,9 @@ async def _index_uploaded_file(
         indexing_error = str(e)
         logger.exception("[knowledge_admin] indexing failed for %s: %s", file_name, e)
 
-    if indexing_error:
-        await mark_status(
-            tenant_id=tenant_id,
-            source_type="upload",
-            source_ref=storage_path,
-            status=INDEX_STATUS_FAILED,
-            error=indexing_error,
-        )
+    # terminal 실패 상태(failed)는 *큐가 소유*한다 — 여기서 failed 로 마킹하지 않는다.
+    # (transient 를 여기서 failed 로 찍으면 재시도 때 깜빡이고, 그 사이 크래시 시 failed 로 굳어
+    #  pending/processing 만 복구하는 sweeper 가 못 살림. 성공 시 indexed 마킹은 위에서 이미 수행.)
     return indexing_error
 
 
@@ -344,7 +345,7 @@ async def upload_knowledge_file(
     storage_path = upload_result["file_path"]
     public_url = upload_result.get("public_url")
 
-    # 2) knowledge_files 사전 등록 (processing)
+    # 2) knowledge_files 사전 등록 (pending — 인덱싱은 백그라운드 워커풀이 처리)
     await register_uploaded_file(
         tenant_id=tenant_id,
         storage_path=storage_path,
@@ -356,6 +357,7 @@ async def upload_knowledge_file(
         uploaded_by_uid=(uploaded_by_uid or None),
         uploaded_by_name=(uploaded_by_name or None),
         doc_role=doc_role,
+        initial_status=INDEX_STATUS_PENDING,
     )
 
     # 2-1) knowledge_folders 레지스트리에도 폴더(+조상) 등록.
@@ -375,28 +377,28 @@ async def upload_knowledge_file(
         # 업로더 본인에게 업로드 대상 폴더 조회 권한 자동 부여 (leaf 만 — 조상은 트리에서 합성됨).
         await grant_folder_permission(tenant_id, uploaded_by_uid, _fp)
 
-    # 3) 콘텐츠 추출 + RAG 인덱싱 (upload/reindex 공용 헬퍼)
-    indexing_error = await _index_uploaded_file(
-        tenant_id=tenant_id,
-        storage_path=storage_path,
-        file_content=file_content,
-        file_name=file_name,
-        doc_role=doc_role,
-        public_url=public_url,
-    )
+    # 3) 인덱싱은 백그라운드 워커풀에 위임하고 즉시 반환한다.
+    #    (브라우저가 인덱싱 끝까지 연결을 붙잡지 않음 → 대량 폴더 업로드도 수 분 내 접수 완료.
+    #     실제 인덱싱 진행은 프론트가 index_status 폴링으로 확인. 폴더 카드 갱신도 인덱싱 완료 후.)
+    from app.services.ingest_queue import enqueue_index_job
+    enqueue_index_job(tenant_id, storage_path, file_name, doc_role, folder_path or "")
 
-    # 폴더 카드 갱신은 *업로드 배치 단위* 로 프론트가 `POST /knowledge/folders/refresh-cards`
-    # 를 1회 호출해 처리한다 (파일마다 재생성하는 storm 방지). 업로드 엔드포인트는 카드를
-    # 직접 만지지 않는다.
     return {
         "source_type": "upload",
         "source_ref": storage_path,
         "file_name": file_name,
         "size_bytes": size_bytes,
         "public_url": public_url,
-        "indexed": indexing_error is None,
-        "error": indexing_error,
+        "accepted": True,
+        "status": INDEX_STATUS_PENDING,   # 인덱싱은 백그라운드 진행 — 프론트는 상태 폴링
     }
+
+
+@router.get("/knowledge/ingest/status")
+async def knowledge_ingest_status(tenant_id: str = Query(...)):
+    """백그라운드 인제스트 관측 — 테넌트 upload 파일 상태별 카운트 + 큐/동시성 스냅샷."""
+    from app.services.ingest_queue import ingest_status_counts
+    return await ingest_status_counts(tenant_id)
 
 
 @router.post("/knowledge/files/reindex")
@@ -427,41 +429,19 @@ async def reindex_knowledge_file(
     file_name = entry.get("file_name") or Path(source_ref).name
     doc_role = entry.get("doc_role")
 
-    # 진행중 표시 (UI 가 즉시 processing 으로 보이도록)
+    # 재인덱싱도 백그라운드 워커풀에 위임 — pending 으로 돌리고 enqueue(워커가 멱등 정리 후 재처리).
     await mark_status(
         tenant_id=tenant_id, source_type=source_type, source_ref=source_ref,
-        status=INDEX_STATUS_PROCESSING,
+        status=INDEX_STATUS_PENDING,
     )
-
-    # 스토리지에서 원본 재다운로드 (source_ref = 'files' 버킷 내 경로)
-    try:
-        loader = SupabaseStorageLoader()
-        resp = await asyncio.to_thread(
-            loader.supabase.storage.from_("files").download, source_ref
-        )
-        file_content = resp if isinstance(resp, bytes) else (
-            resp.read() if hasattr(resp, "read") else bytes(resp)
-        )
-    except Exception as e:
-        await mark_status(
-            tenant_id=tenant_id, source_type=source_type, source_ref=source_ref,
-            status=INDEX_STATUS_FAILED, error=f"스토리지 다운로드 실패: {e}",
-        )
-        raise HTTPException(status_code=500, detail=f"스토리지 다운로드 실패: {e}")
-
-    indexing_error = await _index_uploaded_file(
-        tenant_id=tenant_id,
-        storage_path=source_ref,
-        file_content=file_content,
-        file_name=file_name,
-        doc_role=doc_role,
-    )
+    from app.services.ingest_queue import enqueue_index_job
+    enqueue_index_job(tenant_id, source_ref, file_name, doc_role, entry.get("folder_path") or "")
     return {
         "source_type": source_type,
         "source_ref": source_ref,
         "file_name": file_name,
-        "indexed": indexing_error is None,
-        "error": indexing_error,
+        "accepted": True,
+        "status": INDEX_STATUS_PENDING,
     }
 
 

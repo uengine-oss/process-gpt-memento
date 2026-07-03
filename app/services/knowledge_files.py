@@ -160,6 +160,9 @@ async def mark_status(
     error: Optional[str] = None,
 ) -> None:
     payload: Dict[str, Any] = {"index_status": status, "index_error": error}
+    # updated_at 을 명시적으로 갱신 — 백그라운드 인제스트의 좀비(오래된 processing) 판정이
+    # 이 타임스탬프에 의존하므로, DB 트리거 유무와 무관하게 항상 최신화한다.
+    payload["updated_at"] = datetime.utcnow().isoformat()
     if status == INDEX_STATUS_INDEXED:
         payload["indexed_at"] = datetime.utcnow().isoformat()
         payload["index_error"] = None
@@ -490,6 +493,105 @@ async def delete_entry(
 def _chunked(seq: List[Any], size: int) -> List[List[Any]]:
     """리스트를 size 단위 배치로 분할."""
     return [seq[i:i + size] for i in range(0, len(seq), size)]
+
+
+async def clear_index_artifacts(tenant_id: str, source_ref: str) -> None:
+    """한 파일의 RAG 인덱스 산출물만 정리 — *스토리지 원본/knowledge_files row 는 유지*.
+
+    재인덱싱(재시도·재시작 복구·reindex) 을 멱등하게 만들기 위해 *인덱싱 시작 전*에 호출한다.
+    정리 대상: documents(청크 + 이미지-분석), document_images, document_pages,
+    processed_files, Chroma 임베딩. (delete_entry 의 부분집합 — storage/row 는 안 건드림)
+    최초 인덱싱(이전 산출물 없음)에는 사실상 no-op(인덱스 조회라 저렴).
+    """
+    if not tenant_id or not source_ref:
+        return
+
+    # 0a. 청크 id 수집 (이미지-분석/이미지메타 삭제의 FK)
+    chunk_ids: List[str] = []
+    try:
+        resp = await asyncio.to_thread(
+            supabase.table("documents").select("id")
+            .eq("metadata->>tenant_id", tenant_id)
+            .eq("metadata->>file_id", source_ref)
+            .execute
+        )
+        chunk_ids = [str(r.get("id")) for r in (resp.data or []) if r.get("id")]
+    except Exception as e:
+        logger.warning("[knowledge_files] clear: collect chunk ids failed: %s", e)
+
+    # 0b. 이미지-분석 documents id (document_id ∈ chunk_ids)
+    image_doc_ids: List[str] = []
+    for batch in _chunked(chunk_ids, 200):
+        try:
+            resp = await asyncio.to_thread(
+                supabase.table("documents").select("id")
+                .eq("metadata->>type", "image_analysis")
+                .in_("metadata->>document_id", batch)
+                .execute
+            )
+            image_doc_ids.extend(str(r.get("id")) for r in (resp.data or []) if r.get("id"))
+        except Exception as e:
+            logger.warning("[knowledge_files] clear: collect image ids failed: %s", e)
+
+    # 1. Chroma 임베딩 (청크 file_id + 이미지-분석 id)
+    try:
+        from app.services.vector_store import get_vector_store
+        vsm = get_vector_store()
+        await asyncio.to_thread(
+            vsm.collection.delete,
+            where={"$and": [{"tenant_id": tenant_id}, {"file_id": source_ref}]},
+        )
+        for batch in _chunked(image_doc_ids, 500):
+            await asyncio.to_thread(vsm.collection.delete, ids=batch)
+    except Exception as e:
+        logger.warning("[knowledge_files] clear: chroma delete failed: %s", e)
+
+    # 2. document_images
+    for batch in _chunked(chunk_ids, 200):
+        try:
+            await asyncio.to_thread(
+                supabase.table("document_images").delete().in_("document_id", batch).execute
+            )
+        except Exception as e:
+            logger.warning("[knowledge_files] clear: document_images failed: %s", e)
+
+    # 3. documents 청크 본문 (file_id)
+    try:
+        await asyncio.to_thread(
+            supabase.table("documents").delete()
+            .eq("metadata->>tenant_id", tenant_id)
+            .eq("metadata->>file_id", source_ref)
+            .execute
+        )
+    except Exception as e:
+        logger.warning("[knowledge_files] clear: documents(chunks) failed: %s", e)
+
+    # 3b. documents 이미지-분석 본문 (id)
+    for batch in _chunked(image_doc_ids, 200):
+        try:
+            await asyncio.to_thread(
+                supabase.table("documents").delete().in_("id", batch).execute
+            )
+        except Exception as e:
+            logger.warning("[knowledge_files] clear: documents(image) failed: %s", e)
+
+    # 4. document_pages (file_id 실제 컬럼)
+    try:
+        await asyncio.to_thread(
+            supabase.table("document_pages").delete()
+            .eq("tenant_id", tenant_id).eq("file_id", source_ref).execute
+        )
+    except Exception as e:
+        logger.warning("[knowledge_files] clear: document_pages failed: %s", e)
+
+    # 5. processed_files (file_id 실제 컬럼) — 재인덱싱 가능하도록
+    try:
+        await asyncio.to_thread(
+            supabase.table("processed_files").delete()
+            .eq("tenant_id", tenant_id).eq("file_id", source_ref).execute
+        )
+    except Exception as e:
+        logger.warning("[knowledge_files] clear: processed_files failed: %s", e)
 
 
 async def delete_entries_bulk(

@@ -198,13 +198,35 @@ class VectorStoreManager:
             print(f"Embedded batch {bi}/{total_batches} ({len(batch_texts)} docs)")
         return embeddings
 
-    def _embed_batch_adaptive(self, batch: List[str]) -> List[List[float]]:
-        """배치 임베딩. 실패 시(예: GPU OOM) 절반으로 쪼개 재귀 재시도 — 1까지 줄여도 실패면 raise."""
+    def _embed_batch_adaptive(self, batch: List[str], _attempt: int = 0) -> List[List[float]]:
+        """배치 임베딩. 실패 유형별 대응:
+        - rate/네트워크성(429/5xx/timeout/connection): *같은 배치*를 지수 백오프로 재시도
+          (배치를 쪼갠다고 429가 풀리지 않으므로). MEMENTO_EMBED_MAX_RETRIES(기본 3)회.
+        - 그 외(예: OOM/424/과대배치): 절반으로 쪼개 재귀 재시도 — 1까지 줄여도 실패면 raise.
+        (이 메서드는 to_thread 워커 스레드에서 도므로 time.sleep 은 이벤트 루프를 막지 않음)
+        """
         if not batch:
             return []
         try:
             return self.embeddings.embed_documents(batch)
         except Exception as exc:  # noqa: BLE001
+            import time as _t
+            msg = str(exc).lower()
+            transient = any(k in msg for k in (
+                "429", "rate limit", "too many requests", "timeout", "timed out",
+                "502", "503", "504", "connection", "econnreset", "temporarily", "overload",
+            ))
+            try:
+                _max = int(os.getenv("MEMENTO_EMBED_MAX_RETRIES", "3"))
+            except ValueError:
+                _max = 3
+            # rate/네트워크성 → 같은 배치 백오프 재시도 (서버 과부하 대응)
+            if transient and _attempt < _max:
+                delay = min(30.0, 1.5 * (2 ** _attempt))
+                print(f"[vector_store] embed transient({type(exc).__name__}) "
+                      f"→ {delay:.0f}s 후 재시도 {_attempt + 1}/{_max}")
+                _t.sleep(delay)
+                return self._embed_batch_adaptive(batch, _attempt + 1)
             if len(batch) == 1:
                 print(f"[vector_store] embed 단일 텍스트 실패 (len={len(batch[0])}): {exc}")
                 raise
