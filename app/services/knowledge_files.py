@@ -1421,6 +1421,51 @@ async def list_for_folder(
     return rows
 
 
+async def fetch_rows_by_folders(
+    tenant_id: str,
+    select_cols: str,
+    folder_paths: List[str],
+    *,
+    doc_role: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """여러 폴더의 *subtree* row 를 폴더 경로로 직접 조회(폴더 스코프).
+
+    수천 개 file_id(source_ref=긴 한글 경로)를 URL IN 절로 나열하면 kong/PostgREST URL 한계를
+    넘겨 조회가 통째로 실패한다. 폴더 선택 시에는 file_id 열거 대신 folder_path(few)로 직접
+    eq+like 질의해 스코프한다. 폴더당 exact + ``folder/%`` 프리픽스 2질의를 병합, source_ref 로 dedup.
+    """
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for raw in folder_paths or []:
+        p = (raw or "").strip().strip("/")
+        if not p:
+            continue
+        for like in (None, f"{p}/%"):
+            try:
+                q = (
+                    supabase.table("knowledge_files").select(select_cols)
+                    .eq("tenant_id", tenant_id)
+                )
+                q = q.eq("folder_path", p) if like is None else q.like("folder_path", like)
+                if doc_role:
+                    q = q.eq("doc_role", doc_role)
+                if limit is not None:
+                    q = q.limit(limit)
+                rows = (await asyncio.to_thread(q.execute)).data or []
+            except Exception as e:
+                logger.warning("[knowledge_files] fetch_rows_by_folders(%r,%s) failed: %s", p, like, e)
+                continue
+            for r in rows:
+                ref = r.get("source_ref")
+                if ref is not None:
+                    if ref in seen:
+                        continue
+                    seen.add(str(ref))
+                out.append(r)
+    return out
+
+
 async def search_by_name(
     tenant_id: str, q: str, indexed_only: bool = False, limit: int = 300
 ) -> List[Dict[str, Any]]:

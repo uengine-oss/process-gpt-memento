@@ -188,6 +188,7 @@ async def folders_tree(
     tenant_id: str,
     roots: Optional[List[str]] = Query(default=None),
     file_ids: Optional[List[str]] = Query(default=None),
+    folder_paths: Optional[List[str]] = Query(default=None),
     doc_role: Optional[str] = Query(default=None),
     depth: int = Query(default=_DEFAULT_TREE_DEPTH, ge=1, le=_MAX_TREE_DEPTH),
 ):
@@ -207,13 +208,22 @@ async def folders_tree(
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id required")
 
-    # ★ 보안 경계 — file_ids(=선택 source_ref) 가 오면 그 화이트리스트 안에서만 트리를 짠다.
-    #   (없으면 레거시/직접호출 하위호환으로 tenant 전체. deepagents 는 항상 보내고 빈 선택은 먼저 거부.)
+    # ★ 보안 경계 — file_ids(=선택 source_ref) 또는 folder_paths(폴더 스코프) 안에서만 트리를 짠다.
+    #   - file_ids: 개별 파일 선택. 화이트리스트 IN(청크).
+    #   - folder_paths: 폴더째 선택. file_id 수천 개를 URL 로 안 넘기고 폴더 경로로 직접 조회(스케일).
+    #   - 둘 다 없으면 레거시/직접호출 하위호환으로 tenant 전체.
     allow = [str(x) for x in (file_ids or []) if x]
+    scope_folders = [str(x) for x in (folder_paths or []) if x and str(x).strip().strip("/")]
     try:
         if allow:
             rows = await _fetch_kf_by_refs(
                 tenant_id, "file_name, folder_path, doc_card, doc_role", allow, doc_role=doc_role
+            )
+        elif scope_folders:
+            from app.services.knowledge_files import fetch_rows_by_folders
+            rows = await fetch_rows_by_folders(
+                tenant_id, "source_ref, file_name, folder_path, doc_card, doc_role",
+                scope_folders, doc_role=doc_role, limit=_TREE_FETCH_LIMIT,
             )
         else:
             q = (
@@ -228,7 +238,7 @@ async def folders_tree(
         logger.exception("[/folders/tree] query failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    truncated = (not allow) and len(rows) >= _TREE_FETCH_LIMIT
+    truncated = (not allow and not scope_folders) and len(rows) >= _TREE_FETCH_LIMIT
 
     # 집계 구조 빌드
     files_by_folder: Dict[str, List[Dict[str, Any]]] = {}
@@ -339,6 +349,7 @@ async def folders_open(
     tenant_id: str,
     folder_path: str,
     file_ids: Optional[List[str]] = Query(default=None),
+    folder_paths: Optional[List[str]] = Query(default=None),
     doc_role: Optional[str] = Query(default=None),
 ):
     """한 폴더의 직속 자식 — 하위폴더(카드 요약) + 문서(abstract) — 반환.
@@ -360,8 +371,12 @@ async def folders_open(
     if not fp:
         raise HTTPException(status_code=400, detail="folder_path empty")
 
-    # ★ 보안 경계 — file_ids(=선택 source_ref) 가 오면 그 화이트리스트 안의 문서/폴더만 노출.
+    # ★ 보안 경계 — file_ids(개별 선택) 또는 folder_paths(폴더 스코프) 안에서만 노출.
+    #   folder_paths 가 오면 여는 폴더(fp)가 그 subtree 안인지 순수 문자열로 검증(refs 열거 불필요).
     allow = [str(x) for x in (file_ids or []) if x]
+    scope_folders = [_norm(x) for x in (folder_paths or []) if _norm(x)]
+    if scope_folders and not any(fp == s or fp.startswith(s + "/") for s in scope_folders):
+        return {"folder_path": fp, "subfolders": [], "docs": []}
 
     # 직속 문서 (정확히 이 폴더)
     try:

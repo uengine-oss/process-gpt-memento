@@ -30,6 +30,11 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+def _norm_folder(p: Optional[str]) -> str:
+    """폴더 경로 정규화 — 앞뒤 슬래시/공백 제거. 폴더 스코프 접두어 검사용."""
+    return (p or "").strip().strip("/")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 헬퍼 — file_name → file_id (source_ref) 해석
 # ─────────────────────────────────────────────────────────────────────────────
@@ -105,6 +110,7 @@ async def catalog(
     tenant_id: str,
     file_ids: Optional[List[str]] = Query(default=None),
     file_names: Optional[List[str]] = Query(default=None),
+    folder_paths: Optional[List[str]] = Query(default=None),
 ):
     """선택 자료의 doc_card 목록 반환.
 
@@ -121,27 +127,32 @@ async def catalog(
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id required")
 
+    _CATALOG_COLS = (
+        "source_ref, source_type, file_name, folder_path, path, mime_type, "
+        "size_bytes, modified_time, indexed_at, index_status, doc_card, doc_role"
+    )
     try:
-        query = (
-            supabase.table("knowledge_files")
-            .select(
-                "source_ref, source_type, file_name, folder_path, path, mime_type, "
-                "size_bytes, modified_time, indexed_at, index_status, doc_card, doc_role"
-            )
-            .eq("tenant_id", tenant_id)
-        )
-
         cleaned_ids = [str(x) for x in (file_ids or []) if x]
         cleaned_names = [str(x) for x in (file_names or []) if x]
-        if cleaned_ids:
-            query = query.in_("source_ref", cleaned_ids)
-        elif cleaned_names:
-            query = query.in_("file_name", cleaned_names)
-
-        query = query.order("file_name", desc=False)
-
-        response = await asyncio.to_thread(query.execute)
-        rows = response.data or []
+        cleaned_folders = [str(x) for x in (folder_paths or []) if x and str(x).strip().strip("/")]
+        if not cleaned_ids and not cleaned_names and cleaned_folders:
+            # 폴더 스코프 — 수천 file_id 를 URL IN 으로 안 넘기고 폴더 경로로 직접 조회.
+            from app.services.knowledge_files import fetch_rows_by_folders
+            rows = await fetch_rows_by_folders(tenant_id, _CATALOG_COLS, cleaned_folders)
+            rows = sorted(rows, key=lambda r: (r.get("file_name") or ""))
+        else:
+            query = (
+                supabase.table("knowledge_files")
+                .select(_CATALOG_COLS)
+                .eq("tenant_id", tenant_id)
+            )
+            if cleaned_ids:
+                query = query.in_("source_ref", cleaned_ids)
+            elif cleaned_names:
+                query = query.in_("file_name", cleaned_names)
+            query = query.order("file_name", desc=False)
+            response = await asyncio.to_thread(query.execute)
+            rows = response.data or []
 
         out: List[Dict[str, Any]] = []
         for r in rows:
@@ -370,6 +381,7 @@ async def document_grep(
     path: str,
     pattern: str,
     file_ids: Optional[List[str]] = Query(default=None),
+    folder_paths: Optional[List[str]] = Query(default=None),
     regex: bool = Query(default=False),
     case_sensitive: bool = Query(default=False),
     context_lines: int = Query(default=0, ge=0, le=_GREP_MAX_CONTEXT_LINES),
@@ -400,9 +412,18 @@ async def document_grep(
             "truncated": False,
             "error": f"path '{path}' not found in tenant '{tenant_id}'",
         }
-    # ★ 보안 경계 — 선택 화이트리스트(file_ids=source_ref) 밖이면 본문 조회 거부.
+    # ★ 보안 경계 — file_ids(개별) 또는 folder_paths(폴더 스코프) 밖이면 본문 조회 거부.
+    #   folder_paths 는 path 접두어로 순수 검사(수천 refs 열거 없이 스케일).
     _allow = [str(x) for x in (file_ids or []) if x]
-    if _allow and file_id not in _allow:
+    _scope = [_norm_folder(x) for x in (folder_paths or []) if _norm_folder(x)]
+    _path_norm = (path or "").strip().strip("/")
+    if _scope:
+        if not any(_path_norm == s or _path_norm.startswith(s + "/") for s in _scope):
+            return {
+                "response": [], "total_matches": 0, "truncated": False,
+                "error": f"path '{path}' 는 선택한 폴더 범위 밖입니다.",
+            }
+    elif _allow and file_id not in _allow:
         return {
             "response": [],
             "total_matches": 0,
@@ -540,6 +561,7 @@ async def document_page(
     path: str,
     pages: str,
     file_ids: Optional[List[str]] = Query(default=None),
+    folder_paths: Optional[List[str]] = Query(default=None),
 ):
     """페이지 범위 본문 반환.
 
@@ -575,9 +597,17 @@ async def document_page(
             "pages": [],
             "error": f"path '{path}' not found in tenant '{tenant_id}'",
         }
-    # ★ 보안 경계 — 선택 화이트리스트(file_ids=source_ref) 밖이면 본문 조회 거부.
+    # ★ 보안 경계 — file_ids(개별) 또는 folder_paths(폴더 스코프) 밖이면 본문 조회 거부.
     _allow = [str(x) for x in (file_ids or []) if x]
-    if _allow and file_id not in _allow:
+    _scope = [_norm_folder(x) for x in (folder_paths or []) if _norm_folder(x)]
+    _path_norm = (path or "").strip().strip("/")
+    if _scope:
+        if not any(_path_norm == s or _path_norm.startswith(s + "/") for s in _scope):
+            return {
+                "file_name": file_name, "pages": [],
+                "error": f"path '{path}' 는 선택한 폴더 범위 밖입니다.",
+            }
+    elif _allow and file_id not in _allow:
         return {
             "file_name": file_name,
             "pages": [],
