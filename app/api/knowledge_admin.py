@@ -833,18 +833,44 @@ async def delete_knowledge_folder(
         if r.get("source_ref")
     ]
     bulk = await delete_entries_bulk(tenant_id=tenant_id, entries=entries)
-    deleted = bulk.get("total", len(entries))
-    failed = 0
 
-    # knowledge_folders 메타 row도 정리 (빈 폴더 + 자식 폴더, role scope)
-    await delete_folder_meta(tenant_id=tenant_id, folder_path=folder_path, doc_role=doc_role)
+    # 실제 결과를 반영 — 예전엔 무조건 ok:True 라, IN-리스트 URL 초과로 삭제가 통째로 실패해도
+    # '성공(deleted=total)'으로 오인됐다(파일 100+ 폴더). 이제 knowledge_files row 삭제 성공
+    # 여부(목록에 보이는 실체)로 판정하고, 실패 시 폴더 메타/카드도 건드리지 않는다.
+    rows_ok = (not entries) or bool(bulk.get("knowledge_rows_deleted"))
+    artifacts_ok = (not entries) or all(
+        bulk.get(k)
+        for k in (
+            "documents_deleted", "image_analysis_documents_deleted", "chroma_deleted",
+            "document_images_deleted", "pages_deleted", "processed_files_deleted",
+            "storage_deleted",
+        )
+    )
+    deleted = len(rows) if rows_ok else 0
+    failed = 0 if rows_ok else len(rows)
 
-    # 폴더 카드 정리: 삭제된 폴더 + 하위(subtree) 카드 행 제거 후, *부모* 카드 재생성
-    # (부모는 하위폴더 1개가 줄었으므로 요약/카운트 갱신 필요).
-    from app.services.folder_cards import delete_folder_cards, rebuild_folders
-    await delete_folder_cards(tenant_id=tenant_id, folder_path=folder_path, doc_role=doc_role)
-    _parent = folder_path.rsplit("/", 1)[0] if "/" in folder_path else ""
-    if _parent:
-        await rebuild_folders(tenant_id, [_parent], doc_role or "content")
+    if rows_ok:
+        # knowledge_folders 메타 row도 정리 (빈 폴더 + 자식 폴더, role scope)
+        await delete_folder_meta(tenant_id=tenant_id, folder_path=folder_path, doc_role=doc_role)
+        # 폴더 카드 정리: 삭제된 폴더 + 하위(subtree) 카드 행 제거 후, *부모* 카드 재생성
+        # (부모는 하위폴더 1개가 줄었으므로 요약/카운트 갱신 필요).
+        from app.services.folder_cards import delete_folder_cards, rebuild_folders
+        await delete_folder_cards(tenant_id=tenant_id, folder_path=folder_path, doc_role=doc_role)
+        _parent = folder_path.rsplit("/", 1)[0] if "/" in folder_path else ""
+        if _parent:
+            await rebuild_folders(tenant_id, [_parent], doc_role or "content")
+    else:
+        logger.warning(
+            "[knowledge_admin] folder delete FAILED to remove rows: tenant=%s folder=%s files=%d bulk=%s",
+            tenant_id, folder_path, len(rows), bulk,
+        )
 
-    return {"ok": True, "deleted": deleted, "failed": failed, "total": len(rows)}
+    return {
+        "ok": rows_ok,
+        # 파일은 지워졌지만 RAG/스토리지 아티팩트 일부 실패 → orphan 가능(목록엔 안 보임)
+        "partial": rows_ok and not artifacts_ok,
+        "deleted": deleted,
+        "failed": failed,
+        "total": len(rows),
+        "detail": bulk,
+    }

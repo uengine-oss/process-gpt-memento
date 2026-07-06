@@ -11,6 +11,7 @@ import logging
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from app.core.supabase_client import supabase
 
@@ -497,6 +498,31 @@ def _chunked(seq: List[Any], size: int) -> List[List[Any]]:
     return [seq[i:i + size] for i in range(0, len(seq), size)]
 
 
+def _chunk_by_urllen(
+    seq: List[Any], max_encoded: int = 5000, max_count: int = 200
+) -> List[List[Any]]:
+    """PostgREST ``in.(...)`` 필터의 *URL 길이* 안전 배치.
+
+    source_ref/file_id 는 한글 스토리지 경로라 URL 인코딩하면 한 건이 수백 자로 부풀어,
+    고정 개수(예: 200)로 묶으면 파일 100여 개부터 URL 이 kong/PostgREST 한계(~8KB)를 넘겨
+    요청이 *통째로 실패* → 삭제가 조용히 누락된다(성공으로 오인). 각 배치의 인코딩 길이 합을
+    예산 이하로 유지해 이 실패를 원천 차단한다. (개수 상한도 병행 — 짧은 UUID 다량 대비.)
+    """
+    batches: List[List[Any]] = []
+    cur: List[Any] = []
+    cur_len = 0
+    for it in seq:
+        enc = len(quote(str(it), safe="")) + 3  # 구분자/따옴표 여유
+        if cur and (cur_len + enc > max_encoded or len(cur) >= max_count):
+            batches.append(cur)
+            cur, cur_len = [], 0
+        cur.append(it)
+        cur_len += enc
+    if cur:
+        batches.append(cur)
+    return batches
+
+
 async def clear_index_artifacts(tenant_id: str, source_ref: str) -> None:
     """한 파일의 RAG 인덱스 산출물만 정리 — *스토리지 원본/knowledge_files row 는 유지*.
 
@@ -523,7 +549,7 @@ async def clear_index_artifacts(tenant_id: str, source_ref: str) -> None:
 
     # 0b. 이미지-분석 documents id (document_id ∈ chunk_ids)
     image_doc_ids: List[str] = []
-    for batch in _chunked(chunk_ids, 200):
+    for batch in _chunk_by_urllen(chunk_ids):
         try:
             resp = await asyncio.to_thread(
                 supabase.table("documents").select("id")
@@ -549,7 +575,7 @@ async def clear_index_artifacts(tenant_id: str, source_ref: str) -> None:
         logger.warning("[knowledge_files] clear: chroma delete failed: %s", e)
 
     # 2. document_images
-    for batch in _chunked(chunk_ids, 200):
+    for batch in _chunk_by_urllen(chunk_ids):
         try:
             await asyncio.to_thread(
                 supabase.table("document_images").delete().in_("document_id", batch).execute
@@ -569,7 +595,7 @@ async def clear_index_artifacts(tenant_id: str, source_ref: str) -> None:
         logger.warning("[knowledge_files] clear: documents(chunks) failed: %s", e)
 
     # 3b. documents 이미지-분석 본문 (id)
-    for batch in _chunked(image_doc_ids, 200):
+    for batch in _chunk_by_urllen(image_doc_ids):
         try:
             await asyncio.to_thread(
                 supabase.table("documents").delete().in_("id", batch).execute
@@ -647,7 +673,7 @@ async def delete_entries_bulk(
 
     # 0a. 청크 id 수집 (file_id IN refs) — image-분석/이미지메타 삭제의 FK
     chunk_ids: List[str] = []
-    for batch in _chunked(refs, _REF_BATCH):
+    for batch in _chunk_by_urllen(refs):
         try:
             resp = await asyncio.to_thread(
                 supabase.table("documents")
@@ -663,7 +689,7 @@ async def delete_entries_bulk(
 
     # 0b. 이미지-분석 documents id 수집 (document_id ∈ chunk_ids)
     image_doc_ids: List[str] = []
-    for batch in _chunked(chunk_ids, _ID_BATCH):
+    for batch in _chunk_by_urllen(chunk_ids):
         try:
             resp = await asyncio.to_thread(
                 supabase.table("documents")
@@ -698,7 +724,7 @@ async def delete_entries_bulk(
 
     # 2. document_images 메타 삭제 (document_id ∈ chunk_ids)
     try:
-        for batch in _chunked(chunk_ids, _ID_BATCH):
+        for batch in _chunk_by_urllen(chunk_ids):
             await asyncio.to_thread(
                 supabase.table("document_images").delete().in_("document_id", batch).execute
             )
@@ -708,7 +734,7 @@ async def delete_entries_bulk(
 
     # 3. documents 청크 본문 삭제 (file_id IN refs)
     try:
-        for batch in _chunked(refs, _REF_BATCH):
+        for batch in _chunk_by_urllen(refs):
             await asyncio.to_thread(
                 supabase.table("documents")
                 .delete()
@@ -722,7 +748,7 @@ async def delete_entries_bulk(
 
     # 3b. documents 이미지-분석 본문 삭제 (id 로)
     try:
-        for batch in _chunked(image_doc_ids, _ID_BATCH):
+        for batch in _chunk_by_urllen(image_doc_ids):
             await asyncio.to_thread(
                 supabase.table("documents").delete().in_("id", batch).execute
             )
@@ -732,7 +758,7 @@ async def delete_entries_bulk(
 
     # 4. document_pages 삭제 (file_id IN refs — 실제 컬럼)
     try:
-        for batch in _chunked(refs, _REF_BATCH):
+        for batch in _chunk_by_urllen(refs):
             await asyncio.to_thread(
                 supabase.table("document_pages")
                 .delete()
@@ -746,7 +772,7 @@ async def delete_entries_bulk(
 
     # 5. processed_files 삭제 (file_id IN refs — 실제 컬럼)
     try:
-        for batch in _chunked(refs, _REF_BATCH):
+        for batch in _chunk_by_urllen(refs):
             await asyncio.to_thread(
                 supabase.table("processed_files")
                 .delete()
@@ -782,7 +808,7 @@ async def delete_entries_bulk(
 
     # 7. knowledge_files row 삭제 (source_ref IN refs)
     try:
-        for batch in _chunked(refs, _REF_BATCH):
+        for batch in _chunk_by_urllen(refs):
             await asyncio.to_thread(
                 supabase.table("knowledge_files")
                 .delete()
