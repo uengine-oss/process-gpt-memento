@@ -299,6 +299,44 @@ async def glossary_inline(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GET /glossary/terms
+# ─────────────────────────────────────────────────────────────────────────────
+# 구조화 용어사전(glossary_terms) 의 tenant 전체 용어를 반환. rfi-translate 등 소비자가
+# 이 목록으로 term-lock 매처를 만들어 '문서에 실제 등장한 용어만' 고정 번역한다.
+# (프롬프트 통째 주입이 아니라 소비자측 스캔 → 사전이 수만 개여도 스캔은 문서 길이에만 비례)
+# ─────────────────────────────────────────────────────────────────────────────
+@router.get("/glossary/terms")
+async def glossary_terms(
+    tenant_id: str,
+    file_ids: Optional[List[str]] = Query(default=None),
+):
+    """구조화 용어사전 행(영문/한글뜻/약어)을 반환.
+
+    Args:
+        tenant_id: 필수.
+        file_ids: 선택. 주면 해당 사전 파일들로 한정, 없으면 tenant 전체.
+
+    Returns:
+        ``{"response": [{english, korean, abbreviation}, ...], "count": int}``
+    """
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id required")
+
+    try:
+        from app.services.glossary_terms import list_terms
+        cleaned_ids = [str(x) for x in (file_ids or []) if x] or None
+        terms = await list_terms(tenant_id, file_ids=cleaned_ids)
+        logger.info(
+            "[/glossary/terms] tenant=%s ids=%s → %d terms",
+            tenant_id, (len(cleaned_ids) if cleaned_ids else "all"), len(terms),
+        )
+        return {"response": terms, "count": len(terms)}
+    except Exception as e:
+        logger.exception("[/glossary/terms] failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GET /document/grep
 # ─────────────────────────────────────────────────────────────────────────────
 

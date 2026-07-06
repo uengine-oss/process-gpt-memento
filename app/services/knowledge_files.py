@@ -194,14 +194,16 @@ _normalize_doc_role = normalize_doc_role
 
 # ── 업로드 허용 확장자 정책 (doc_role 별) ──────────────────────────────────
 # 지식베이스 업로드는 분류(doc_role)별로 받는 확장자를 제한한다.
-#   content/glossary/reference : 일반 문서 (pdf/hwp/hwpx/doc/docx/pptx/txt)
+#   content/reference          : 일반 문서 (pdf/hwp/hwpx/doc/docx/pptx/txt)
+#   glossary (용어 사전)       : 고정형 CSV(영문,한글뜻,약어) 전용 — glossary_terms 테이블로
+#                                직행시키는 소스 (term-lock 소비). csv 만 허용.
 #   template (양식)            : 편집형 양식만 (hwpx/docx)
 #   dataset (데이터)           : 정량 데이터만 (xlsx)
 #   legal_review (검토 사례)   : 변호사 메모 추출이 docx XML 한정 → docx 만
 _DOC_EXTS: tuple = (".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".pptx", ".txt")
 ROLE_ALLOWED_EXTENSIONS: Dict[str, tuple] = {
     "content": _DOC_EXTS,
-    "glossary": _DOC_EXTS,
+    "glossary": (".csv",),
     "reference": _DOC_EXTS,
     "template": (".hwpx", ".docx"),
     "dataset": (".xlsx",),
@@ -336,22 +338,22 @@ async def delete_entry(
                 )
 
     # 1. Chroma 임베딩 삭제 (documents row 삭제 *전*에 — 의존성은 없지만 보수적 순서)
+    #    쓰기 락 공유(delete_where/ids)로 임베딩과 겹쳐도 단일 writer 충돌 없이 직렬화.
     try:
         from app.services.vector_store import get_vector_store
         vsm = get_vector_store()
         # 청크 임베딩 — Chroma metadata 의 tenant_id + file_id 로 매칭
-        await asyncio.to_thread(
-            vsm.collection.delete,
-            where={"$and": [
+        await vsm.delete_where(
+            {"$and": [
                 {"tenant_id": tenant_id},
                 {"file_id": source_ref},
-            ]},
+            ]}
         )
         # 이미지-분석 임베딩 — file_id 가 없어서 row id 로 직접 삭제
         if image_doc_ids:
             for start in range(0, len(image_doc_ids), 500):
                 batch = image_doc_ids[start:start + 500]
-                await asyncio.to_thread(vsm.collection.delete, ids=batch)
+                await vsm.delete_ids(batch)
         result["chroma_deleted"] = True
     except Exception as e:
         logger.warning("[knowledge_files] delete Chroma embeddings failed: %s", e)
@@ -533,16 +535,16 @@ async def clear_index_artifacts(tenant_id: str, source_ref: str) -> None:
         except Exception as e:
             logger.warning("[knowledge_files] clear: collect image ids failed: %s", e)
 
-    # 1. Chroma 임베딩 (청크 file_id + 이미지-분석 id)
+    # 1. Chroma 임베딩 (청크 file_id + 이미지-분석 id) — 쓰기 락 공유(delete_where/ids)로
+    #    재인덱싱·삭제가 임베딩과 겹쳐도 단일 writer 충돌 없이 직렬화된다.
     try:
         from app.services.vector_store import get_vector_store
         vsm = get_vector_store()
-        await asyncio.to_thread(
-            vsm.collection.delete,
-            where={"$and": [{"tenant_id": tenant_id}, {"file_id": source_ref}]},
+        await vsm.delete_where(
+            {"$and": [{"tenant_id": tenant_id}, {"file_id": source_ref}]}
         )
         for batch in _chunked(image_doc_ids, 500):
-            await asyncio.to_thread(vsm.collection.delete, ids=batch)
+            await vsm.delete_ids(batch)
     except Exception as e:
         logger.warning("[knowledge_files] clear: chroma delete failed: %s", e)
 
@@ -676,19 +678,20 @@ async def delete_entries_bulk(
     result["image_doc_count"] = len(image_doc_ids)
 
     # 1. Chroma 임베딩 삭제 (file_id $in 배치 + 이미지-분석은 id 로)
+    #    *쓰기 락 공유* — 임베딩(add_documents)과 같은 _chroma_write_lock 아래에서 돌아
+    #    동시 인제스트 중에도 SQLite/HNSW 충돌·스래싱 없이 협조 직렬화된다.
     try:
         from app.services.vector_store import get_vector_store
         vsm = get_vector_store()
         for batch in _chunked(refs, _CHROMA_BATCH):
-            await asyncio.to_thread(
-                vsm.collection.delete,
-                where={"$and": [
+            await vsm.delete_where(
+                {"$and": [
                     {"tenant_id": tenant_id},
                     {"file_id": {"$in": batch}},
-                ]},
+                ]}
             )
         for batch in _chunked(image_doc_ids, 500):
-            await asyncio.to_thread(vsm.collection.delete, ids=batch)
+            await vsm.delete_ids(batch)
         result["chroma_deleted"] = True
     except Exception as e:
         logger.warning("[knowledge_files] bulk delete Chroma embeddings failed: %s", e)
@@ -1285,23 +1288,25 @@ async def list_by_role(
         return []
 
 
-async def list_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
-    """프론트 picker용 — 테넌트의 모든 knowledge_files row 반환.
+# 프론트 목록/모달이 쓰는 knowledge_files 조회 필드(요약 상태만 평탄화, 무거운 doc_card 전체는 제외)
+_KF_LIST_SELECT = (
+    "source_type, source_ref, file_name, folder_path, path, drive_folder_id, "
+    "mime_type, size_bytes, modified_time, owner, "
+    "uploaded_by_uid, uploaded_by_name, index_status, "
+    "index_error, indexed_at, updated_at, doc_role, "
+    "abstract_status:doc_card->>abstract_status, abstract:doc_card->>abstract"
+)
 
-    성능: doc_card 전체(요약/키포인트/TOC 등 무거운 JSON)를 끌어오면 5천+ row에서
-    DB→백엔드 전송이 폭발한다. 목록은 요약 *상태* 만 필요하므로 doc_card 에서
-    abstract_status / abstract 두 필드만 평탄화해 조회한다.
+
+async def list_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
+    """테넌트의 *모든* knowledge_files row 반환 (전체 조회 — 대량 테넌트에선 무거우니 폴더 lazy 를 권장).
+
+    성능: doc_card 전체(요약/키포인트/TOC 등 무거운 JSON) 대신 abstract_status/abstract 만 평탄화.
     """
     try:
         result = await asyncio.to_thread(
             supabase.table("knowledge_files")
-            .select(
-                "source_type, source_ref, file_name, folder_path, path, drive_folder_id, "
-                "mime_type, size_bytes, modified_time, owner, "
-                "uploaded_by_uid, uploaded_by_name, index_status, "
-                "index_error, indexed_at, updated_at, doc_role, "
-                "abstract_status:doc_card->>abstract_status, abstract:doc_card->>abstract"
-            )
+            .select(_KF_LIST_SELECT)
             .eq("tenant_id", tenant_id)
             .order("folder_path", desc=False)
             .order("file_name", desc=False)
@@ -1310,4 +1315,110 @@ async def list_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
         return list(result.data or [])
     except Exception as e:
         logger.warning("[knowledge_files] list_for_tenant failed: %s", e)
+        return []
+
+
+async def list_counts(tenant_id: str) -> Dict[str, Any]:
+    """가벼운 카운트 집계 — 폴더 lazy 로딩 시 트리 배지/역할 탭 카운트용.
+
+    파일 전체 행(무거운 abstract 등) 대신 (folder_path, doc_role, index_status) 3개 컬럼만 읽어
+    role별 총계 / role별 폴더 직속 파일수 / 상태별 총계를 서버에서 집계해 *작은 JSON* 으로 반환한다.
+    (수만 건이어도 3컬럼이라 전체 조회보다 훨씬 가볍고, 프론트는 수만 항목을 렌더하지 않음)
+    """
+    role_totals: Dict[str, int] = {}
+    folder_direct: Dict[str, Dict[str, int]] = {}
+    # 인덱싱 완료(indexed) 파일만의 role별 폴더 직속 카운트 — 채팅 모달(선택 가능한 파일만 노출)에서
+    # 폴더 체크박스의 '전체 선택됨' 판정 기준. folder_direct 는 모든 상태 포함(목록 페이지 배지용).
+    folder_direct_indexed: Dict[str, Dict[str, int]] = {}
+    status_totals: Dict[str, int] = {}
+    try:
+        rows = (await asyncio.to_thread(
+            supabase.table("knowledge_files")
+            .select("folder_path, doc_role, index_status")
+            .eq("tenant_id", tenant_id).limit(200000).execute
+        )).data or []
+    except Exception as e:
+        logger.warning("[knowledge_files] list_counts failed: %s", e)
+        return {"role_totals": {}, "folder_direct": {}, "folder_direct_indexed": {}, "status_totals": {}}
+    for r in rows:
+        role = (r.get("doc_role") or "content")
+        st = r.get("index_status") or "unknown"
+        fp = (r.get("folder_path") or "").strip().strip("/")
+        role_totals[role] = role_totals.get(role, 0) + 1
+        status_totals[st] = status_totals.get(st, 0) + 1
+        if fp:
+            d = folder_direct.setdefault(role, {})
+            d[fp] = d.get(fp, 0) + 1
+            if st == "indexed":
+                di = folder_direct_indexed.setdefault(role, {})
+                di[fp] = di.get(fp, 0) + 1
+    return {
+        "role_totals": role_totals,
+        "folder_direct": folder_direct,
+        "folder_direct_indexed": folder_direct_indexed,
+        "status_totals": status_totals,
+    }
+
+
+async def list_for_folder(
+    tenant_id: str, folder_path: str, recursive: bool = False
+) -> List[Dict[str, Any]]:
+    """*폴더 단위* knowledge_files 조회 — lazy 로딩용(수만 건 테넌트에서 전체 조회 회피).
+
+    - recursive=False: 그 폴더에 *직접* 든 파일만 (목록 페이지 표시용).
+    - recursive=True : 그 폴더 + 모든 하위 파일 (모달에서 폴더 선택 → 파일 refs 해결용).
+    prefix LIKE 파싱 안전을 위해 exact/prefix 를 분리 질의 후 병합(list_files_in_folder_recursive 와 동일 패턴).
+    """
+    fp = (folder_path or "").strip().strip("/")
+    if not tenant_id or not fp:
+        return []
+    rows: List[Dict[str, Any]] = []
+    try:
+        exact = await asyncio.to_thread(
+            supabase.table("knowledge_files").select(_KF_LIST_SELECT)
+            .eq("tenant_id", tenant_id).eq("folder_path", fp)
+            .order("file_name", desc=False).execute
+        )
+        rows.extend(exact.data or [])
+    except Exception as e:
+        logger.warning("[knowledge_files] list_for_folder exact failed: %s", e)
+    if recursive:
+        try:
+            child = await asyncio.to_thread(
+                supabase.table("knowledge_files").select(_KF_LIST_SELECT)
+                .eq("tenant_id", tenant_id).like("folder_path", f"{fp}/%")
+                .order("folder_path", desc=False).order("file_name", desc=False).execute
+            )
+            rows.extend(child.data or [])
+        except Exception as e:
+            logger.warning("[knowledge_files] list_for_folder children failed: %s", e)
+    return rows
+
+
+async def search_by_name(
+    tenant_id: str, q: str, indexed_only: bool = False, limit: int = 300
+) -> List[Dict[str, Any]]:
+    """파일명 부분일치 검색 — 채팅 모달의 lazy 트리에서 '전체 로드 없이' 검색을 지원.
+
+    수만 건 테넌트에서 전체를 프론트로 내리지 않고, file_name ILIKE 로 서버에서 좁혀 상위 N건만 반환한다.
+    indexed_only=True 면 선택 가능한(인덱싱 완료) 파일만.
+    """
+    term = (q or "").strip()
+    if not tenant_id or not term:
+        return []
+    # PostgREST ilike 와일드카드 — 특수문자(%,_,,)는 이스케이프해 리터럴 매칭
+    safe = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace(",", " ")
+    try:
+        query = (
+            supabase.table("knowledge_files").select(_KF_LIST_SELECT)
+            .eq("tenant_id", tenant_id).ilike("file_name", f"%{safe}%")
+        )
+        if indexed_only:
+            query = query.eq("index_status", "indexed")
+        result = await asyncio.to_thread(
+            query.order("file_name", desc=False).limit(limit).execute
+        )
+        return list(result.data or [])
+    except Exception as e:
+        logger.warning("[knowledge_files] search_by_name failed: %s", e)
         return []

@@ -211,12 +211,44 @@ async def _index_uploaded_file(
             # 추출본은 doc_card.glossary_compact 에 저장. /glossary/inline 이 우선 활용.
             # 실패해도 인덱싱은 indexed 로 남김 (raw page fallback 동작).
             if role_norm == "glossary":
+                # ── 우선: 고정형 CSV(영문,한글뜻,약어) 는 구조화 테이블(glossary_terms)로 직행 ──
+                # LLM 정제 없이 행 그대로 저장 → rfi-translate 등 소비자가 term-lock 으로 활용.
+                # 구조화 파싱이 성립하면 compact 추출은 건너뛴다(중복/토큰낭비 방지).
+                structured_done = False
                 try:
-                    from app.services.glossary_extraction import extract_and_save_glossary_compact
-                    gloss_result = await extract_and_save_glossary_compact(
-                        tenant_id=tenant_id, file_id=storage_path,
+                    from app.services.glossary_terms import (
+                        parse_glossary_terms,
+                        replace_file_terms,
                     )
-                    if gloss_result.get("saved"):
+                    parsed_terms = parse_glossary_terms(file_content, file_name)
+                    if parsed_terms is not None:
+                        n_terms = await replace_file_terms(
+                            tenant_id, storage_path, file_name, parsed_terms,
+                        )
+                        structured_done = True
+                        logger.info(
+                            "[knowledge_admin] %s: structured glossary imported "
+                            "(%d terms → glossary_terms)",
+                            file_name, n_terms,
+                        )
+                except Exception as struct_err:
+                    logger.warning(
+                        "[knowledge_admin] %s: structured glossary parse failed "
+                        "(%s) — fallback: LLM compact 추출",
+                        file_name, struct_err,
+                    )
+
+                try:
+                    if structured_done:
+                        gloss_result = {"saved": False, "structured": True}
+                    else:
+                        from app.services.glossary_extraction import extract_and_save_glossary_compact
+                        gloss_result = await extract_and_save_glossary_compact(
+                            tenant_id=tenant_id, file_id=storage_path,
+                        )
+                    if gloss_result.get("structured"):
+                        pass  # 구조화 저장 완료 — 위에서 이미 로깅.
+                    elif gloss_result.get("saved"):
                         logger.info(
                             "[knowledge_admin] %s: glossary extracted & saved "
                             "(terms=%d, ok_batches=%d/%d)",
@@ -399,6 +431,26 @@ async def knowledge_ingest_status(tenant_id: str = Query(...)):
     """백그라운드 인제스트 관측 — 테넌트 upload 파일 상태별 카운트 + 큐/동시성 스냅샷."""
     from app.services.ingest_queue import ingest_status_counts
     return await ingest_status_counts(tenant_id)
+
+
+@router.get("/knowledge/files/counts")
+async def knowledge_files_counts(tenant_id: str = Query(...)):
+    """폴더 lazy 로딩용 경량 카운트 — role별 총계 / role별 폴더 직속 파일수 / 상태별 총계."""
+    from app.services.knowledge_files import list_counts
+    return await list_counts(tenant_id)
+
+
+@router.get("/knowledge/files/search")
+async def knowledge_files_search(
+    tenant_id: str = Query(...),
+    q: str = Query(...),
+    indexed_only: bool = Query(False),
+    limit: int = Query(300),
+):
+    """파일명 부분일치 검색 — lazy 트리에서 전체 로드 없이 검색. 상위 N건만 반환."""
+    from app.services.knowledge_files import search_by_name
+    rows = await search_by_name(tenant_id, q, indexed_only=indexed_only, limit=limit)
+    return {"file_details": rows}
 
 
 @router.post("/knowledge/files/reindex")

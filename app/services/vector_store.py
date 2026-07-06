@@ -465,6 +465,25 @@ class VectorStoreManager:
         except Exception as e:
             print(f"Error in _save_image_metadata_once: {e}")
 
+    async def delete_where(self, where: Dict[str, Any]) -> None:
+        """Chroma 임베딩을 메타데이터 필터로 삭제 — *쓰기 락 아래*에서.
+
+        add_documents 의 upsert 와 같은 ``_chroma_write_lock`` 을 공유해, 임베딩 진행 중
+        삭제가 겹쳐도 SQLite/HNSW 레벨에서 충돌("database is locked")·스래싱을 막는다.
+        (락 없이 직접 collection.delete 를 부르면 단일 writer 리소스를 두고 경합해 극단적으로 느려짐.)
+        """
+        if not where:
+            return
+        async with _get_chroma_write_lock():
+            await asyncio.to_thread(self.collection.delete, where=where)
+
+    async def delete_ids(self, ids: List[str]) -> None:
+        """Chroma 임베딩을 id 리스트로 삭제 — *쓰기 락 아래*에서 (delete_where 와 동일 취지)."""
+        if not ids:
+            return
+        async with _get_chroma_write_lock():
+            await asyncio.to_thread(self.collection.delete, ids=ids)
+
     async def similarity_search(
         self,
         query: str,

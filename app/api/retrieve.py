@@ -356,8 +356,13 @@ async def list_documents(
     tenant_id: str,
     drive_folder_id: Optional[str] = None,
     include_images: bool = False,
+    folder_path: Optional[str] = None,
+    recursive: bool = False,
 ):
     """테넌트의 내부 지식공간 파일 목록을 knowledge_files에서 조회한다.
+
+    - folder_path 미지정: 테넌트 전체(전체 조회 — 대량 테넌트에선 무거움).
+    - folder_path 지정: 그 폴더 파일만(lazy 로딩). recursive=True 면 하위 포함.
 
     응답:
         files: [file_name, ...]                       (역호환)
@@ -365,9 +370,12 @@ async def list_documents(
         total: 개수
     """
     try:
-        from app.services.knowledge_files import list_for_tenant
+        from app.services.knowledge_files import list_for_tenant, list_for_folder
 
-        rows = await list_for_tenant(tenant_id)
+        if folder_path is not None and str(folder_path).strip().strip("/"):
+            rows = await list_for_folder(tenant_id, folder_path, recursive)
+        else:
+            rows = await list_for_tenant(tenant_id)
         if drive_folder_id:
             rows = [r for r in rows if r.get("drive_folder_id") == drive_folder_id]
 

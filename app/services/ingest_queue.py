@@ -40,7 +40,18 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
 # ── 설정(env) ────────────────────────────────────────────────────────────────
+# 인제스트 전체 킬스위치. false 면 워커/복구/sweeper 를 아예 안 띄운다 → 재시작해도
+# 대기/처리중 잡을 다시 집지 않는다. (대량 삭제 등으로 임베딩을 잠시 멈춰야 할 때 사용:
+#  MEMENTO_INGEST_ENABLED=false 로 재시작 → 삭제 → true 로 되돌려 재시작하면 복구가 이어받음.)
+_INGEST_ENABLED = _bool_env("MEMENTO_INGEST_ENABLED", True)
 _BASE_CONCURRENCY = max(1, _int_env("MEMENTO_INGEST_CONCURRENCY", 4))
 _MAX_CONCURRENCY = max(_BASE_CONCURRENCY, _int_env("MEMENTO_INGEST_MAX_CONCURRENCY", 12))
 _MAX_RETRIES = max(0, _int_env("MEMENTO_INGEST_MAX_RETRIES", 3))
@@ -403,6 +414,12 @@ async def start_ingest_workers() -> None:
     if _started:
         return
     _started = True
+    if not _INGEST_ENABLED:
+        # 킬스위치 ON — 워커/복구/sweeper 미기동. 큐에 잡이 들어와도(enqueue) 처리하지 않는다.
+        logger.warning(
+            "[ingest] DISABLED via MEMENTO_INGEST_ENABLED=false — workers/recovery/sweeper not started"
+        )
+        return
     _get_queue()
     for i in range(_MAX_CONCURRENCY):
         _workers.append(_spawn(_worker(i)))
