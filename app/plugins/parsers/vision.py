@@ -24,11 +24,12 @@ import httpx
 from app.core.config import resolve_llm_config
 
 
-# ─── 동작 상수 (env 아님 — parsers/config.py 의 Synap 상수와 동일 컨벤션) ──────
+# ─── 동작 상수 ──────────────────────────────────────────────────────────────
 PDF_VISION_ENABLED = True       # PDF 스캔/이미지 페이지 VLM 처리 on/off
-# 문서 전체 VLM 동시 호출 수 (ThreadPool). frentis vision 서버 실측: 4=안정(10p 19s),
-# 10=전부 500(단일 GPU 동시추론 한계). 서버 증설 전까지 4 유지.
-VISION_MAX_WORKERS = 4
+# 문서 전체 VLM 동시 호출 수 (ThreadPool). 비전 서버 용량에 맞춰 조절:
+#   폐쇄망 단일 GPU 로 VRAM 여유 적으면 1~2 (OOM 방지), 클라우드/여유 있으면 8+ 로 상향.
+#   env ``MEMENTO_PDF_VISION_WORKERS`` 로 재배포 없이 조절. (기본 4)
+VISION_MAX_WORKERS = max(1, int(os.getenv("MEMENTO_PDF_VISION_WORKERS", "4") or "4"))
 OCR_MAX_TOKENS = 8192           # 스캔 페이지 통합 OCR
 DESCRIBE_MAX_TOKENS = 4096      # 개별 그림 설명
 VISION_TIMEOUT_SEC = 300.0      # 개별 호출 timeout(초)
@@ -154,6 +155,9 @@ def run_parallel(tasks: List[Tuple[str, Callable[[], str]]]) -> Dict[str, str]:
     if not tasks:
         return {}
     max_workers = max(1, VISION_MAX_WORKERS)
+    # 실제 동시성 = min(작업수, 설정값). env(MEMENTO_PDF_VISION_WORKERS) 반영 여부를 여기서 확인.
+    print(f"[vision] VLM {len(tasks)}건 → 동시 {min(len(tasks), max_workers)} "
+          f"(MEMENTO_PDF_VISION_WORKERS={max_workers})")
     results: Dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         fut_map = {pool.submit(thunk): key for key, thunk in tasks}

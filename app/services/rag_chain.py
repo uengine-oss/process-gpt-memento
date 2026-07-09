@@ -217,7 +217,7 @@ class RAGChain:
     async def process_and_store_documents(self, documents: list[Document], tenant_id: str) -> bool:
         """Process and store documents in the vector store with integrated image analysis."""
         try:
-            print(f"\nProcessing {len(documents)} documents...")
+            print(f"\n[index] {len(documents)}개 청크 임베딩·벡터스토어 저장 시작...")
 
             try:
                 from main import log_memory_snapshot
@@ -270,7 +270,10 @@ class RAGChain:
         """문서들의 이미지를 분석하고, 해당 이미지가 나오는 페이지/구간의 청크에만 설명 추가."""
         from app.core import config
         if not config.image_analysis_enabled():
-            print("Image analysis disabled (provider does not support vision)")
+            # image_analysis 비활성 = env MEMENTO_IMAGE_ANALYSIS=false 이거나 provider 가 vision 미지원.
+            # (PDF 페이지/영역 vision 은 별개 게이트 PDF_VISION_ENABLED — 이 skip 과 무관하게 동작)
+            reason = "MEMENTO_IMAGE_ANALYSIS=false" if os.getenv("MEMENTO_IMAGE_ANALYSIS") else "provider vision 미지원"
+            print(f"[image-analysis] 임베디드 이미지 재분석 skip ({reason})")
             return
         try:
             # 1) 고유 이미지 수집 (image_id 기준, 한 번만 분석)

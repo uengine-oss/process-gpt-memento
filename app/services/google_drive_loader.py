@@ -16,7 +16,7 @@ import json
 from langchain.schema import Document
 from datetime import datetime
 
-from app.services.document_processor import DocumentProcessor
+from app.services.document_processor import get_document_processor
 
 import fitz  # PyMuPDF for PDF image extraction
 from PIL import Image
@@ -50,7 +50,7 @@ class GoogleDriveLoader:
         self.token_path = token_path
         self.credentials = None
         self.service = drive_service
-        self.document_loader = DocumentProcessor()
+        self.document_loader = get_document_processor()  # 공유 싱글톤 — 청커 중복 생성 방지
         self.tenant_id = tenant_id
         
         # Initialize Supabase client if tenant_id is provided

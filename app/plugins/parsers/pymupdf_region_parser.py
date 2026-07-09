@@ -109,7 +109,7 @@ class PyMuPDFRegionParser(PyMuPDFParser):
                 page_infos.append(info)
 
             if tasks:
-                print(f"[vision] PDF(region) '{file_name}' VLM {len(tasks)}건 처리 시작")
+                print(f"[vision] PDF(region) '{file_name}' VLM 처리 시작")
             results = vision.run_parallel(tasks) if tasks else {}
 
             # ── 2차 패스: Document 조립 ───────────────────────────────────────

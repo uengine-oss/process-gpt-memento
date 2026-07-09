@@ -377,7 +377,7 @@ class DocumentProcessor:
     async def process_documents(self, documents: List[Document], metadata: dict = None) -> List[Document]:
         """Async: Process documents by splitting them into chunks and adding metadata."""
         try:
-            print(f"Processing {len(documents)} documents...")
+            print(f"[chunk] {len(documents)}개 문서(페이지) 청킹 시작...")
             # Add additional metadata if provided
             if metadata:
                 for doc in documents:

@@ -5,7 +5,7 @@ import os
 import io
 from typing import List, Optional, Dict, Any
 from supabase import create_client, Client
-from app.services.document_processor import DocumentProcessor
+from app.services.document_processor import get_document_processor
 import asyncio
 
 from dotenv import load_dotenv
@@ -23,7 +23,9 @@ class SupabaseStorageLoader:
             os.getenv('SUPABASE_URL'),
             os.getenv('SUPABASE_KEY')
         )
-        self.document_processor = DocumentProcessor()
+        # DocumentProcessor(청커 포함)는 실제로 파싱할 때만 필요하다. 업로드 전용 경로
+        # (save-to-storage 는 upload_file_to_storage 만 씀)에서 매번 안 쓰는 processor 를 만들어
+        # 청커가 이중 생성되던 것을 제거 — 파싱 시 get_document_processor() 싱글톤을 lazy 로 쓴다.
         
     async def download_and_process_file(self, file_path: str, metadata: Optional[dict] = None, tenant_id: Optional[str] = None) -> List[dict]:
         """
@@ -51,10 +53,11 @@ class SupabaseStorageLoader:
             # Create a BytesIO object from the response
             file_content = io.BytesIO(response)
             
-            # Process the file using DocumentProcessor
-            documents = await self.document_processor.load_document(file_content, original_filename)
+            # Process the file using DocumentProcessor (공유 싱글톤 — 청커 1회 생성)
+            processor = get_document_processor()
+            documents = await processor.load_document(file_content, original_filename)
             if documents:
-                documents = await self.document_processor.process_documents(documents, metadata or {})
+                documents = await processor.process_documents(documents, metadata or {})
             
             # Add storage metadata
             for doc in documents:
