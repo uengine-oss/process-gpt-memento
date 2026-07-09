@@ -10,12 +10,14 @@ from typing import Dict, Optional, Type
 from . import config
 from .base import BaseParser
 from .pymupdf_parser import PyMuPDFParser
+from .pymupdf_region_parser import PyMuPDFRegionParser
 from .pdfplumber_parser import PdfplumberParser
 from .synap_parser import SynapParser, SynapParseError
 
 
 _REGISTRY: Dict[str, Type[BaseParser]] = {
     PyMuPDFParser.name: PyMuPDFParser,
+    PyMuPDFRegionParser.name: PyMuPDFRegionParser,
     PdfplumberParser.name: PdfplumberParser,
 }
 
