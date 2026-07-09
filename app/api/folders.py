@@ -214,26 +214,39 @@ async def folders_tree(
     #   - 둘 다 없으면 레거시/직접호출 하위호환으로 tenant 전체.
     allow = [str(x) for x in (file_ids or []) if x]
     scope_folders = [str(x) for x in (folder_paths or []) if x and str(x).strip().strip("/")]
+    _COLS = "source_ref, file_name, folder_path, doc_card, doc_role"
     try:
+        # 개별 file_ids(allow) 와 폴더 스코프(scope_folders)를 union. 단일 소스면 예전과 동일 결과.
+        rows = []
+        _seen: set = set()
+
+        def _add_tree_rows(new_rows):
+            for r in (new_rows or []):
+                key = (str(r.get("folder_path") or ""), str(r.get("file_name") or ""))
+                if key in _seen:
+                    continue
+                _seen.add(key)
+                rows.append(r)
+
         if allow:
-            rows = await _fetch_kf_by_refs(
-                tenant_id, "file_name, folder_path, doc_card, doc_role", allow, doc_role=doc_role
-            )
-        elif scope_folders:
+            _add_tree_rows(await _fetch_kf_by_refs(tenant_id, _COLS, allow, doc_role=doc_role))
+        if scope_folders:
             from app.services.knowledge_files import fetch_rows_by_folders
-            rows = await fetch_rows_by_folders(
-                tenant_id, "source_ref, file_name, folder_path, doc_card, doc_role",
-                scope_folders, doc_role=doc_role, limit=_TREE_FETCH_LIMIT,
-            )
-        else:
+            _add_tree_rows(await fetch_rows_by_folders(
+                tenant_id, _COLS, scope_folders, doc_role=doc_role, limit=_TREE_FETCH_LIMIT,
+            ))
+        if not allow and not scope_folders:
             q = (
                 supabase.table("knowledge_files")
-                .select("file_name, folder_path, doc_card, doc_role")
+                .select(_COLS)
                 .eq("tenant_id", tenant_id)
             )
             if doc_role:
                 q = q.eq("doc_role", doc_role)
-            rows = (await asyncio.to_thread(q.limit(_TREE_FETCH_LIMIT).execute)).data or []
+            base = (await asyncio.to_thread(q.limit(_TREE_FETCH_LIMIT).execute)).data or []
+            # 채팅 첨부(folder_path="")가 스코프 없는 전체 트리의 루트에 뜨지 않게 제외.
+            from app.services.knowledge_files import _is_chat_attachment_ref
+            _add_tree_rows([r for r in base if not _is_chat_attachment_ref(r.get("source_ref"))])
     except Exception as e:
         logger.exception("[/folders/tree] query failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -379,8 +392,10 @@ async def folders_open(
         return {"folder_path": fp, "subfolders": [], "docs": []}
 
     # 직속 문서 (정확히 이 폴더)
+    #   폴더 스코프 안을 여는 중이면(scope_folders) 폴더 직속 문서 *전부*. 개별 file_ids 모드
+    #   (폴더 스코프 없음)일 때만 그 file_ids 로 좁힌다 → 폴더+파일 공존 시 폴더 문서가 사라지지 않게.
     try:
-        if allow:
+        if allow and not scope_folders:
             direct_rows = await _fetch_kf_by_refs(
                 tenant_id, "file_name, folder_path, path, doc_card, doc_role, mime_type",
                 allow, doc_role=doc_role, folder_eq=fp,
@@ -401,7 +416,7 @@ async def folders_open(
 
     # 하위 (descendant) — 하위폴더 집계용
     try:
-        if allow:
+        if allow and not scope_folders:
             desc_rows = await _fetch_kf_by_refs(
                 tenant_id, "folder_path", allow, doc_role=doc_role, folder_like=f"{fp}/%",
             )

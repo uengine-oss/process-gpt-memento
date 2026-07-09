@@ -104,9 +104,9 @@ async def search(
     if cleaned_folders:
         subtree_ids = await _resolve_subtree_file_ids(tenant_id, cleaned_folders)
         if cleaned_files:
-            # file_ids ∩ subtree — 선택 자료 중 그 폴더 안에 있는 것만.
-            allow = set(cleaned_files)
-            cleaned_files = [fid for fid in subtree_ids if fid in allow]
+            # 폴더 subtree ∪ 개별 file_ids — 둘 다 접근(공존 스코프: 폴더 + 방에 올린 파일 등).
+            # (예전엔 교집합이라, 폴더와 함께 온 개별 파일이 폴더 밖이면 사라졌음.)
+            cleaned_files = sorted(set(subtree_ids) | set(cleaned_files))
         else:
             cleaned_files = subtree_ids
         if not cleaned_files:

@@ -135,12 +135,20 @@ async def catalog(
         cleaned_ids = [str(x) for x in (file_ids or []) if x]
         cleaned_names = [str(x) for x in (file_names or []) if x]
         cleaned_folders = [str(x) for x in (folder_paths or []) if x and str(x).strip().strip("/")]
-        if not cleaned_ids and not cleaned_names and cleaned_folders:
-            # 폴더 스코프 — 수천 file_id 를 URL IN 으로 안 넘기고 폴더 경로로 직접 조회.
-            from app.services.knowledge_files import fetch_rows_by_folders
-            rows = await fetch_rows_by_folders(tenant_id, _CATALOG_COLS, cleaned_folders)
-            rows = sorted(rows, key=lambda r: (r.get("file_name") or ""))
-        else:
+        # 개별(file_ids/names) 과 폴더 스코프를 *union* 으로 합친다(공존 스코프: 폴더 + 방 첨부 등).
+        # 단일 소스면 각 분기 결과가 예전과 동일 → 기존 호출 영향 없음. 둘 다면 합쳐서 dedup.
+        rows: list = []
+        seen_refs: set = set()
+
+        def _add_rows(new_rows):
+            for r in (new_rows or []):
+                ref = r.get("source_ref")
+                if ref in seen_refs:
+                    continue
+                seen_refs.add(ref)
+                rows.append(r)
+
+        if cleaned_ids or cleaned_names:
             query = (
                 supabase.table("knowledge_files")
                 .select(_CATALOG_COLS)
@@ -150,9 +158,20 @@ async def catalog(
                 query = query.in_("source_ref", cleaned_ids)
             elif cleaned_names:
                 query = query.in_("file_name", cleaned_names)
-            query = query.order("file_name", desc=False)
-            response = await asyncio.to_thread(query.execute)
-            rows = response.data or []
+            response = await asyncio.to_thread(query.order("file_name", desc=False).execute)
+            _add_rows(response.data or [])
+        if cleaned_folders:
+            from app.services.knowledge_files import fetch_rows_by_folders
+            _add_rows(await fetch_rows_by_folders(tenant_id, _CATALOG_COLS, cleaned_folders))
+        if not cleaned_ids and not cleaned_names and not cleaned_folders:
+            # 스코프 없음 → tenant 전체. 채팅 첨부는 전체조회에 안 섞이게 제외.
+            from app.services.knowledge_files import _is_chat_attachment_ref
+            response = await asyncio.to_thread(
+                supabase.table("knowledge_files").select(_CATALOG_COLS)
+                .eq("tenant_id", tenant_id).order("file_name", desc=False).execute
+            )
+            _add_rows([r for r in (response.data or []) if not _is_chat_attachment_ref(r.get("source_ref"))])
+        rows = sorted(rows, key=lambda r: (r.get("file_name") or ""))
 
         out: List[Dict[str, Any]] = []
         for r in rows:
@@ -412,24 +431,19 @@ async def document_grep(
             "truncated": False,
             "error": f"path '{path}' not found in tenant '{tenant_id}'",
         }
-    # ★ 보안 경계 — file_ids(개별) 또는 folder_paths(폴더 스코프) 밖이면 본문 조회 거부.
-    #   folder_paths 는 path 접두어로 순수 검사(수천 refs 열거 없이 스케일).
+    # ★ 보안 경계 — 선택한 자료(폴더 스코프 ∪ 개별 file_ids) 밖이면 본문 조회 거부.
+    #   folder_paths 는 path 접두어로 순수 검사(수천 refs 열거 없이 스케일). 폴더·파일 공존 시 union.
     _allow = [str(x) for x in (file_ids or []) if x]
     _scope = [_norm_folder(x) for x in (folder_paths or []) if _norm_folder(x)]
     _path_norm = (path or "").strip().strip("/")
-    if _scope:
-        if not any(_path_norm == s or _path_norm.startswith(s + "/") for s in _scope):
+    if _scope or _allow:
+        _in_folder = bool(_scope) and any(_path_norm == s or _path_norm.startswith(s + "/") for s in _scope)
+        _in_files = bool(_allow) and (file_id in _allow)
+        if not (_in_folder or _in_files):
             return {
                 "response": [], "total_matches": 0, "truncated": False,
-                "error": f"path '{path}' 는 선택한 폴더 범위 밖입니다.",
+                "error": f"path '{path}' 는 선택한 자료(폴더/파일) 범위 밖입니다.",
             }
-    elif _allow and file_id not in _allow:
-        return {
-            "response": [],
-            "total_matches": 0,
-            "truncated": False,
-            "error": f"path '{path}' 는 선택한 자료 범위 밖입니다.",
-        }
     file_name = path  # 표시/인용용 (페이지 조회는 file_id 기준)
 
     # 패턴 컴파일 (regex 모드면 정규식, 아니면 literal escape)
@@ -597,22 +611,18 @@ async def document_page(
             "pages": [],
             "error": f"path '{path}' not found in tenant '{tenant_id}'",
         }
-    # ★ 보안 경계 — file_ids(개별) 또는 folder_paths(폴더 스코프) 밖이면 본문 조회 거부.
+    # ★ 보안 경계 — 선택한 자료(폴더 스코프 ∪ 개별 file_ids) 밖이면 본문 조회 거부. 공존 시 union.
     _allow = [str(x) for x in (file_ids or []) if x]
     _scope = [_norm_folder(x) for x in (folder_paths or []) if _norm_folder(x)]
     _path_norm = (path or "").strip().strip("/")
-    if _scope:
-        if not any(_path_norm == s or _path_norm.startswith(s + "/") for s in _scope):
+    if _scope or _allow:
+        _in_folder = bool(_scope) and any(_path_norm == s or _path_norm.startswith(s + "/") for s in _scope)
+        _in_files = bool(_allow) and (file_id in _allow)
+        if not (_in_folder or _in_files):
             return {
                 "file_name": file_name, "pages": [],
-                "error": f"path '{path}' 는 선택한 폴더 범위 밖입니다.",
+                "error": f"path '{path}' 는 선택한 자료(폴더/파일) 범위 밖입니다.",
             }
-    elif _allow and file_id not in _allow:
-        return {
-            "file_name": file_name,
-            "pages": [],
-            "error": f"path '{path}' 는 선택한 자료 범위 밖입니다.",
-        }
 
     # 다운로드 핸들 — 출처 칩에서 원본 파일을 내려받게 source_type/source_ref/실제 file_name 동봉.
     # (source_ref = drive: google file_id / upload: storage_path)

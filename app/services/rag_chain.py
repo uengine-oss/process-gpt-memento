@@ -425,9 +425,14 @@ class RAGChain:
             return []
 
     async def save_processed_files(self, file_ids: List[str], tenant_id: str, file_names: List[str] = None) -> bool:
-        """Save list of processed files"""
+        """Save list of processed files (멱등 — 재처리/이중 호출 시 덮어쓰기).
+
+        processed_files 는 (file_id, tenant_id) unique 제약이 있어 plain insert 는 같은 파일을
+        다시 처리할 때 23505(duplicate key)로 터진다. 세션 첨부는 같은 storage 파일이 결정적
+        file_id(session/{tenant}/{uuid}) 로 매핑돼 재업로드/이중 호출이 흔하므로 upsert 로 저장한다.
+        """
         try:
-            # Prepare data for batch insert
+            # Prepare data for batch upsert
             data = []
             for i, file_id in enumerate(file_ids):
                 data.append({
@@ -435,14 +440,14 @@ class RAGChain:
                     'tenant_id': tenant_id,
                     'file_name': file_names[i] if file_names else None
                 })
-            
-            # Batch insert
+
+            # Batch upsert — 중복 (file_id, tenant_id) 는 갱신(파일명 최신화), 신규는 삽입
             await asyncio.to_thread(
                 self.supabase.table('processed_files')
-                .insert(data)
+                .upsert(data, on_conflict='file_id,tenant_id')
                 .execute
             )
-            
+
             return True
         except Exception as e:
             print(f"Error saving processed files: {e}")

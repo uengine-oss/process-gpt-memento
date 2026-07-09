@@ -61,6 +61,17 @@ INDEX_STATUS_INDEXED = "indexed"
 INDEX_STATUS_FAILED = "failed"
 INDEX_STATUS_EXCLUDED = "excluded"
 
+# 채팅 첨부(임시/세션 업로드)의 source_ref prefix. 이 파일들은 knowledge_files 에 등록돼
+# 에이전트가 file_id 로 읽을 수 있지만, KB 브라우저/폴더트리/카탈로그 *전체조회* 에는 안 뜬다.
+#  · files/…   : /save-to-storage (채팅 첨부 — 프론트 업로드)
+#  · session/… : /process-session-file (에이전트 폴백 ingest)
+_CHAT_ATTACHMENT_PREFIXES = ("files/", "session/")
+
+
+def _is_chat_attachment_ref(source_ref) -> bool:
+    """source_ref 가 채팅 첨부(전체조회에서 숨길 대상)인가."""
+    return str(source_ref or "").startswith(_CHAT_ATTACHMENT_PREFIXES)
+
 
 def _safe_int(v: Any) -> Optional[int]:
     if v is None:
@@ -1338,7 +1349,9 @@ async def list_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
             .order("file_name", desc=False)
             .execute
         )
-        return list(result.data or [])
+        # 채팅 첨부(source_ref 가 'session/' 또는 'files/')는 KB 브라우저/폴더트리에 안 뜨게 제외.
+        # (에이전트의 카탈로그/페이지 읽기는 file_id 로 직접 접근하므로 영향 없음)
+        return [r for r in (result.data or []) if not _is_chat_attachment_ref(r.get("source_ref"))]
     except Exception as e:
         logger.warning("[knowledge_files] list_for_tenant failed: %s", e)
         return []
@@ -1360,13 +1373,16 @@ async def list_counts(tenant_id: str) -> Dict[str, Any]:
     try:
         rows = (await asyncio.to_thread(
             supabase.table("knowledge_files")
-            .select("folder_path, doc_role, index_status")
+            .select("folder_path, doc_role, index_status, source_ref")
             .eq("tenant_id", tenant_id).limit(200000).execute
         )).data or []
     except Exception as e:
         logger.warning("[knowledge_files] list_counts failed: %s", e)
         return {"role_totals": {}, "folder_direct": {}, "folder_direct_indexed": {}, "status_totals": {}}
     for r in rows:
+        # 채팅 첨부는 카운트에서 제외 (KB 브라우저 배지/역할탭 오염 방지)
+        if _is_chat_attachment_ref(r.get("source_ref")):
+            continue
         role = (r.get("doc_role") or "content")
         st = r.get("index_status") or "unknown"
         fp = (r.get("folder_path") or "").strip().strip("/")

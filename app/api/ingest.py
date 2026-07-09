@@ -144,6 +144,7 @@ async def process_session_file(request: ProcessSessionFileRequest):
         storage_loader = SupabaseStorageLoader()
         image_extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]
         is_image = file_extension in image_extensions
+        page_docs = None  # 비이미지: 페이지 단위 본문 (document_pages 저장용 — grep/read_document_page 가 읽음)
 
         if is_image:
             import asyncio as _asyncio
@@ -158,11 +159,26 @@ async def process_session_file(request: ProcessSessionFileRequest):
                 file_content, original_filename, file_id, request.tenant_id, None, storage_type="storage",
             ) or []
         else:
-            documents = await storage_loader.download_and_process_file(
+            # 정상 업로드와 동일하게 *페이지 로드 → 청크* 2단계. download_and_process_file 은 청크만
+            # 돌려줘 page_docs 가 사라지므로 직접 로드한다(document_pages 에 페이지 본문을 남기기 위함).
+            import asyncio as _asyncio
+            raw = await _asyncio.to_thread(
+                storage_loader.supabase.storage.from_("files").download,
                 storage_path,
-                metadata={"tenant_id": request.tenant_id, "original_filename": original_filename},
-                tenant_id=request.tenant_id,
             )
+            file_bytes = raw if isinstance(raw, bytes) else (
+                raw.read() if hasattr(raw, "read") else bytes(raw)
+            )
+            processor = get_document_processor()
+            page_docs = await processor.load_document(io.BytesIO(file_bytes), original_filename)
+            if not page_docs:
+                raise HTTPException(status_code=400, detail="문서에서 본문 추출 실패 (빈 본문 또는 파싱 실패)")
+            documents = await processor.process_documents(page_docs, {
+                "tenant_id": request.tenant_id,
+                "original_filename": original_filename,
+                "file_path": storage_path,
+                "storage_type": "storage",
+            })
 
         if not documents:
             raise HTTPException(status_code=400, detail="문서에서 청크 추출 실패 (빈 본문 또는 파싱 실패)")
@@ -183,7 +199,33 @@ async def process_session_file(request: ProcessSessionFileRequest):
         if not ok:
             raise HTTPException(status_code=500, detail="벡터 저장 실패")
 
-        # 5) processed_files 테이블에도 등록 (knowledge 조회 호환)
+        # 5) knowledge_files 등록 — 에이전트의 카탈로그/경로해석(_resolve_file_id) 이 이 테이블에 의존.
+        #    이게 없어서 세션 첨부가 "지식베이스에 등록되어있지 않아" 로 못 읽히던 문제 수정.
+        #    source_ref = 세션 file_id(청크 metadata.file_id 와 동일), folder_path="" 로 KB 폴더트리엔 숨김.
+        #    upsert(on_conflict) 라 같은 파일 재처리(이중 호출)에도 멱등.
+        try:
+            from app.services.knowledge_files import register_uploaded_file, INDEX_STATUS_INDEXED
+            await register_uploaded_file(
+                tenant_id=request.tenant_id,
+                storage_path=file_id,
+                file_name=original_filename,
+                folder_path="",
+                initial_status=INDEX_STATUS_INDEXED,
+                doc_role=doc_role,
+            )
+        except Exception as exc:
+            print(f"[process-session-file] knowledge_files 등록 실패 (계속): {exc}")
+
+        # 6) document_pages 저장 — read_document_page / grep_in_document 가 벡터스토어가 아니라
+        #    이 테이블에서 페이지 본문을 읽는다. (이미지 첨부는 페이지 개념이 없어 skip)
+        if page_docs:
+            try:
+                from app.services.document_pages import post_load_hook
+                await post_load_hook(request.tenant_id, file_id, page_docs, skip_abstract=True)
+            except Exception as exc:
+                print(f"[process-session-file] document_pages 저장 실패 (계속): {exc}")
+
+        # 7) processed_files 테이블에도 등록 (knowledge 조회 호환)
         try:
             await rag.save_processed_files([file_id], request.tenant_id, [original_filename])
         except Exception as exc:
@@ -361,6 +403,9 @@ async def save_to_storage(
         is_image = file_extension in image_extensions
 
         has_uploaded_images = False
+        # 비이미지 문서의 페이지 docs — 아래에서 document_pages 등록에 재사용(채팅 첨부도
+        # KB 파일과 동일하게 read_document_page/grep 이 되도록).
+        page_docs_for_reg = None
 
         if is_image:
             file_id = storage_file_path.replace("/", "_").replace("\\", "_")
@@ -394,6 +439,7 @@ async def save_to_storage(
             docs = await processor.load_document(file_io, file_name)
             if not docs:
                 raise HTTPException(status_code=400, detail="Failed to load document")
+            page_docs_for_reg = docs  # document_pages 등록용(페이지 단위 본문)
 
             documents = await processor.process_documents(docs, {
                 "storage_type": "storage",
@@ -441,8 +487,34 @@ async def save_to_storage(
 
         await rag.save_processed_files([storage_file_path], tenant_id, [file_name])
 
+        # ── 채팅 첨부를 KB 파일과 *동일하게* 만드는 등록 ──
+        # knowledge_files(카탈로그/경로해석) + document_pages(페이지 본문)를 채워, 프론트가 이
+        # file_id(=storage_file_path)를 에이전트에 넘기면 에이전트가 재-ingest 없이 KB 선택 파일과
+        # 똑같이 읽는다(search/catalog/read_document_page/grep). folder_path="" 로 KB 브라우저엔 숨김.
+        # 벡터는 위에서 이미 room 스코프로 저장돼 room-RAG 도 그대로 동작.
+        try:
+            from app.services.knowledge_files import register_uploaded_file, INDEX_STATUS_INDEXED
+            await register_uploaded_file(
+                tenant_id=tenant_id,
+                storage_path=storage_file_path,
+                file_name=file_name,
+                folder_path="",
+                initial_status=INDEX_STATUS_INDEXED,
+                doc_role="content",
+            )
+        except Exception as exc:  # noqa: BLE001 — 등록 실패가 업로드를 막지 않게
+            print(f"[save-to-storage] knowledge_files 등록 실패 (계속): {exc}")
+
+        if page_docs_for_reg:
+            try:
+                from app.services.document_pages import post_load_hook
+                await post_load_hook(tenant_id, storage_file_path, page_docs_for_reg, skip_abstract=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[save-to-storage] document_pages 저장 실패 (계속): {exc}")
+
         return {
             "message": "File uploaded, processed, and stored successfully",
+            "file_id": storage_file_path,   # ← 프론트가 이걸 에이전트 payload 로 넘기면 재-ingest 스킵
             "file_path": storage_file_path,
             "file_name": file_name,
             "public_url": upload_result.get("public_url"),
