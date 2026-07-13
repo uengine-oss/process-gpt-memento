@@ -52,6 +52,16 @@ class PyMuPDFRegionParser(PyMuPDFParser):
     #: 낮추면 VLM 에 가는 이미지 토큰↓ → 비전 서버 VRAM 부담↓ (OOM 완화 레버).
     _RENDER_DPI = 200
 
+    # ── 반복 이미지(로고/워터마크/레터헤드) 감지 파라미터 ──────────────────────
+    #: 같은 위치·크기의 이미지가 문서의 이 비율 이상 페이지에 나타나면 *장식용 보일러플레이트*
+    #: (로고 등)로 보고 VLM 을 부르지 않는다. 550p 문서에서 페이지마다 로고 VLM 을 부르는
+    #: '호출 폭발'의 근본 차단. 픽셀 임계치가 아니라 "반복성" 이라는 상대 신호.
+    _BOILERPLATE_PAGE_RATIO = 0.5
+    #: 반복으로 인정할 최소 페이지 수(짧은 문서에서 우연한 2회 반복을 로고로 오판 방지).
+    _BOILERPLATE_MIN_PAGES = 3
+    #: 이 페이지 수 미만 문서엔 미적용(호출 수가 애초에 적어 이득 없음, 오판 위험만).
+    _BOILERPLATE_MIN_DOC_PAGES = 5
+
     def _parse_sync(self, file_content: bytes, file_name: str) -> List[Document]:
         import fitz  # PyMuPDF
 
@@ -63,6 +73,9 @@ class PyMuPDFRegionParser(PyMuPDFParser):
         docs: List[Document] = []
         try:
             pdf = fitz.open(tmp_path)
+
+            # ── 0차 패스: 반복 이미지(로고/워터마크) 서명 수집 → 페이지당 VLM 스킵 ──
+            boilerplate = self._detect_boilerplate(pdf) if vision_on else set()
 
             # ── 1차 패스: 텍스트/영역 수집 + VLM 작업 등록 ──────────────────────
             page_infos: List[Dict[str, Any]] = []
@@ -89,7 +102,8 @@ class PyMuPDFRegionParser(PyMuPDFParser):
                             tasks.append((key, (lambda b=png: vision.ocr_page_image(b))))
                 elif vision_on and has_text:
                     # 3번: 텍스트 + 이미지 → ★ 이미지 rect 병합 → 영역당 1회.
-                    regions = self._figure_regions(page, page_w, page_h, page_area)
+                    #     (반복 로고/워터마크는 boilerplate 로 이미 제외됨)
+                    regions = self._figure_regions(page, page_w, page_h, page_area, boilerplate)
                     if regions:
                         info["mode"] = "region"
                         for idx, reg in enumerate(regions):
@@ -157,14 +171,48 @@ class PyMuPDFRegionParser(PyMuPDFParser):
 
     # ── 영역(region) 도출 ──────────────────────────────────────────────────────
 
+    def _detect_boilerplate(self, pdf) -> set:
+        """여러 페이지에 반복 등장하는 이미지(로고/워터마크/레터헤드)의 위치 서명 집합.
+
+        같은 위치·크기로 문서의 상당수 페이지에 나타나는 이미지는 장식용 보일러플레이트다.
+        페이지마다 VLM 을 부르면 550p 문서에서 호출이 폭발하므로, 사전 스캔으로 걸러 스킵한다.
+        위치 서명(bbox 양자화)으로 판정 → 로고 xref 공유/페이지별 재삽입을 모두 잡고, 픽셀
+        절대치가 아니라 "반복성" 이라는 상대 신호라 임의성이 낮다.
+        렌더링 없이 get_images/get_image_rects 만 훑으므로 비용은 무시할 수준.
+        """
+        total = pdf.page_count
+        if total < self._BOILERPLATE_MIN_DOC_PAGES:
+            return set()
+        counts: Dict[Tuple[int, int, int, int], set] = {}
+        for pnum, page in enumerate(pdf):
+            for rect in self._image_placement_rects(page):
+                sig = self._placement_signature(rect)
+                counts.setdefault(sig, set()).add(pnum)
+        thresh = max(self._BOILERPLATE_MIN_PAGES, int(total * self._BOILERPLATE_PAGE_RATIO))
+        boiler = {sig for sig, pages in counts.items() if len(pages) >= thresh}
+        if boiler:
+            print(f"[vision] 반복 이미지(로고/워터마크 등) {len(boiler)}종 감지 "
+                  f"→ 페이지당 VLM 스킵 (총 {total}p 중 {thresh}p 이상 반복 기준)")
+        return boiler
+
+    @staticmethod
+    def _placement_signature(bbox: List[float]) -> Tuple[int, int, int, int]:
+        """반복 판정용 위치 서명 — bbox 를 2pt 격자로 양자화.
+
+        같은 로고는 페이지마다 거의 동일 좌표·크기로 배치되므로 서명이 일치한다(부동소수
+        미세 오차는 양자화로 흡수). 위치+크기를 함께 담으므로 크기 다른 그림과 안 섞인다.
+        """
+        return tuple(int(round(c / 2.0)) for c in bbox)  # type: ignore[return-value]
+
     def _figure_regions(
-        self, page, page_w: float, page_h: float, page_area: float
+        self, page, page_w: float, page_h: float, page_area: float, boilerplate: set = None
     ) -> List[Dict[str, Any]]:
         """페이지의 이미지 placement rect 들을 병합해 '그림 영역' 목록을 만든다.
 
         반환: [{"bbox":[x0,y0,x1,y1], "y":float, "coverage":float}] (y정렬).
+        ``boilerplate`` 서명에 해당하는 반복 로고/워터마크는 입력 단계에서 제외한다.
         """
-        rects = self._image_placement_rects(page)
+        rects = self._image_placement_rects(page, boilerplate)
         if not rects:
             return []
         gap = self._MERGE_GAP_FRAC * min(page_w, page_h)
@@ -184,11 +232,12 @@ class PyMuPDFRegionParser(PyMuPDFParser):
         return out
 
     @staticmethod
-    def _image_placement_rects(page) -> List[List[float]]:
+    def _image_placement_rects(page, skip_sigs: set = None) -> List[List[float]]:
         """페이지에 배치된 모든 이미지의 사각형(placement rect) 수집.
 
         XObject 를 *뽑는* 게 아니라 *페이지 상 위치* 를 모은다 → 병합의 입력.
         같은 이미지가 여러 번 배치되면 각 배치가 rect 1개. 1px 이하 노이즈는 제외.
+        ``skip_sigs`` 가 주어지면 위치 서명이 일치하는 rect(반복 로고 등)는 건너뛴다.
         """
         rects: List[List[float]] = []
         try:
@@ -205,7 +254,10 @@ class PyMuPDFRegionParser(PyMuPDFParser):
                 for r in page.get_image_rects(xref):
                     if (r.x1 - r.x0) <= 1 or (r.y1 - r.y0) <= 1:
                         continue
-                    rects.append([float(r.x0), float(r.y0), float(r.x1), float(r.y1)])
+                    rect = [float(r.x0), float(r.y0), float(r.x1), float(r.y1)]
+                    if skip_sigs and PyMuPDFRegionParser._placement_signature(rect) in skip_sigs:
+                        continue  # 반복 로고/워터마크 → 영역 후보에서 제외
+                    rects.append(rect)
             except Exception:
                 continue
         return rects

@@ -16,6 +16,7 @@ from app.api.ingest import router as ingest_router
 from app.api.knowledge_admin import router as knowledge_admin_router
 from app.api.legal_review import router as legal_review_router
 from app.api.navigator import router as navigator_router
+from app.api.parse_preview import router as parse_preview_router
 from app.api.query import router as query_router
 from app.api.retrieve import router as retrieve_router
 from app.api.summary import router as summary_router
@@ -65,6 +66,7 @@ app.include_router(ingest_router)
 app.include_router(knowledge_admin_router)
 app.include_router(legal_review_router)
 app.include_router(navigator_router)
+app.include_router(parse_preview_router)
 app.include_router(folders_router)
 app.include_router(summary_router)
 

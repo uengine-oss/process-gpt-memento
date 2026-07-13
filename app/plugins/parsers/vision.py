@@ -70,6 +70,31 @@ def _disable_thinking() -> bool:
     )
 
 
+def _strip_wrapping_fence(text: str) -> str:
+    """VLM 이 출력 전체를 ```markdown ... ``` 로 감싼 경우 그 *바깥* 펜스만 제거.
+
+    OCR 프롬프트가 "표는 마크다운 표로"라고 지시하면 모델이 페이지 전체를 코드펜스로
+    감싸는 일이 흔하다. 그대로 저장하면 본문 전체가 코드블록이 되어 표/제목이 렌더되지
+    않고 RAG 노이즈가 된다. 첫 줄이 ``` 로 시작하고 마지막이 ``` 로 끝날 때만 벗긴다
+    (본문 중간의 정상 코드블록은 건드리지 않음)."""
+    if not text:
+        return text
+    t = text.strip()
+    if not t.startswith("```"):
+        return t
+    nl = t.find("\n")
+    if nl == -1:
+        return t  # 한 줄뿐이면 펜스로 보지 않음
+    opener = t[:nl].strip()          # "```" 또는 "```markdown"
+    # opener 는 백틱 + (선택)언어토큰만 있어야 진짜 여는 펜스
+    if opener.strip("`").strip().isalnum() or opener == "```":
+        body = t[nl + 1:]
+        if body.rstrip().endswith("```"):
+            body = body.rstrip()[:-3]
+            return body.strip()
+    return t
+
+
 def _vlm_call(image_bytes: bytes, prompt: str, mime_type: str, max_tokens: int) -> str:
     """OpenAI 호환 /chat/completions vision 호출. 실패 시 빈 문자열."""
     cfg = resolve_llm_config()
@@ -114,7 +139,8 @@ def _vlm_call(image_bytes: bytes, prompt: str, mime_type: str, max_tokens: int) 
         content = msg.get("content") or msg.get("reasoning_content") or ""
         if isinstance(content, list):
             content = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
-        return str(content).strip()
+        # VLM 이 출력 전체를 ```markdown ... ``` 로 감싸는 경우가 잦다 → 바깥 펜스 제거.
+        return _strip_wrapping_fence(str(content))
     except Exception as exc:
         print(f"[vision] 호출 실패: {exc}")
         return ""
