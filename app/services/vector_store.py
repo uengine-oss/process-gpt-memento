@@ -74,15 +74,28 @@ class VectorStoreManager:
             config.supabase_dummy_embedding_dimensions()
         )
 
-        persist_dir = Path(config.chroma_persist_directory()).expanduser()
-        if not persist_dir.is_absolute():
-            # 프로젝트 루트 기준 (app/services/vector_store.py → repo root)
-            repo_root = Path(__file__).resolve().parents[2]
-            persist_dir = (repo_root / persist_dir).resolve()
-        persist_dir.mkdir(parents=True, exist_ok=True)
-
         self.chroma_collection_name = config.chroma_collection_name().strip()
-        self.chroma_client = PersistentClient(path=str(persist_dir))
+
+        # ── Chroma client: 서버 모드(HttpClient) 우선, 없으면 in-process(PersistentClient) ──
+        # CHROMA_SERVER_HOST 가 설정되면 별도 Chroma 서버에 붙는다. 대용량 인덱스가 API 프로세스
+        # (이벤트 루프)를 얼리는 문제를 피하기 위한 경로. on-disk 포맷이 동일하므로 기존 데이터를
+        # 서버가 그대로 서빙한다(재임베딩 불필요). 미설정이면 기존 로컬 동작 그대로.
+        server_host = config.chroma_server_host()
+        if server_host:
+            import chromadb
+            server_port = config.chroma_server_port()
+            self.chroma_client = chromadb.HttpClient(host=server_host, port=server_port)
+            print(f"[vector_store] Chroma 서버 모드: http://{server_host}:{server_port}", flush=True)
+        else:
+            persist_dir = Path(config.chroma_persist_directory()).expanduser()
+            if not persist_dir.is_absolute():
+                # 프로젝트 루트 기준 (app/services/vector_store.py → repo root)
+                repo_root = Path(__file__).resolve().parents[2]
+                persist_dir = (repo_root / persist_dir).resolve()
+            persist_dir.mkdir(parents=True, exist_ok=True)
+            self.chroma_client = PersistentClient(path=str(persist_dir))
+            print(f"[vector_store] Chroma in-process 모드: {persist_dir}", flush=True)
+
         self.collection = self.chroma_client.get_or_create_collection(
             name=self.chroma_collection_name,
             metadata={"hnsw:space": "cosine"},

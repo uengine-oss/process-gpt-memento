@@ -192,6 +192,22 @@ def chroma_collection_name() -> str:
     return _env("CHROMA_COLLECTION_NAME", CHROMA_COLLECTION_NAME)
 
 
+def chroma_server_host() -> str:
+    """설정 시 Chroma 를 *서버 모드*(HttpClient)로 사용. 빈 값이면 in-process PersistentClient.
+
+    대용량 인덱스에서 인프로세스 Chroma 가 API 프로세스(이벤트 루프)를 얼리는 문제를
+    피하려면, Chroma 를 별도 서버로 띄우고 이 값을 그 host 로 지정한다.
+    """
+    return (_env("CHROMA_SERVER_HOST", "") or "").strip()
+
+
+def chroma_server_port() -> int:
+    try:
+        return int(_env("CHROMA_SERVER_PORT", "8000"))
+    except (TypeError, ValueError):
+        return 8000
+
+
 def supabase_write_embedding() -> bool:
     raw = os.getenv("SUPABASE_WRITE_EMBEDDING")
     if raw is None or raw.strip() == "":
