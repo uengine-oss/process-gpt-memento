@@ -87,8 +87,8 @@ async def search(
         - ``tenant_id`` 필수
         - ``file_ids`` 옵셔널 — 1개 이상이면 그 파일들 중에서 검색 (``$in``).
           비우면 tenant 전체에서 검색.
-        - ``folder_paths`` 옵셔널 — 이 폴더(들)의 subtree 로 검색을 좁힌다. file_ids 도 주면
-          *교집합*. 에이전트가 file_id(uuid) 대신 folder_path 만 다루며 scoped RAG 를 도는 경로.
+        - ``folder_paths`` 옵셔널 — 이 폴더(들)의 subtree 로 검색을 좁힌다. file_ids도 주면
+          ``folder subtree ∪ file_ids``. 폴더와 독립 첨부가 공존하는 선택을 보존한다.
         - ``exclude_chunk_ids`` 옵셔널 — 이 chunk_id 들은 결과에서 제외하고 top_k 채움.
 
     /retrieve 와 달리 small-doc 통째 반환 / glossary merge / room/proc_inst 분기 등
