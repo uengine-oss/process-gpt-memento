@@ -386,6 +386,20 @@ async def save_to_storage(
 
         file_content = await file.read()
         file_name = file.filename or "unknown"
+        file_extension = Path(file_name).suffix.lower()
+
+        # 채팅방 직접 첨부 정책 — 프론트 검증을 우회해도 서버에서 동일하게 차단한다.
+        if room_id:
+            chat_allowed_extensions = {".pdf", ".hwpx", ".doc", ".docx", ".pptx", ".txt"}
+            chat_max_file_size = 10 * 1024 * 1024
+            if file_extension not in chat_allowed_extensions:
+                raise HTTPException(
+                    status_code=400,
+                    detail="지원하지 않는 파일 형식입니다. 허용: PDF, HWPX, DOC, DOCX, PPTX, TXT",
+                )
+            if len(file_content) > chat_max_file_size:
+                raise HTTPException(status_code=413, detail="파일은 10MB 이하만 업로드할 수 있습니다.")
+
         print(
             f"[ingest:save-to-storage] file={file_name!r} size={len(file_content)}B "
             f"tenant={tenant_id!r} proc_inst_id={proc_inst_id!r} room_id={room_id!r}"
@@ -398,7 +412,6 @@ async def save_to_storage(
         storage_file_path = upload_result["file_path"]
         print(f"[ingest:save-to-storage] uploaded path={storage_file_path}")
 
-        file_extension = Path(file_name).suffix.lower()
         image_extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]
         is_image = file_extension in image_extensions
 
