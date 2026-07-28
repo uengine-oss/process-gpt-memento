@@ -615,6 +615,47 @@ class VectorStoreManager:
             )
         return ordered_documents
 
+    async def search_chunk_metadata(
+        self,
+        query: str,
+        filter: Optional[Dict[str, Any]] = None,
+        top_k: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """임베딩 검색 히트의 *메타데이터만* 유사도 순으로 반환.
+
+        본문이 필요 없는 랭킹 용도(폴더 안에서 관련 문서 추리기)에서 쓴다. 청크 수백 개를
+        Supabase 에서 hydrate 하지 않으므로 similarity_search 보다 훨씬 싸다.
+        """
+        try:
+            return await asyncio.to_thread(
+                self._search_chunk_metadata_sync, query, filter, top_k
+            )
+        except Exception as e:
+            print(f"Error searching chunk metadata: {e}")
+            return []
+
+    def _search_chunk_metadata_sync(
+        self,
+        query: str,
+        filter: Optional[Dict[str, Any]] = None,
+        top_k: int = 200,
+    ) -> List[Dict[str, Any]]:
+        try:
+            query_embedding = self.embeddings.embed_query(query)
+            where = self._build_chroma_where(filter)
+            response = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=max(1, int(top_k)),
+                where=where,
+                include=["metadatas"],
+            )
+            groups = response.get("metadatas") or []
+            first = groups[0] if groups else []
+            return [m for m in (first or []) if isinstance(m, dict)]
+        except Exception as e:
+            print(f"Error searching chunk metadata: {e}")
+            return []
+
     def get_retriever(self, top_k: int = 5, **kwargs):
         raise NotImplementedError(
             "SupabaseVectorStore retriever was removed. "

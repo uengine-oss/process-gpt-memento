@@ -126,6 +126,8 @@ async def process_session_file(request: ProcessSessionFileRequest):
                     "(허용: pdf/hwp/hwpx/doc/docx/pptx/txt/xlsx/이미지)"
                 ),
             )
+        # 벡터 인덱싱 제외 — /save-to-storage 와 같은 정책.
+        skip_vector_index = file_extension in {".xlsx", ".xlsm"}
 
         # 2) file_id 명시 부여 — *세션 첨부* 표시 위해 'session/' prefix
         # storage path 가 이미 uuid 포함이면 그것 활용, 아니면 신규 uuid
@@ -173,14 +175,19 @@ async def process_session_file(request: ProcessSessionFileRequest):
             page_docs = await processor.load_document(io.BytesIO(file_bytes), original_filename)
             if not page_docs:
                 raise HTTPException(status_code=400, detail="문서에서 본문 추출 실패 (빈 본문 또는 파싱 실패)")
-            documents = await processor.process_documents(page_docs, {
-                "tenant_id": request.tenant_id,
-                "original_filename": original_filename,
-                "file_path": storage_path,
-                "storage_type": "storage",
-            })
+            if skip_vector_index:
+                # save-to-storage 와 같은 정책 — 표 격자는 임베딩하지 않고 텍스트만 남긴다.
+                documents = []
+                print(f"[process-session-file] {file_extension} → 청킹·임베딩 생략 (텍스트만 보존)")
+            else:
+                documents = await processor.process_documents(page_docs, {
+                    "tenant_id": request.tenant_id,
+                    "original_filename": original_filename,
+                    "file_path": storage_path,
+                    "storage_type": "storage",
+                })
 
-        if not documents:
+        if not documents and not skip_vector_index:
             raise HTTPException(status_code=400, detail="문서에서 청크 추출 실패 (빈 본문 또는 파싱 실패)")
 
         # 4) 모든 chunk 에 file_id 박음 + doc_role
@@ -195,9 +202,10 @@ async def process_session_file(request: ProcessSessionFileRequest):
                 pass
 
         rag = get_rag_chain()
-        ok = await rag.process_and_store_documents(documents, request.tenant_id)
-        if not ok:
-            raise HTTPException(status_code=500, detail="벡터 저장 실패")
+        if documents:
+            ok = await rag.process_and_store_documents(documents, request.tenant_id)
+            if not ok:
+                raise HTTPException(status_code=500, detail="벡터 저장 실패")
 
         # 5) knowledge_files 등록 — 에이전트의 카탈로그/경로해석(_resolve_file_id) 이 이 테이블에 의존.
         #    이게 없어서 세션 첨부가 "지식베이스에 등록되어있지 않아" 로 못 읽히던 문제 수정.
@@ -390,12 +398,14 @@ async def save_to_storage(
 
         # 채팅방 직접 첨부 정책 — 프론트 검증을 우회해도 서버에서 동일하게 차단한다.
         if room_id:
-            chat_allowed_extensions = {".pdf", ".hwpx", ".doc", ".docx", ".pptx", ".txt"}
+            # /process-session-file 의 _CHAT_ALLOWED_EXTS 및 프론트 채팅 첨부 목록과 같은 집합이어야
+            # 한다. 여기만 좁으면 업로드가 400 이라 URL 이 안 생기고, 에이전트는 파일이 없는 것처럼 돈다.
+            chat_allowed_extensions = {".pdf", ".hwpx", ".doc", ".docx", ".pptx", ".txt", ".xlsx"}
             chat_max_file_size = 10 * 1024 * 1024
             if file_extension not in chat_allowed_extensions:
                 raise HTTPException(
                     status_code=400,
-                    detail="지원하지 않는 파일 형식입니다. 허용: PDF, HWPX, DOC, DOCX, PPTX, TXT",
+                    detail="지원하지 않는 파일 형식입니다. 허용: PDF, HWPX, DOC, DOCX, PPTX, TXT, XLSX",
                 )
             if len(file_content) > chat_max_file_size:
                 raise HTTPException(status_code=413, detail="파일은 10MB 이하만 업로드할 수 있습니다.")
@@ -414,6 +424,8 @@ async def save_to_storage(
 
         image_extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]
         is_image = file_extension in image_extensions
+        # 벡터 인덱싱 제외 확장자 — 표 격자는 청킹·임베딩이 무의미하다(아래 분기 주석 참고).
+        skip_vector_index = file_extension in {".xlsx", ".xlsm"}
 
         has_uploaded_images = False
         # 비이미지 문서의 페이지 docs — 아래에서 document_pages 등록에 재사용(채팅 첨부도
@@ -454,12 +466,19 @@ async def save_to_storage(
                 raise HTTPException(status_code=400, detail="Failed to load document")
             page_docs_for_reg = docs  # document_pages 등록용(페이지 단위 본문)
 
-            documents = await processor.process_documents(docs, {
-                "storage_type": "storage",
-                "file_path": storage_file_path,
-                "file_name": file_name,
-                "tenant_id": tenant_id,
-            })
+            if skip_vector_index:
+                # 엑셀은 셀 격자라 의미 검색 대상이 아니다. 표를 800자로 잘라 임베딩하면 행이
+                # 토막나 검색 품질만 나빠지고 비용만 든다. 텍스트(document_pages)만 남기면
+                # grep/read_document_page 로 정확히 읽히고, 값 추출은 원본을 openpyxl 로 연다.
+                documents = []
+                print(f"[ingest:save-to-storage] {file_extension} → 청킹·임베딩 생략 (텍스트만 보존)")
+            else:
+                documents = await processor.process_documents(docs, {
+                    "storage_type": "storage",
+                    "file_path": storage_file_path,
+                    "file_name": file_name,
+                    "tenant_id": tenant_id,
+                })
 
             for doc in documents:
                 doc.metadata.update({
@@ -476,7 +495,7 @@ async def save_to_storage(
                 else:
                     doc.metadata["knowledge_scope"] = "global"
 
-        if not documents and not has_uploaded_images:
+        if not documents and not has_uploaded_images and not skip_vector_index:
             return {
                 "message": "File uploaded to storage (no content extracted)",
                 "file_path": storage_file_path,
@@ -486,17 +505,18 @@ async def save_to_storage(
             }
 
         rag = get_rag_chain()
-        success = await rag.process_and_store_documents(documents, tenant_id)
+        if documents:
+            success = await rag.process_and_store_documents(documents, tenant_id)
 
-        if not success:
-            print(f"Vector store processing failed for {file_name}, but file is uploaded")
-            return {
-                "message": "File uploaded to storage (vector processing failed)",
-                "file_path": storage_file_path,
-                "file_name": file_name,
-                "public_url": upload_result.get("public_url"),
-                "processed": False,
-            }
+            if not success:
+                print(f"Vector store processing failed for {file_name}, but file is uploaded")
+                return {
+                    "message": "File uploaded to storage (vector processing failed)",
+                    "file_path": storage_file_path,
+                    "file_name": file_name,
+                    "public_url": upload_result.get("public_url"),
+                    "processed": False,
+                }
 
         await rag.save_processed_files([storage_file_path], tenant_id, [file_name])
 

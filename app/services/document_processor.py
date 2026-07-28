@@ -24,7 +24,6 @@ from app.plugins.parsers import (
 from langchain_community.document_loaders import (
     UnstructuredWordDocumentLoader,
     UnstructuredPowerPointLoader,
-    UnstructuredExcelLoader,
     UnstructuredFileLoader,
     PyPDFLoader,
     TextLoader
@@ -36,6 +35,46 @@ from app.services.file_to_pdf import convert_to_pdf, convert_to_docx, FileToPdfE
 _vendor_dir = Path(__file__).resolve().parents[2] / "vendor"
 if _vendor_dir.is_dir() and str(_vendor_dir) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(_vendor_dir))
+
+
+def _load_xlsx_documents(data: bytes, file_name: str) -> List[Document]:
+    """xlsx 바이트 → 시트별 Document (한 시트 = 한 페이지).
+
+    셀은 행 단위로 탭 구분해 이어붙인다. 표 구조를 그대로 남겨야 grep/read_document_page 로
+    "어느 시트 몇 번째 행" 을 사람이 알아볼 수 있다.
+    """
+    from openpyxl import load_workbook
+
+    # 시트당 행 상한 — 수십만 행짜리 원장을 통째로 텍스트화하면 청킹 단계에서 메모리가 터진다.
+    # 잘린 사실은 본문에 남긴다(조용히 줄이면 "다 읽었다"로 오해된다).
+    max_rows = 20000
+
+    wb = load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    docs: List[Document] = []
+    try:
+        for idx, ws in enumerate(wb.worksheets, start=1):
+            lines: List[str] = []
+            truncated = False
+            for row in ws.iter_rows(values_only=True):
+                if len(lines) >= max_rows:
+                    truncated = True
+                    break
+                cells = ["" if v is None else str(v).replace("\n", " ") for v in row]
+                while cells and not cells[-1]:
+                    cells.pop()
+                if cells:
+                    lines.append("\t".join(cells))
+            if truncated:
+                lines.append(f"[… 이 시트는 {max_rows}행까지만 수록됨]")
+            if not lines:
+                continue
+            docs.append(Document(
+                page_content=f"[시트: {ws.title}]\n" + "\n".join(lines),
+                metadata={"source": file_name, "page": idx, "sheet_name": ws.title},
+            ))
+    finally:
+        wb.close()
+    return docs
 
 
 def _extract_text_from_hwp_or_hwpx(file_path: str, file_extension: str) -> Tuple[Optional[str], Optional[str]]:
@@ -247,15 +286,11 @@ class DocumentProcessor:
                         await asyncio.to_thread(os.unlink, converted_pdf_path)
                     await asyncio.to_thread(os.unlink, tmp_path)
             elif file_extension == '.xlsx':
-                # Save BytesIO to temporary file
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
-                    await asyncio.to_thread(tmp.write, file_content.read())
-                    tmp_path = tmp.name
-                try:
-                    loader = UnstructuredExcelLoader(tmp_path, mode="single")
-                    documents = await asyncio.to_thread(loader.load)
-                finally:
-                    await asyncio.to_thread(os.unlink, tmp_path)
+                # openpyxl 직접 사용. UnstructuredExcelLoader 는 unstructured/nltk 를 끌고 들어와
+                # 첫 호출에서 프로세스가 멎는다(관측: 채팅 xlsx 첨부 시 서버 사망). 엑셀은 셀 격자라
+                # 레이아웃 분석이 필요 없으므로 시트별 텍스트 덤프로 충분하다.
+                data = await asyncio.to_thread(file_content.read)
+                documents = await asyncio.to_thread(_load_xlsx_documents, data, file_name)
             elif file_extension == '.pdf':
                 data = await asyncio.to_thread(file_content.read)
                 documents = await get_pdf_parser().parse(data, file_name)
