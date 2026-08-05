@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import os
-from dotenv import load_dotenv
 from supabase import Client, create_client
 
-load_dotenv()
+from app.core.env_loader import load_project_dotenv
+
+load_project_dotenv()
 
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),

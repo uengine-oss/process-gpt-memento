@@ -1,0 +1,60 @@
+# 소스리스(.pyc) 고객사 배포용 이미지.
+# Python 3.11 compiler/runtime 이미지를 일치시켜 bytecode magic number 호환성을 보장한다.
+
+FROM python:3.11-slim AS compiler
+
+WORKDIR /src
+
+COPY app ./app
+COPY vendor ./vendor
+COPY scripts ./scripts
+COPY benchmark ./benchmark
+COPY main.py ./main.py
+
+# legacy 레이아웃(foo.pyc)은 원본 .py를 제거한 뒤에도 일반 import가 가능하다.
+# 비-Python 자산은 유지하고 Python 원본과 임시 __pycache__만 제거한다.
+RUN python -m compileall -b -q app vendor scripts benchmark main.py \
+ && find app vendor scripts benchmark -name '*.py' -delete \
+ && rm -f main.py \
+ && find app vendor scripts benchmark -name '__pycache__' -type d -prune -exec rm -rf {} +
+
+
+FROM python:3.11-slim
+
+WORKDIR /usr/src/app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    git \
+    libffi-dev \
+    libxml2-dev \
+    libxslt1-dev \
+    libgl1 \
+    libglib2.0-0 \
+    poppler-utils \
+    libreoffice \
+    vim \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV MAX_JOBS=1 \
+    MALLOC_ARENA_MAX=2 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+COPY requirements.txt ./requirements.txt
+RUN pip install --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
+
+COPY --from=compiler /src/app ./app
+COPY --from=compiler /src/vendor ./vendor
+COPY --from=compiler /src/scripts ./scripts
+COPY --from=compiler /src/benchmark ./benchmark
+COPY --from=compiler /src/main.pyc ./main.pyc
+COPY sql ./sql
+
+EXPOSE 8005
+
+CMD ["python", "main.pyc"]

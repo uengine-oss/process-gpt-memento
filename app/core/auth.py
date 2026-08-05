@@ -5,12 +5,13 @@ import os
 from typing import Any, Dict
 from urllib.parse import urlencode
 
-from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2AuthorizationCodeBearer
 from supabase import Client, create_client
 
-load_dotenv()
+from app.core.env_loader import load_project_dotenv
+
+load_project_dotenv()
 
 
 supabase: Client = create_client(

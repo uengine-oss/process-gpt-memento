@@ -8,15 +8,15 @@ import uuid
 import unicodedata
 
 from chromadb import PersistentClient
-from dotenv import load_dotenv
 from langchain.schema import Document
 from supabase import create_client
 
+from app.core.env_loader import load_project_dotenv
 from app.services.llm import get_embeddings
 from app.core import config
 
 
-load_dotenv()
+load_project_dotenv()
 
 PRIMITIVE_METADATA_TYPES = (str, int, float, bool)
 

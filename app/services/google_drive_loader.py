@@ -11,11 +11,11 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload, MediaIoBaseUpload
 import asyncio
 from supabase import create_client, Client
-from dotenv import load_dotenv
 import json
 from langchain.schema import Document
 from datetime import datetime
 
+from app.core.env_loader import load_project_dotenv
 from app.services.document_processor import get_document_processor
 
 import fitz  # PyMuPDF for PDF image extraction
@@ -26,7 +26,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-load_dotenv()
+load_project_dotenv()
 
 SCOPES = [
     'https://www.googleapis.com/auth/drive.readonly',

@@ -8,9 +8,9 @@ from supabase import create_client, Client
 from app.services.document_processor import get_document_processor
 import asyncio
 
-from dotenv import load_dotenv
+from app.core.env_loader import load_project_dotenv
 
-load_dotenv(override=True)
+load_project_dotenv(override=True)
 
 class SupabaseStorageLoader:
     """Handles loading and processing of documents from Supabase Storage"""
