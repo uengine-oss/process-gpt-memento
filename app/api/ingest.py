@@ -400,12 +400,12 @@ async def save_to_storage(
         if room_id:
             # /process-session-file 의 _CHAT_ALLOWED_EXTS 및 프론트 채팅 첨부 목록과 같은 집합이어야
             # 한다. 여기만 좁으면 업로드가 400 이라 URL 이 안 생기고, 에이전트는 파일이 없는 것처럼 돈다.
-            chat_allowed_extensions = {".pdf", ".hwpx", ".doc", ".docx", ".pptx", ".txt", ".xlsx"}
+            chat_allowed_extensions = {".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".pptx", ".txt", ".xlsx"}
             chat_max_file_size = 10 * 1024 * 1024
             if file_extension not in chat_allowed_extensions:
                 raise HTTPException(
                     status_code=400,
-                    detail="지원하지 않는 파일 형식입니다. 허용: PDF, HWPX, DOC, DOCX, PPTX, TXT, XLSX",
+                    detail="지원하지 않는 파일 형식입니다. 허용: PDF, HWP, HWPX, DOC, DOCX, PPTX, TXT, XLSX",
                 )
             if len(file_content) > chat_max_file_size:
                 raise HTTPException(status_code=413, detail="파일은 10MB 이하만 업로드할 수 있습니다.")

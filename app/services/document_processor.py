@@ -16,11 +16,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from openai import OpenAI
 
 from app.plugins.chunkers import get_chunker
-from app.plugins.parsers import (
-    get_pdf_parser,
-    get_synap_parser,
-    synap_supports,
-)
+from app.plugins.parsers import get_pdf_parser
 from langchain_community.document_loaders import (
     UnstructuredWordDocumentLoader,
     UnstructuredPowerPointLoader,
@@ -200,25 +196,7 @@ class DocumentProcessor:
 
             documents = None
 
-            # Synap 원격 파서(OCR/DA)는 정책상 .hwp 전용으로만 사용한다(SYNAP_EXTENSIONS).
-            # HWP 바이너리는 이미지/표 추출이 어려워 Synap DA 로 OCR; 실패 시 로컬(extract_hwp 텍스트)로 폴백.
-            # pdf/docx/hwpx/pptx/xlsx 는 각자 독자 파서가 우월하므로 Synap 우회.
-            if synap_supports(file_extension):
-                data = await asyncio.to_thread(file_content.read)
-                try:
-                    documents = await get_synap_parser().parse(data, file_name)
-                    print(f"[synap] '{file_name}' 원격 파싱 성공 (pages={len(documents)})")
-                except Exception as e:
-                    print(f"[synap] '{file_name}' 원격 파싱 실패 → 로컬 파서로 폴백: {e}")
-                    documents = None
-                    try:
-                        file_content.seek(0)
-                    except Exception:
-                        pass
-
-            if documents is not None:
-                pass
-            elif file_extension == '.txt':
+            if file_extension == '.txt':
                 content = await asyncio.to_thread(file_content.read)
                 content = content.decode('utf-8-sig')
                 documents = [Document(page_content=content)]
