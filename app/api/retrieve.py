@@ -671,25 +671,9 @@ async def get_chunks_with_embeddings(
                     from app.services.vector_store import get_vector_store
 
                     vsm = get_vector_store()
-                    fetched = await asyncio.to_thread(
-                        vsm.collection.get,
-                        ids=row_ids,
-                        include=["embeddings"],
-                    )
-                    _f_ids = fetched.get("ids")
-                    fetched_ids = list(_f_ids) if _f_ids is not None else []
-                    _f_embs = fetched.get("embeddings")
-                    fetched_embs = list(_f_embs) if _f_embs is not None else []
-                    for i, rid in enumerate(fetched_ids):
-                        if i < len(fetched_embs):
-                            emb = fetched_embs[i]
-                            if emb is not None:
-                                try:
-                                    embeddings_map[str(rid)] = list(emb)
-                                except Exception:
-                                    embeddings_map[str(rid)] = None
+                    embeddings_map = await vsm.get_embeddings_by_ids(row_ids)
                 except Exception as e:
-                    logger.warning("[chunks-with-embeddings] Chroma 임베딩 조회 실패: %s", e)
+                    logger.warning("[chunks-with-embeddings] 인덱스 임베딩 조회 실패: %s", e)
 
         chunks: List[dict] = []
         for row in text_rows:

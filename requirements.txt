@@ -25,6 +25,9 @@ PyMuPDF>=1.26.0
 Pillow==10.0.1
 requests>=2.31.0
 chromadb
+# 대용량 인덱스용 벡터 백엔드 (VECTOR_BACKEND=qdrant).
+# 서버와 major/minor 를 맞출 것 — 어긋나면 클라이언트가 호환 경고를 낸다. 짝: 서버 v1.19.0.
+qdrant-client>=1.19,<1.20
 onnxruntime==1.18.1
 markdown>=3.8.2
 beautifulsoup4==4.12.3

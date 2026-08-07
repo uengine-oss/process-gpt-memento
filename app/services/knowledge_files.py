@@ -715,7 +715,7 @@ async def delete_entries_bulk(
     result["image_doc_count"] = len(image_doc_ids)
 
     # 1. Chroma 임베딩 삭제 (file_id $in 배치 + 이미지-분석은 id 로)
-    #    *쓰기 락 공유* — 임베딩(add_documents)과 같은 _chroma_write_lock 아래에서 돌아
+    #    *쓰기 락 공유* — 임베딩(add_documents)과 같은 인덱스 쓰기 락 아래에서 돌아
     #    동시 인제스트 중에도 SQLite/HNSW 충돌·스래싱 없이 협조 직렬화된다.
     try:
         from app.services.vector_store import get_vector_store

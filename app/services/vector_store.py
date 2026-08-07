@@ -2,17 +2,17 @@ from __future__ import annotations
 
 from typing import List, Dict, Any, Optional
 import asyncio
+import contextlib
 import os
-from pathlib import Path
 import uuid
 import unicodedata
 
-from chromadb import PersistentClient
 from langchain.schema import Document
 from supabase import create_client
 
 from app.core.env_loader import load_project_dotenv
 from app.services.llm import get_embeddings
+from app.services.vector_index import make_vector_index
 from app.core import config
 
 
@@ -20,19 +20,20 @@ load_project_dotenv()
 
 PRIMITIVE_METADATA_TYPES = (str, int, float, bool)
 
-# Chroma 는 로컬 PersistentClient(SQLite 백엔드)라 여러 스레드에서 *동시 쓰기* 하면
-# "database is locked" 등 충돌 위험이 있다. 임베딩/삽입을 to_thread 로 오프로드하면서
-# 동시 인덱싱이 가능해졌으므로, Chroma *쓰기* 구간만 이 락으로 직렬화한다.
+# Chroma 는 SQLite 백엔드라 여러 스레드에서 *동시 쓰기* 하면 "database is locked" 등
+# 충돌 위험이 있다. 임베딩/삽입을 to_thread 로 오프로드하면서 동시 인덱싱이 가능해졌으므로,
+# 인덱스 *쓰기* 구간만 이 락으로 직렬화한다.
 # (락 획득은 async — 이벤트 루프는 막지 않고, 실제 작업은 to_thread 안에서 돈다.
 #  읽기(similarity_search)는 동시 허용 — 직렬화하지 않는다.)
-_chroma_write_lock: Optional["asyncio.Lock"] = None
+# Qdrant 는 동시 쓰기를 자체 처리하므로 이 락을 건너뛴다(requires_write_lock=False).
+_index_write_lock: Optional["asyncio.Lock"] = None
 
 
-def _get_chroma_write_lock() -> "asyncio.Lock":
-    global _chroma_write_lock
-    if _chroma_write_lock is None:
-        _chroma_write_lock = asyncio.Lock()
-    return _chroma_write_lock
+def _get_index_write_lock() -> "asyncio.Lock":
+    global _index_write_lock
+    if _index_write_lock is None:
+        _index_write_lock = asyncio.Lock()
+    return _index_write_lock
 
 def _normalize_filename(value: Any) -> Any:
     if not isinstance(value, str):
@@ -61,7 +62,7 @@ def _strip_nul(value: Any) -> Any:
 
 
 class VectorStoreManager:
-    """Stores source documents in Supabase and indexes embeddings in Chroma."""
+    """Stores source documents in Supabase and indexes embeddings in the vector index."""
 
     def __init__(self):
         self.supabase = create_client(
@@ -74,32 +75,17 @@ class VectorStoreManager:
             config.supabase_dummy_embedding_dimensions()
         )
 
-        self.chroma_collection_name = config.chroma_collection_name().strip()
+        # 벡터 인덱스 백엔드는 VECTOR_BACKEND(chroma|qdrant)로 고른다. 접속·스키마·필터 번역은
+        # 전부 vector_index 모듈이 처리하고, 여기서는 인덱스 표면만 쓴다.
+        self.index = make_vector_index()
+        # 로그에 실제 백엔드를 찍기 위한 표시명 (QdrantIndex → "Qdrant")
+        self.index_name = type(self.index).__name__.removesuffix("Index") or "index"
 
-        # ── Chroma client: 서버 모드(HttpClient) 우선, 없으면 in-process(PersistentClient) ──
-        # CHROMA_SERVER_HOST 가 설정되면 별도 Chroma 서버에 붙는다. 대용량 인덱스가 API 프로세스
-        # (이벤트 루프)를 얼리는 문제를 피하기 위한 경로. on-disk 포맷이 동일하므로 기존 데이터를
-        # 서버가 그대로 서빙한다(재임베딩 불필요). 미설정이면 기존 로컬 동작 그대로.
-        server_host = config.chroma_server_host()
-        if server_host:
-            import chromadb
-            server_port = config.chroma_server_port()
-            self.chroma_client = chromadb.HttpClient(host=server_host, port=server_port)
-            print(f"[vector_store] Chroma 서버 모드: http://{server_host}:{server_port}", flush=True)
-        else:
-            persist_dir = Path(config.chroma_persist_directory()).expanduser()
-            if not persist_dir.is_absolute():
-                # 프로젝트 루트 기준 (app/services/vector_store.py → repo root)
-                repo_root = Path(__file__).resolve().parents[2]
-                persist_dir = (repo_root / persist_dir).resolve()
-            persist_dir.mkdir(parents=True, exist_ok=True)
-            self.chroma_client = PersistentClient(path=str(persist_dir))
-            print(f"[vector_store] Chroma in-process 모드: {persist_dir}", flush=True)
-
-        self.collection = self.chroma_client.get_or_create_collection(
-            name=self.chroma_collection_name,
-            metadata={"hnsw:space": "cosine"},
-        )
+    def _write_lock(self):
+        """인덱스 쓰기 직렬화 컨텍스트. 단일 writer 백엔드(Chroma)에서만 실제로 잠근다."""
+        if getattr(self.index, "requires_write_lock", True):
+            return _get_index_write_lock()
+        return contextlib.nullcontext()
 
     async def add_documents(self, documents: List[Document], tenant_id: str) -> bool:
         """Add source documents to Supabase and vector index entries to Chroma."""
@@ -145,7 +131,7 @@ class VectorStoreManager:
                 f"elapsed={int((_time.perf_counter()-_emb_t0)*1000)}ms"
             )
 
-            print("Saving documents to Supabase and Chroma...")
+            print(f"Saving documents to Supabase and {self.index_name}...")
             row_ids: List[str] = []
             for text, metadata in zip(texts, metadatas):
                 rid = str(metadata.get("id") or uuid.uuid4())
@@ -165,9 +151,9 @@ class VectorStoreManager:
                     metadatas=metadatas[start:end],
                     embeddings=embeddings[start:end],
                 )
-                async with _get_chroma_write_lock():
+                async with self._write_lock():
                     await asyncio.to_thread(
-                        self._upsert_chroma_documents_batch,
+                        self._upsert_index_documents_batch,
                         row_ids=row_ids[start:end],
                         texts=texts[start:end],
                         metadatas=metadatas[start:end],
@@ -341,46 +327,46 @@ class VectorStoreManager:
                     f"Supabase batch insert failed even with dummy {dims}-d vector."
                 ) from fallback_exc
 
-    def _upsert_chroma_documents_batch(
+    def _upsert_index_documents_batch(
         self,
         row_ids: List[str],
         texts: List[str],
         metadatas: List[Dict[str, Any]],
         embeddings: List[List[float]],
     ) -> None:
-        self.collection.upsert(
+        self.index.upsert(
             ids=row_ids,
             embeddings=embeddings,
             documents=texts,
-            metadatas=[self._build_chroma_metadata(m, rid) for m, rid in zip(metadatas, row_ids)],
+            metadatas=[self._build_index_metadata(m, rid) for m, rid in zip(metadatas, row_ids)],
         )
 
-    def _build_chroma_metadata(
+    def _build_index_metadata(
         self, metadata: Dict[str, Any], document_row_id: str
     ) -> Dict[str, Any]:
-        chroma_metadata: Dict[str, Any] = {}
+        index_metadata: Dict[str, Any] = {}
         for key, value in (metadata or {}).items():
             if value is None:
                 continue
             if isinstance(value, PRIMITIVE_METADATA_TYPES):
-                chroma_metadata[key] = _normalize_str(value)
+                index_metadata[key] = _normalize_str(value)
 
-        chroma_metadata["document_row_id"] = document_row_id
-        chroma_metadata.setdefault("type", "document")
-        return chroma_metadata
+        index_metadata["document_row_id"] = document_row_id
+        index_metadata.setdefault("type", "document")
+        return index_metadata
 
-    def _upsert_chroma_document(
+    def _upsert_index_document(
         self,
         document_row_id: str,
         text: str,
         metadata: Dict[str, Any],
         embedding: List[float],
     ) -> None:
-        self.collection.upsert(
+        self.index.upsert(
             ids=[document_row_id],
             embeddings=[embedding],
             documents=[text],
-            metadatas=[self._build_chroma_metadata(metadata, document_row_id)],
+            metadatas=[self._build_index_metadata(metadata, document_row_id)],
         )
 
     async def _save_image_metadata_once(
@@ -445,9 +431,9 @@ class VectorStoreManager:
                                 metadata=image_metadata,
                                 embedding=image_embedding,
                             )
-                            async with _get_chroma_write_lock():
+                            async with self._write_lock():
                                 await asyncio.to_thread(
-                                    self._upsert_chroma_document,
+                                    self._upsert_index_document,
                                     document_row_id=image_document_row_id,
                                     text=analysis_text,
                                     metadata=image_metadata,
@@ -479,23 +465,34 @@ class VectorStoreManager:
             print(f"Error in _save_image_metadata_once: {e}")
 
     async def delete_where(self, where: Dict[str, Any]) -> None:
-        """Chroma 임베딩을 메타데이터 필터로 삭제 — *쓰기 락 아래*에서.
+        """임베딩을 메타데이터 필터로 삭제 — *쓰기 락 아래*에서.
 
-        add_documents 의 upsert 와 같은 ``_chroma_write_lock`` 을 공유해, 임베딩 진행 중
-        삭제가 겹쳐도 SQLite/HNSW 레벨에서 충돌("database is locked")·스래싱을 막는다.
-        (락 없이 직접 collection.delete 를 부르면 단일 writer 리소스를 두고 경합해 극단적으로 느려짐.)
+        add_documents 의 upsert 와 같은 락을 공유해, 임베딩 진행 중 삭제가 겹쳐도 단일 writer
+        백엔드(Chroma/SQLite)에서 충돌("database is locked")·스래싱을 막는다.
+        (락 없이 직접 삭제를 부르면 단일 writer 리소스를 두고 경합해 극단적으로 느려짐.)
         """
         if not where:
             return
-        async with _get_chroma_write_lock():
-            await asyncio.to_thread(self.collection.delete, where=where)
+        async with self._write_lock():
+            await asyncio.to_thread(self.index.delete_where, where)
 
     async def delete_ids(self, ids: List[str]) -> None:
-        """Chroma 임베딩을 id 리스트로 삭제 — *쓰기 락 아래*에서 (delete_where 와 동일 취지)."""
+        """임베딩을 id 리스트로 삭제 — *쓰기 락 아래*에서 (delete_where 와 동일 취지)."""
         if not ids:
             return
-        async with _get_chroma_write_lock():
-            await asyncio.to_thread(self.collection.delete, ids=ids)
+        async with self._write_lock():
+            await asyncio.to_thread(self.index.delete_ids, ids)
+
+    async def get_embeddings_by_ids(self, ids: List[str]) -> Dict[str, List[float]]:
+        """row id → 임베딩 벡터. 인덱스에 없는 id 는 결과에서 빠진다.
+
+        주의: Qdrant 백엔드는 Cosine 거리라 저장 시 벡터를 L2 정규화한다. 즉 여기서 돌려주는
+        값은 Chroma 백엔드의 원본 벡터와 스케일이 다르다(방향은 동일). 코사인 유사도 용도면
+        동등하지만, 크기(norm)에 의존하는 소비자가 있으면 확인이 필요하다.
+        """
+        if not ids:
+            return {}
+        return await asyncio.to_thread(self.index.get_embeddings, ids)
 
     async def similarity_search(
         self,
@@ -503,7 +500,7 @@ class VectorStoreManager:
         filter: Optional[Dict[str, Any]] = None,
         top_k: int = 5,
     ) -> List[Document]:
-        """Search Chroma and hydrate the matching source documents from Supabase."""
+        """Search the vector index and hydrate the matching source documents from Supabase."""
         try:
             print(f"Searching for documents similar to query: {query}")
             return await asyncio.to_thread(self._similarity_search_sync, query, filter, top_k)
@@ -511,10 +508,10 @@ class VectorStoreManager:
             print(f"Error searching documents: {e}")
             return []
 
-    def _build_chroma_where(
+    def _build_where(
         self, filter: Optional[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
-        """filter dict 를 Chroma where 절로 변환.
+        """filter dict 를 인덱스 where 절로 변환 (Chroma where 문법 = 공용 필터 언어).
 
         지원 키:
             - 일반 metadata 키 (primitive value): equality 매칭
@@ -564,17 +561,16 @@ class VectorStoreManager:
     ) -> List[Document]:
         try:
             query_embedding = self.embeddings.embed_query(query)
-            where = self._build_chroma_where(filter)
-            response = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=top_k,
+            where = self._build_where(filter)
+            hits = self.index.query(
+                embedding=query_embedding,
+                top_k=top_k,
                 where=where,
             )
 
-            hit_ids = response.get("ids", [[]])
             ordered_document_ids: List[str] = []
-            for raw_id in hit_ids[0] if hit_ids else []:
-                document_id = str(raw_id)
+            for hit in hits:
+                document_id = str(hit.get("id") or "")
                 if document_id and document_id not in ordered_document_ids:
                     ordered_document_ids.append(document_id)
 
@@ -642,16 +638,14 @@ class VectorStoreManager:
     ) -> List[Dict[str, Any]]:
         try:
             query_embedding = self.embeddings.embed_query(query)
-            where = self._build_chroma_where(filter)
-            response = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=max(1, int(top_k)),
+            where = self._build_where(filter)
+            hits = self.index.query(
+                embedding=query_embedding,
+                top_k=max(1, int(top_k)),
                 where=where,
-                include=["metadatas"],
+                with_metadata=True,
             )
-            groups = response.get("metadatas") or []
-            first = groups[0] if groups else []
-            return [m for m in (first or []) if isinstance(m, dict)]
+            return [h["metadata"] for h in hits if isinstance(h.get("metadata"), dict)]
         except Exception as e:
             print(f"Error searching chunk metadata: {e}")
             return []
