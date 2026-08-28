@@ -83,12 +83,11 @@ async def process_session_file(request: ProcessSessionFileRequest):
     동작:
       1. file_url → storage path 추출 (또는 file_path 직접)
       2. SupabaseStorageLoader 로 download → DocumentProcessor 청크
-      3. *명시적 file_id 부여* — ``session/{tenant_id}/{uuid}.{ext}``
+      3. Storage object key를 stable ``file_id``로 사용
       4. rag.process_and_store_documents 호출 (vector store 인덱싱)
       5. 응답: ``{file_id, file_name, tenant_id, chunks}``
     """
     import os as _os
-    import uuid as _uuid
     from urllib.parse import urlparse
 
     try:
@@ -129,18 +128,11 @@ async def process_session_file(request: ProcessSessionFileRequest):
         # 벡터 인덱싱 제외 — /save-to-storage 와 같은 정책.
         skip_vector_index = file_extension in {".xlsx", ".xlsm"}
 
-        # 2) file_id 명시 부여 — *세션 첨부* 표시 위해 'session/' prefix
-        # storage path 가 이미 uuid 포함이면 그것 활용, 아니면 신규 uuid
-        path_basename = _os.path.basename(storage_path)
-        # path_basename 예: "b4a64e29-...pdf" 또는 "report.pdf"
-        # 확장자 분리해 uuid 추출
-        stem = Path(path_basename).stem
-        try:
-            _uuid.UUID(stem)
-            uuid_part = stem
-        except (ValueError, TypeError):
-            uuid_part = str(_uuid.uuid4())
-        file_id = f"session/{request.tenant_id}/{uuid_part}{file_extension}"
+        # 2) Storage object key를 stable file_id로 사용한다.
+        # knowledge_files.source_ref는 원본 다운로드 경로이기도 하므로 별도의 session/... 논리 ID를
+        # 만들면 /document/raw가 존재하지 않는 객체를 찾게 된다. /save-to-storage와 동일하게 실제
+        # object key 하나를 검색·페이지·원본 조회 전 구간의 정본으로 사용한다.
+        file_id = storage_path
 
         # 3) download + 청크
         storage_loader = SupabaseStorageLoader()

@@ -676,19 +676,20 @@ async def document_page(
 # ─────────────────────────────────────────────────────────────────────────────
 # GET /document/raw
 #
-# 원본 파일 바이트 스트림 — data-analyst 서브에이전트가 sandbox 안에서 코드로 처리할
-# dataset (xlsx/csv) 파일을 받기 위해 호출. drive 소스가 아닌 upload 소스만 허용.
+# 원본 파일 바이트 스트림 — Codex가 선택한 문서의 작업 복사본을 만들 때 호출한다.
+# drive 소스가 아닌 upload 소스만 허용.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/document/raw")
 async def document_raw(
     tenant_id: str,
-    file_name: str,
+    file_id: Optional[str] = None,
+    file_name: Optional[str] = None,
 ):
     """파일 원본 바이트를 binary stream 으로 반환.
 
     Args:
-        tenant_id, file_name: 필수.
+        tenant_id와 file_id가 정본이다. file_name은 구 클라이언트 호환용 폴백이다.
 
     제약:
         - upload 소스만 허용 (storage 'files' 버킷에서 다운로드).
@@ -699,27 +700,30 @@ async def document_raw(
     """
     from fastapi import Response
 
-    if not tenant_id or not file_name:
-        raise HTTPException(status_code=400, detail="tenant_id, file_name required")
+    if not tenant_id or not (file_id or file_name):
+        raise HTTPException(status_code=400, detail="tenant_id and file_id (or legacy file_name) required")
 
     try:
-        result = await asyncio.to_thread(
+        query = (
             supabase.table("knowledge_files")
-            .select("source_ref, source_type")
+            .select("source_ref, source_type, file_name, mime_type, size_bytes, file_hash")
             .eq("tenant_id", tenant_id)
-            .eq("file_name", file_name)
-            .order("modified_time", desc=True)
-            .limit(1)
-            .execute
         )
+        if file_id:
+            query = query.eq("source_ref", file_id)
+        else:
+            query = query.eq("file_name", file_name).order("modified_time", desc=True)
+        result = await asyncio.to_thread(query.limit(1).execute)
         rows = result.data or []
     except Exception as e:
         logger.exception("[/document/raw] resolve failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
     if not rows:
-        raise HTTPException(status_code=404, detail=f"file_name '{file_name}' not found in tenant '{tenant_id}'")
+        locator = f"file_id '{file_id}'" if file_id else f"file_name '{file_name}'"
+        raise HTTPException(status_code=404, detail=f"{locator} not found in tenant '{tenant_id}'")
     row = rows[0]
+    resolved_name = str(row.get("file_name") or file_name or "file")
     source_type = row.get("source_type")
     source_ref = row.get("source_ref")
     if source_type != "upload":
@@ -743,7 +747,7 @@ async def document_raw(
 
     logger.info(
         "[/document/raw] tenant=%s file=%s bytes=%d",
-        tenant_id, file_name, len(data),
+        tenant_id, resolved_name, len(data),
     )
     # Content-Disposition 의 filename 은 ASCII-safe 한 fallback + RFC 5987 utf-8 양쪽 제공.
     # ⚠ ``isalnum()`` 은 한글도 True 라서 그대로 쓰면 latin-1 헤더 인코딩 실패.
@@ -751,13 +755,17 @@ async def document_raw(
     import urllib.parse
     safe_name = "".join(
         c if (c.isascii() and (c.isalnum() or c in "._-")) else "_"
-        for c in file_name
+        for c in resolved_name
     ).strip("_") or "file"
-    quoted = urllib.parse.quote(file_name)
+    quoted = urllib.parse.quote(resolved_name)
+    response_headers = {
+        "Content-Disposition": f"attachment; filename=\"{safe_name}\"; filename*=UTF-8''{quoted}",
+        "X-ProcessGPT-File-Id": str(source_ref),
+    }
+    if row.get("file_hash"):
+        response_headers["X-ProcessGPT-Sha256"] = str(row["file_hash"])
     return Response(
         content=data,
-        media_type="application/octet-stream",
-        headers={
-            "Content-Disposition": f"attachment; filename=\"{safe_name}\"; filename*=UTF-8''{quoted}",
-        },
+        media_type=str(row.get("mime_type") or "application/octet-stream"),
+        headers=response_headers,
     )
