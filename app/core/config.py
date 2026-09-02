@@ -1,13 +1,44 @@
 """Static configuration. env holds secrets and per-env switches only."""
 from __future__ import annotations
 
+import json
+import logging
 import os
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+SAMPLING_CONFIG_PATH = PROJECT_ROOT / "config" / "llm_sampling.json"
 
 
 def _env(name: str, default: Any = None) -> Any:
     v = os.getenv(name)
     return default if v is None or v.strip() == "" else v
+
+
+@lru_cache(maxsize=1)
+def _sampling_file() -> Dict[str, Any]:
+    try:
+        data = json.loads(SAMPLING_CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("[config] llm_sampling.json 을 읽지 못했다: %s", exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def resolve_sampling_config(provider: str) -> Dict[str, Any]:
+    """프로바이더에 보낼 샘플링 파라미터.
+
+    사내 GPU 서버(vLLM)는 기본값으로 두면 사고 토큰까지 생성해 응답이 길고 느리다.
+    무엇을 보낼지는 코드가 아니라 ``config/llm_sampling.json`` 이 정한다.
+    """
+    section = _sampling_file().get(provider)
+    return dict(section) if isinstance(section, dict) else {}
 
 
 LLM_PROVIDERS: Dict[str, Dict[str, Any]] = {
@@ -70,12 +101,16 @@ EMBEDDING_PROVIDERS: Dict[str, Dict[str, Any]] = {
         "client": "openai_compatible",
     },
     "custom": {
+        # 사내 GPU 임베딩 서버. bge-m3 (TEI) 가 nginx 30000/v1 로 OpenAI 호환 /v1/embeddings 제공.
+        # base_url 은 .../v1 까지 지정 (client 가 {base_url}/embeddings 호출).
+        # 구버전엔 K-Cloud /encode_text 서버(client=custom_encode_text)였으나 bge-m3 는
+        # OpenAI 호환이라 openai_compatible 로 변경.
         "base_url": None,
-        "model": "Qwen3-Embedding-4B",
+        "model": "BAAI/bge-m3",
         "api_key_env": ["CUSTOM_EMBEDDING_API_KEY"],
         "base_url_env": ["CUSTOM_EMBEDDING_BASE_URL"],
         "model_env": ["CUSTOM_EMBEDDING_MODEL"],
-        "client": "custom_encode_text",
+        "client": "openai_compatible",
     },
     "self": {
         "base_url": None,
@@ -92,6 +127,13 @@ EMBEDDING_PROVIDERS: Dict[str, Dict[str, Any]] = {
 EMBEDDING_TIMEOUT_SEC: float = 180.0
 CHROMA_PERSIST_DIRECTORY: str = "./chroma_db"
 CHROMA_COLLECTION_NAME: str = "documents"
+VECTOR_BACKEND: str = "chroma"
+QDRANT_COLLECTION_NAME: str = "documents"
+QDRANT_VECTOR_SIZE: int = 1536
+QDRANT_ON_DISK: bool = True
+QDRANT_QUANTIZATION: str = "int8"
+QDRANT_SEARCH_OVERSAMPLING: float = 2.0
+QDRANT_HNSW_EF: int = 100
 SUPABASE_WRITE_EMBEDDING: bool = False
 SUPABASE_DUMMY_EMBEDDING_DIMENSIONS: int = 1536
 OPENROUTER_HTTP_REFERER: Optional[str] = None
@@ -188,6 +230,96 @@ def chroma_collection_name() -> str:
     return _env("CHROMA_COLLECTION_NAME", CHROMA_COLLECTION_NAME)
 
 
+def chroma_server_host() -> str:
+    """설정 시 Chroma 를 *서버 모드*(HttpClient)로 사용. 빈 값이면 in-process PersistentClient.
+
+    대용량 인덱스에서 인프로세스 Chroma 가 API 프로세스(이벤트 루프)를 얼리는 문제를
+    피하려면, Chroma 를 별도 서버로 띄우고 이 값을 그 host 로 지정한다.
+    """
+    return (_env("CHROMA_SERVER_HOST", "") or "").strip()
+
+
+def chroma_server_port() -> int:
+    try:
+        return int(_env("CHROMA_SERVER_PORT", "8000"))
+    except (TypeError, ValueError):
+        return 8000
+
+
+def vector_backend() -> str:
+    """벡터 인덱스 백엔드: ``chroma`` (기본) 또는 ``qdrant``.
+
+    Chroma 는 HNSW·원본 벡터를 전부 RAM 에 상주시켜 대용량(수백만 벡터)에서 메모리로
+    죽는다. Qdrant 백엔드는 int8 양자화본만 RAM 에 두고 원본은 디스크에 두는 구성이라
+    상주 메모리가 1/4 로 줄어든다. 전환은 이 값 하나로 한다.
+    """
+    return (_env("VECTOR_BACKEND", VECTOR_BACKEND) or VECTOR_BACKEND).strip().lower()
+
+
+def qdrant_url() -> str:
+    """Qdrant REST endpoint. 미설정이면 host/port 로 조립."""
+    explicit = (_env("QDRANT_URL", "") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    host = (_env("QDRANT_HOST", "127.0.0.1") or "127.0.0.1").strip()
+    try:
+        port = int(_env("QDRANT_PORT", "6333"))
+    except (TypeError, ValueError):
+        port = 6333
+    return f"http://{host}:{port}"
+
+
+def qdrant_api_key() -> Optional[str]:
+    return (_env("QDRANT_API_KEY", "") or "").strip() or None
+
+
+def qdrant_collection_name() -> str:
+    # 기본값을 Chroma 컬렉션명과 맞춰, 이관 후에도 같은 이름으로 읽힌다.
+    return _env("QDRANT_COLLECTION_NAME", QDRANT_COLLECTION_NAME)
+
+
+def qdrant_vector_size() -> int:
+    """컬렉션 생성 시에만 쓰인다. 기존 컬렉션이 있으면 그쪽 설정이 우선."""
+    try:
+        return int(_env("QDRANT_VECTOR_SIZE", str(QDRANT_VECTOR_SIZE)))
+    except (TypeError, ValueError):
+        return QDRANT_VECTOR_SIZE
+
+
+def qdrant_on_disk() -> bool:
+    """원본 벡터/HNSW/payload 를 디스크(mmap)에 둘지. 메모리 절감의 핵심 스위치."""
+    raw = _env("QDRANT_ON_DISK", "")
+    if not raw.strip():
+        return QDRANT_ON_DISK
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def qdrant_quantization() -> str:
+    """``int8`` (기본) | ``binary`` | ``none``.
+
+    int8: 벡터당 1/4 크기, 정확도 손실 미미 — 기본값.
+    binary: 1/32 크기. 1536-dim 고차원에서만 쓸 만하고 oversampling 을 크게 줘야 한다.
+    none: 양자화 없음 — 원본이 그대로 RAM/디스크에서 쓰인다.
+    """
+    return (_env("QDRANT_QUANTIZATION", QDRANT_QUANTIZATION) or "int8").strip().lower()
+
+
+def qdrant_search_oversampling() -> float:
+    """양자화 검색 시 후보를 몇 배로 넓게 뽑아 원본으로 재채점할지."""
+    try:
+        return float(_env("QDRANT_SEARCH_OVERSAMPLING", str(QDRANT_SEARCH_OVERSAMPLING)))
+    except (TypeError, ValueError):
+        return QDRANT_SEARCH_OVERSAMPLING
+
+
+def qdrant_hnsw_ef() -> int:
+    """검색 시 탐색 폭. Chroma 쪽 ef_search=100 과 맞춰 리콜을 보존한다."""
+    try:
+        return int(_env("QDRANT_HNSW_EF", str(QDRANT_HNSW_EF)))
+    except (TypeError, ValueError):
+        return QDRANT_HNSW_EF
+
+
 def supabase_write_embedding() -> bool:
     raw = os.getenv("SUPABASE_WRITE_EMBEDDING")
     if raw is None or raw.strip() == "":
@@ -207,3 +339,5 @@ def supabase_dummy_embedding_dimensions() -> int:
 
 def memento_drive_folder_id() -> str:
     return _env("MEMENTO_DRIVE_FOLDER_ID", MEMENTO_DRIVE_FOLDER_ID)
+
+

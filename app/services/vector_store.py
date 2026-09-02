@@ -2,23 +2,38 @@ from __future__ import annotations
 
 from typing import List, Dict, Any, Optional
 import asyncio
+import contextlib
 import os
-from pathlib import Path
 import uuid
 import unicodedata
 
-from chromadb import PersistentClient
-from dotenv import load_dotenv
 from langchain.schema import Document
 from supabase import create_client
 
+from app.core.env_loader import load_project_dotenv
 from app.services.llm import get_embeddings
+from app.services.vector_index import make_vector_index
 from app.core import config
 
 
-load_dotenv()
+load_project_dotenv()
 
 PRIMITIVE_METADATA_TYPES = (str, int, float, bool)
+
+# Chroma 는 SQLite 백엔드라 여러 스레드에서 *동시 쓰기* 하면 "database is locked" 등
+# 충돌 위험이 있다. 임베딩/삽입을 to_thread 로 오프로드하면서 동시 인덱싱이 가능해졌으므로,
+# 인덱스 *쓰기* 구간만 이 락으로 직렬화한다.
+# (락 획득은 async — 이벤트 루프는 막지 않고, 실제 작업은 to_thread 안에서 돈다.
+#  읽기(similarity_search)는 동시 허용 — 직렬화하지 않는다.)
+# Qdrant 는 동시 쓰기를 자체 처리하므로 이 락을 건너뛴다(requires_write_lock=False).
+_index_write_lock: Optional["asyncio.Lock"] = None
+
+
+def _get_index_write_lock() -> "asyncio.Lock":
+    global _index_write_lock
+    if _index_write_lock is None:
+        _index_write_lock = asyncio.Lock()
+    return _index_write_lock
 
 def _normalize_filename(value: Any) -> Any:
     if not isinstance(value, str):
@@ -47,7 +62,7 @@ def _strip_nul(value: Any) -> Any:
 
 
 class VectorStoreManager:
-    """Stores source documents in Supabase and indexes embeddings in Chroma."""
+    """Stores source documents in Supabase and indexes embeddings in the vector index."""
 
     def __init__(self):
         self.supabase = create_client(
@@ -60,19 +75,17 @@ class VectorStoreManager:
             config.supabase_dummy_embedding_dimensions()
         )
 
-        persist_dir = Path(config.chroma_persist_directory()).expanduser()
-        if not persist_dir.is_absolute():
-            # 프로젝트 루트 기준 (app/services/vector_store.py → repo root)
-            repo_root = Path(__file__).resolve().parents[2]
-            persist_dir = (repo_root / persist_dir).resolve()
-        persist_dir.mkdir(parents=True, exist_ok=True)
+        # 벡터 인덱스 백엔드는 VECTOR_BACKEND(chroma|qdrant)로 고른다. 접속·스키마·필터 번역은
+        # 전부 vector_index 모듈이 처리하고, 여기서는 인덱스 표면만 쓴다.
+        self.index = make_vector_index()
+        # 로그에 실제 백엔드를 찍기 위한 표시명 (QdrantIndex → "Qdrant")
+        self.index_name = type(self.index).__name__.removesuffix("Index") or "index"
 
-        self.chroma_collection_name = config.chroma_collection_name().strip()
-        self.chroma_client = PersistentClient(path=str(persist_dir))
-        self.collection = self.chroma_client.get_or_create_collection(
-            name=self.chroma_collection_name,
-            metadata={"hnsw:space": "cosine"},
-        )
+    def _write_lock(self):
+        """인덱스 쓰기 직렬화 컨텍스트. 단일 writer 백엔드(Chroma)에서만 실제로 잠근다."""
+        if getattr(self.index, "requires_write_lock", True):
+            return _get_index_write_lock()
+        return contextlib.nullcontext()
 
     async def add_documents(self, documents: List[Document], tenant_id: str) -> bool:
         """Add source documents to Supabase and vector index entries to Chroma."""
@@ -110,13 +123,15 @@ class VectorStoreManager:
             texts = [doc.page_content or "" for doc in processed_documents]
             metadatas = [doc.metadata for doc in processed_documents]
             _emb_t0 = _time.perf_counter()
-            embeddings = self._embed_texts(texts)
+            # 임베딩은 동기 HTTP/GPU 호출이라 이벤트 루프에서 직접 돌리면 인덱싱 내내
+            # 다른 모든 요청(폴더 조회 등)이 멈춘다 → 워커 스레드로 오프로드해 루프를 비운다.
+            embeddings = await asyncio.to_thread(self._embed_texts, texts)
             print(
                 f"[vector_store] embeddings done: count={len(embeddings)} "
                 f"elapsed={int((_time.perf_counter()-_emb_t0)*1000)}ms"
             )
 
-            print("Saving documents to Supabase and Chroma...")
+            print(f"Saving documents to Supabase and {self.index_name}...")
             row_ids: List[str] = []
             for text, metadata in zip(texts, metadatas):
                 rid = str(metadata.get("id") or uuid.uuid4())
@@ -128,18 +143,22 @@ class VectorStoreManager:
             batch_count = (total - 1) // batch_size + 1 if total else 0
             for bi, start in enumerate(range(0, total, batch_size), start=1):
                 end = start + batch_size
-                self._insert_source_documents_batch(
+                # Supabase insert / Chroma upsert 모두 동기 I/O — 루프 블로킹 방지로 스레드 오프로드.
+                await asyncio.to_thread(
+                    self._insert_source_documents_batch,
                     row_ids=row_ids[start:end],
                     texts=texts[start:end],
                     metadatas=metadatas[start:end],
                     embeddings=embeddings[start:end],
                 )
-                self._upsert_chroma_documents_batch(
-                    row_ids=row_ids[start:end],
-                    texts=texts[start:end],
-                    metadatas=metadatas[start:end],
-                    embeddings=embeddings[start:end],
-                )
+                async with self._write_lock():
+                    await asyncio.to_thread(
+                        self._upsert_index_documents_batch,
+                        row_ids=row_ids[start:end],
+                        texts=texts[start:end],
+                        metadatas=metadatas[start:end],
+                        embeddings=embeddings[start:end],
+                    )
                 print(f"Saved batch {bi}/{batch_count} ({min(end, total) - start} docs)")
             print(
                 f"[vector_store] add_documents done: total={total} "
@@ -156,20 +175,66 @@ class VectorStoreManager:
             return False
 
     def _embed_texts(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings in batches to avoid provider token limits."""
-        embed_batch_size = 50
-        embeddings: List[List[float]] = []
-        total_batches = (len(texts) - 1) // embed_batch_size + 1 if texts else 0
+        """Embed in small batches with adaptive split.
 
-        for batch_start in range(0, len(texts), embed_batch_size):
-            batch_texts = texts[batch_start : batch_start + embed_batch_size]
-            batch_embeddings = self.embeddings.embed_documents(batch_texts)
-            embeddings.extend(batch_embeddings)
-            print(
-                f"Embedded batch {batch_start // embed_batch_size + 1}/{total_batches} "
-                f"({len(batch_texts)} docs)"
-            )
+        사내 bge-m3(TEI) 는 sglang 과 GPU 를 공유해 가용 VRAM 이 빠듯하다. 큰 배치는
+        CUDA OOM(HTTP 424 Backend error)을 유발하므로 기본 배치를 작게 두고(EMBEDDING_BATCH_SIZE,
+        기본 8), 배치 임베딩 실패 시 절반으로 쪼개 1까지 재귀 재시도한다. VRAM 변동(동시 인제스트
+        등)에도 자동 적응. OpenAI 등 큰 배치 허용 provider 는 EMBEDDING_BATCH_SIZE 를 키우면 됨.
+        """
+        if not texts:
+            return []
+        try:
+            target = max(1, int(os.getenv("EMBEDDING_BATCH_SIZE", "8")))
+        except ValueError:
+            target = 8
+
+        embeddings: List[List[float]] = []
+        total_batches = (len(texts) - 1) // target + 1
+        for bi, start in enumerate(range(0, len(texts), target), start=1):
+            batch_texts = texts[start : start + target]
+            embeddings.extend(self._embed_batch_adaptive(batch_texts))
+            print(f"Embedded batch {bi}/{total_batches} ({len(batch_texts)} docs)")
         return embeddings
+
+    def _embed_batch_adaptive(self, batch: List[str], _attempt: int = 0) -> List[List[float]]:
+        """배치 임베딩. 실패 유형별 대응:
+        - rate/네트워크성(429/5xx/timeout/connection): *같은 배치*를 지수 백오프로 재시도
+          (배치를 쪼갠다고 429가 풀리지 않으므로). MEMENTO_EMBED_MAX_RETRIES(기본 3)회.
+        - 그 외(예: OOM/424/과대배치): 절반으로 쪼개 재귀 재시도 — 1까지 줄여도 실패면 raise.
+        (이 메서드는 to_thread 워커 스레드에서 도므로 time.sleep 은 이벤트 루프를 막지 않음)
+        """
+        if not batch:
+            return []
+        try:
+            return self.embeddings.embed_documents(batch)
+        except Exception as exc:  # noqa: BLE001
+            import time as _t
+            msg = str(exc).lower()
+            transient = any(k in msg for k in (
+                "429", "rate limit", "too many requests", "timeout", "timed out",
+                "502", "503", "504", "connection", "econnreset", "temporarily", "overload",
+            ))
+            try:
+                _max = int(os.getenv("MEMENTO_EMBED_MAX_RETRIES", "3"))
+            except ValueError:
+                _max = 3
+            # rate/네트워크성 → 같은 배치 백오프 재시도 (서버 과부하 대응)
+            if transient and _attempt < _max:
+                delay = min(30.0, 1.5 * (2 ** _attempt))
+                print(f"[vector_store] embed transient({type(exc).__name__}) "
+                      f"→ {delay:.0f}s 후 재시도 {_attempt + 1}/{_max}")
+                _t.sleep(delay)
+                return self._embed_batch_adaptive(batch, _attempt + 1)
+            if len(batch) == 1:
+                print(f"[vector_store] embed 단일 텍스트 실패 (len={len(batch[0])}): {exc}")
+                raise
+            mid = len(batch) // 2
+            print(
+                f"[vector_store] embed batch={len(batch)} 실패({type(exc).__name__}) "
+                f"→ {mid}+{len(batch) - mid} 분할 재시도"
+            )
+            return self._embed_batch_adaptive(batch[:mid]) + self._embed_batch_adaptive(batch[mid:])
 
     def _build_supabase_payload(
         self,
@@ -262,46 +327,46 @@ class VectorStoreManager:
                     f"Supabase batch insert failed even with dummy {dims}-d vector."
                 ) from fallback_exc
 
-    def _upsert_chroma_documents_batch(
+    def _upsert_index_documents_batch(
         self,
         row_ids: List[str],
         texts: List[str],
         metadatas: List[Dict[str, Any]],
         embeddings: List[List[float]],
     ) -> None:
-        self.collection.upsert(
+        self.index.upsert(
             ids=row_ids,
             embeddings=embeddings,
             documents=texts,
-            metadatas=[self._build_chroma_metadata(m, rid) for m, rid in zip(metadatas, row_ids)],
+            metadatas=[self._build_index_metadata(m, rid) for m, rid in zip(metadatas, row_ids)],
         )
 
-    def _build_chroma_metadata(
+    def _build_index_metadata(
         self, metadata: Dict[str, Any], document_row_id: str
     ) -> Dict[str, Any]:
-        chroma_metadata: Dict[str, Any] = {}
+        index_metadata: Dict[str, Any] = {}
         for key, value in (metadata or {}).items():
             if value is None:
                 continue
             if isinstance(value, PRIMITIVE_METADATA_TYPES):
-                chroma_metadata[key] = _normalize_str(value)
+                index_metadata[key] = _normalize_str(value)
 
-        chroma_metadata["document_row_id"] = document_row_id
-        chroma_metadata.setdefault("type", "document")
-        return chroma_metadata
+        index_metadata["document_row_id"] = document_row_id
+        index_metadata.setdefault("type", "document")
+        return index_metadata
 
-    def _upsert_chroma_document(
+    def _upsert_index_document(
         self,
         document_row_id: str,
         text: str,
         metadata: Dict[str, Any],
         embedding: List[float],
     ) -> None:
-        self.collection.upsert(
+        self.index.upsert(
             ids=[document_row_id],
             embeddings=[embedding],
             documents=[text],
-            metadatas=[self._build_chroma_metadata(metadata, document_row_id)],
+            metadatas=[self._build_index_metadata(metadata, document_row_id)],
         )
 
     async def _save_image_metadata_once(
@@ -336,7 +401,10 @@ class VectorStoreManager:
 
                     if analysis_text and image_id not in saved_embedding_ids:
                         try:
-                            image_embedding = self.embeddings.embed_query(analysis_text)
+                            # 동기 임베딩 호출 — 루프 블로킹 방지로 스레드 오프로드.
+                            image_embedding = await asyncio.to_thread(
+                                self.embeddings.embed_query, analysis_text
+                            )
                             saved_embedding_ids.add(image_id)
 
                             image_document_row_id = str(uuid.uuid4())
@@ -356,18 +424,21 @@ class VectorStoreManager:
                                 ),
                                 "image_url": image_info.get("image_url", ""),
                             }
-                            self._insert_source_document(
+                            await asyncio.to_thread(
+                                self._insert_source_document,
                                 document_row_id=image_document_row_id,
                                 text=analysis_text,
                                 metadata=image_metadata,
                                 embedding=image_embedding,
                             )
-                            self._upsert_chroma_document(
-                                document_row_id=image_document_row_id,
-                                text=analysis_text,
-                                metadata=image_metadata,
-                                embedding=image_embedding,
-                            )
+                            async with self._write_lock():
+                                await asyncio.to_thread(
+                                    self._upsert_index_document,
+                                    document_row_id=image_document_row_id,
+                                    text=analysis_text,
+                                    metadata=image_metadata,
+                                    embedding=image_embedding,
+                                )
                         except Exception as e:
                             print(f"Error generating embedding for image {image_id}: {e}")
 
@@ -379,7 +450,9 @@ class VectorStoreManager:
                         "image_url": image_info.get("image_url", ""),
                         "metadata": image_info.get("metadata", {}),
                     }
-                    self.supabase.table("document_images").insert(image_data).execute()
+                    await asyncio.to_thread(
+                        self.supabase.table("document_images").insert(image_data).execute
+                    )
                     total_images_saved += 1
 
             if total_images_saved:
@@ -391,13 +464,43 @@ class VectorStoreManager:
         except Exception as e:
             print(f"Error in _save_image_metadata_once: {e}")
 
+    async def delete_where(self, where: Dict[str, Any]) -> None:
+        """임베딩을 메타데이터 필터로 삭제 — *쓰기 락 아래*에서.
+
+        add_documents 의 upsert 와 같은 락을 공유해, 임베딩 진행 중 삭제가 겹쳐도 단일 writer
+        백엔드(Chroma/SQLite)에서 충돌("database is locked")·스래싱을 막는다.
+        (락 없이 직접 삭제를 부르면 단일 writer 리소스를 두고 경합해 극단적으로 느려짐.)
+        """
+        if not where:
+            return
+        async with self._write_lock():
+            await asyncio.to_thread(self.index.delete_where, where)
+
+    async def delete_ids(self, ids: List[str]) -> None:
+        """임베딩을 id 리스트로 삭제 — *쓰기 락 아래*에서 (delete_where 와 동일 취지)."""
+        if not ids:
+            return
+        async with self._write_lock():
+            await asyncio.to_thread(self.index.delete_ids, ids)
+
+    async def get_embeddings_by_ids(self, ids: List[str]) -> Dict[str, List[float]]:
+        """row id → 임베딩 벡터. 인덱스에 없는 id 는 결과에서 빠진다.
+
+        주의: Qdrant 백엔드는 Cosine 거리라 저장 시 벡터를 L2 정규화한다. 즉 여기서 돌려주는
+        값은 Chroma 백엔드의 원본 벡터와 스케일이 다르다(방향은 동일). 코사인 유사도 용도면
+        동등하지만, 크기(norm)에 의존하는 소비자가 있으면 확인이 필요하다.
+        """
+        if not ids:
+            return {}
+        return await asyncio.to_thread(self.index.get_embeddings, ids)
+
     async def similarity_search(
         self,
         query: str,
         filter: Optional[Dict[str, Any]] = None,
         top_k: int = 5,
     ) -> List[Document]:
-        """Search Chroma and hydrate the matching source documents from Supabase."""
+        """Search the vector index and hydrate the matching source documents from Supabase."""
         try:
             print(f"Searching for documents similar to query: {query}")
             return await asyncio.to_thread(self._similarity_search_sync, query, filter, top_k)
@@ -405,10 +508,10 @@ class VectorStoreManager:
             print(f"Error searching documents: {e}")
             return []
 
-    def _build_chroma_where(
+    def _build_where(
         self, filter: Optional[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
-        """filter dict 를 Chroma where 절로 변환.
+        """filter dict 를 인덱스 where 절로 변환 (Chroma where 문법 = 공용 필터 언어).
 
         지원 키:
             - 일반 metadata 키 (primitive value): equality 매칭
@@ -458,17 +561,16 @@ class VectorStoreManager:
     ) -> List[Document]:
         try:
             query_embedding = self.embeddings.embed_query(query)
-            where = self._build_chroma_where(filter)
-            response = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=top_k,
+            where = self._build_where(filter)
+            hits = self.index.query(
+                embedding=query_embedding,
+                top_k=top_k,
                 where=where,
             )
 
-            hit_ids = response.get("ids", [[]])
             ordered_document_ids: List[str] = []
-            for raw_id in hit_ids[0] if hit_ids else []:
-                document_id = str(raw_id)
+            for hit in hits:
+                document_id = str(hit.get("id") or "")
                 if document_id and document_id not in ordered_document_ids:
                     ordered_document_ids.append(document_id)
 
@@ -508,6 +610,45 @@ class VectorStoreManager:
                 )
             )
         return ordered_documents
+
+    async def search_chunk_metadata(
+        self,
+        query: str,
+        filter: Optional[Dict[str, Any]] = None,
+        top_k: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """임베딩 검색 히트의 *메타데이터만* 유사도 순으로 반환.
+
+        본문이 필요 없는 랭킹 용도(폴더 안에서 관련 문서 추리기)에서 쓴다. 청크 수백 개를
+        Supabase 에서 hydrate 하지 않으므로 similarity_search 보다 훨씬 싸다.
+        """
+        try:
+            return await asyncio.to_thread(
+                self._search_chunk_metadata_sync, query, filter, top_k
+            )
+        except Exception as e:
+            print(f"Error searching chunk metadata: {e}")
+            return []
+
+    def _search_chunk_metadata_sync(
+        self,
+        query: str,
+        filter: Optional[Dict[str, Any]] = None,
+        top_k: int = 200,
+    ) -> List[Dict[str, Any]]:
+        try:
+            query_embedding = self.embeddings.embed_query(query)
+            where = self._build_where(filter)
+            hits = self.index.query(
+                embedding=query_embedding,
+                top_k=max(1, int(top_k)),
+                where=where,
+                with_metadata=True,
+            )
+            return [h["metadata"] for h in hits if isinstance(h.get("metadata"), dict)]
+        except Exception as e:
+            print(f"Error searching chunk metadata: {e}")
+            return []
 
     def get_retriever(self, top_k: int = 5, **kwargs):
         raise NotImplementedError(

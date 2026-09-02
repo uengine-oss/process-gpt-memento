@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "프로바이더별 샘플링 파라미터. create_llm 이 이 값을 요청에 실어 보낸다.",
+    "top_p·presence_penalty·frequency_penalty 는 OpenAI 호환 1급 필드로,",
+    "나머지(top_k·min_p·repetition_penalty·chat_template_kwargs)는 vLLM 확장이라",
+    "extra_body 로 전달한다.",
+    "enable_thinking=false 가 핵심이다 — 켜두면 'ok' 한 마디에도 사고 토큰을 뱉어",
+    "출력이 19배(2→38 토큰) 늘고 카드 생성처럼 호출이 많은 작업이 타임아웃한다.",
+    "호출부가 temperature 를 명시하면 그 값이 이긴다(결정론이 필요한 작업 보호)."
+  ],
+  "custom": {
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "presence_penalty": 1.5,
+    "extra_body": {
+      "top_k": 20,
+      "min_p": 0.0,
+      "repetition_penalty": 1.0,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    }
+  }
+}

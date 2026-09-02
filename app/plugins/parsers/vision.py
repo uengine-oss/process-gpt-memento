@@ -1,0 +1,197 @@
+"""문서 공용 Vision(멀티모달 LLM) 헬퍼 — PDF·DOCX 파서가 공유한다.
+
+세 가지 진입점:
+  1. ``ocr_page_image`` — 텍스트 레이어 없는 스캔/이미지 페이지를 통째로 OCR
+     (본문은 받아쓰고 도식은 ``[도식: ...]`` 으로 설명). PDF 전용.
+  2. ``describe_image`` — 본문에 삽입된 개별 그림/도식/사진을 설명.
+     (텍스트는 파서가 뽑고, 그림만 VLM 으로 돌려 *그림 자리에* inline 삽입.)
+     PDF·DOCX 공통. ``prompt`` 인자로 문서별 프롬프트 override 가능(기본=범용).
+  3. ``run_parallel`` — (key, thunk) 목록을 ThreadPool 로 병렬 실행(VISION_MAX_WORKERS).
+
+provider 설정은 memento 의 ``resolve_llm_config()`` 사용(openai/openrouter/custom 공통).
+폐쇄망에서는 ``MEMENTO_LLM_PROVIDER=custom`` + ``CUSTOM_LLM_*`` 로 동작.
+PDF 페이지 OCR/그림 처리 토글은 ``PDF_VISION_ENABLED`` 상수(기본 on).
+"""
+from __future__ import annotations
+
+import base64
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, Dict, List, Optional, Tuple
+
+import httpx
+
+from app.core.config import resolve_llm_config
+
+
+# ─── 동작 상수 ──────────────────────────────────────────────────────────────
+PDF_VISION_ENABLED = True       # PDF 스캔/이미지 페이지 VLM 처리 on/off
+# 문서 전체 VLM 동시 호출 수 (ThreadPool). 비전 서버 용량에 맞춰 조절:
+#   폐쇄망 단일 GPU 로 VRAM 여유 적으면 1~2 (OOM 방지), 클라우드/여유 있으면 8+ 로 상향.
+#   env ``MEMENTO_PDF_VISION_WORKERS`` 로 재배포 없이 조절. (기본 4)
+VISION_MAX_WORKERS = max(1, int(os.getenv("MEMENTO_PDF_VISION_WORKERS", "4") or "4"))
+OCR_MAX_TOKENS = 8192           # 스캔 페이지 통합 OCR
+DESCRIBE_MAX_TOKENS = 4096      # 개별 그림 설명
+VISION_TIMEOUT_SEC = 300.0      # 개별 호출 timeout(초)
+
+
+# 스캔 페이지 전체 OCR — 본문은 받아쓰고 도식만 설명 모드로.
+UNIFIED_OCR_PROMPT = (
+    "당신은 정밀 문서 OCR 엔진입니다. 주어진 문서 페이지 이미지를 보고 "
+    "**페이지에 보이는 모든 텍스트를 원문 그대로** 추출하세요. 규칙:\n"
+    "1. 한글/영문/숫자/기호를 빠짐없이, 읽는 순서(위→아래, 좌→우)대로 출력.\n"
+    "2. 표는 마크다운 표로 구조를 유지해서 옮길 것 (열/행 순서 보존).\n"
+    "3. 제목/소제목/글머리표(•, -, □, 1.)는 그대로 유지.\n"
+    "4. 도식/플로차트/조직도/차트를 만나면 그대로 받아쓰지 말고 "
+    "`[도식: 구성요소·관계·화살표 방향·라벨 설명]` 블록으로 출력하되, "
+    "도식 안의 텍스트(법인명·계약명·숫자)는 원문 그대로 포함할 것.\n"
+    "5. 판독 불가한 부분만 [판독불가] 로 표기. 내용을 지어내지 말 것.\n"
+    "6. 추출한 텍스트 외의 머리말·설명·인사말은 붙이지 말 것."
+)
+
+# 본문 페이지에 삽입된 *개별 그림* 설명용.
+DESCRIBE_IMAGE_PROMPT = (
+    "이것은 문서 본문에 삽입된 그림/도식/차트/사진입니다. 한국어로 간결하게 정리:\n"
+    "1. 그림 유형 (사진 / 조직도 / 플로차트 / 그래프 / 다이어그램 등).\n"
+    "2. 핵심 구성요소와 그들 사이의 관계 (화살표가 있으면 *방향* 포함).\n"
+    "3. 그림 안에 보이는 모든 텍스트 라벨·숫자를 원문 그대로 인용.\n"
+    "원본에 실제로 있는 정보만 사용. 추측 금지. 2~6줄로 요약."
+)
+
+
+def pdf_vision_enabled() -> bool:
+    """PDF vision 활성화 여부. 상수 PDF_VISION_ENABLED."""
+    return PDF_VISION_ENABLED
+
+
+def _disable_thinking() -> bool:
+    return (os.getenv("CUSTOM_LLM_DISABLE_THINKING", "") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _strip_wrapping_fence(text: str) -> str:
+    """VLM 이 출력 전체를 ```markdown ... ``` 로 감싼 경우 그 *바깥* 펜스만 제거.
+
+    OCR 프롬프트가 "표는 마크다운 표로"라고 지시하면 모델이 페이지 전체를 코드펜스로
+    감싸는 일이 흔하다. 그대로 저장하면 본문 전체가 코드블록이 되어 표/제목이 렌더되지
+    않고 RAG 노이즈가 된다. 첫 줄이 ``` 로 시작하고 마지막이 ``` 로 끝날 때만 벗긴다
+    (본문 중간의 정상 코드블록은 건드리지 않음)."""
+    if not text:
+        return text
+    t = text.strip()
+    if not t.startswith("```"):
+        return t
+    nl = t.find("\n")
+    if nl == -1:
+        return t  # 한 줄뿐이면 펜스로 보지 않음
+    opener = t[:nl].strip()          # "```" 또는 "```markdown"
+    # opener 는 백틱 + (선택)언어토큰만 있어야 진짜 여는 펜스
+    if opener.strip("`").strip().isalnum() or opener == "```":
+        body = t[nl + 1:]
+        if body.rstrip().endswith("```"):
+            body = body.rstrip()[:-3]
+            return body.strip()
+    return t
+
+
+def _vlm_call(image_bytes: bytes, prompt: str, mime_type: str, max_tokens: int) -> str:
+    """OpenAI 호환 /chat/completions vision 호출. 실패 시 빈 문자열."""
+    cfg = resolve_llm_config()
+    base_url = (cfg.get("base_url") or "").rstrip("/")
+    api_key = cfg.get("api_key") or "not-needed"
+    model = cfg.get("model") or ""
+    if not base_url or not model:
+        print("[vision] base_url/model 미설정 — skip")
+        return ""
+
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    payload: Dict = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}},
+                ],
+            }
+        ],
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+    }
+    if cfg.get("provider") == "custom" and _disable_thinking():
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    if cfg.get("extra_headers"):
+        headers.update(cfg["extra_headers"])
+
+    try:
+        with httpx.Client(timeout=VISION_TIMEOUT_SEC) as client:
+            resp = client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        msg = choices[0].get("message") or {}
+        content = msg.get("content") or msg.get("reasoning_content") or ""
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+        # VLM 이 출력 전체를 ```markdown ... ``` 로 감싸는 경우가 잦다 → 바깥 펜스 제거.
+        return _strip_wrapping_fence(str(content))
+    except Exception as exc:
+        print(f"[vision] 호출 실패: {exc}")
+        return ""
+
+
+def ocr_page_image(png_bytes: bytes) -> str:
+    """스캔 페이지 PNG → 통합 OCR 텍스트(+도식 설명)."""
+    return _vlm_call(png_bytes, UNIFIED_OCR_PROMPT, "image/png", max_tokens=OCR_MAX_TOKENS)
+
+
+def describe_image(
+    image_bytes: bytes, mime_type: str = "image/png", prompt: Optional[str] = None
+) -> str:
+    """본문에 삽입된 그림 → 설명 텍스트. ``prompt`` 미지정 시 범용 프롬프트 사용."""
+    return _vlm_call(
+        image_bytes, prompt or DESCRIBE_IMAGE_PROMPT, mime_type, max_tokens=DESCRIBE_MAX_TOKENS
+    )
+
+
+_IMAGE_MIME_BY_EXT = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "bmp": "image/bmp", "webp": "image/webp",
+}
+
+
+def guess_image_mime(name_or_ext: str) -> str:
+    """파일명 또는 확장자 → image MIME. 미지원/미상은 image/png 로 폴백."""
+    raw = name_or_ext or ""
+    raw = raw.rsplit(".", 1)[-1] if "." in raw else raw
+    return _IMAGE_MIME_BY_EXT.get(raw.strip().lower(), "image/png")
+
+
+def run_parallel(tasks: List[Tuple[str, Callable[[], str]]]) -> Dict[str, str]:
+    """(key, thunk) 목록을 ThreadPool 로 병렬 실행 → {key: result}.
+
+    동시 호출 수는 상수 VISION_MAX_WORKERS 로 제한.
+    """
+    if not tasks:
+        return {}
+    max_workers = max(1, VISION_MAX_WORKERS)
+    # 실제 동시성 = min(작업수, 설정값). env(MEMENTO_PDF_VISION_WORKERS) 반영 여부를 여기서 확인.
+    print(f"[vision] VLM {len(tasks)}건 → 동시 {min(len(tasks), max_workers)} "
+          f"(MEMENTO_PDF_VISION_WORKERS={max_workers})")
+    results: Dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        fut_map = {pool.submit(thunk): key for key, thunk in tasks}
+        for fut in as_completed(fut_map):
+            key = fut_map[fut]
+            try:
+                results[key] = fut.result()
+            except Exception as exc:
+                print(f"[vision] task {key} 실패: {exc}")
+                results[key] = ""
+    return results

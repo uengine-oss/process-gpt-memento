@@ -32,11 +32,52 @@ def _summarize_doc(doc: Document, max_chars: int = 200) -> str:
 SMALL_DOC_CHUNK_THRESHOLD = 15
 
 
+async def _resolve_subtree_file_ids(
+    tenant_id: str, folder_paths: List[str]
+) -> List[str]:
+    """folder_path(들) 의 *subtree* 에 속한 파일들의 source_ref(=file_id) 목록.
+
+    각 폴더 자신 + 하위(``folder_path == p`` 또는 ``folder_path like p/%``). scoped RAG 폴백을
+    선택된 폴더 안으로 좁히는 데 쓴다. 대규모 코퍼스 cross-contamination 방어의 핵심.
+    """
+    out: set[str] = set()
+    for raw in folder_paths:
+        p = (raw or "").strip().strip("/")
+        if not p:
+            continue
+        try:
+            eq = await asyncio.to_thread(
+                supabase.table("knowledge_files")
+                .select("source_ref")
+                .eq("tenant_id", tenant_id)
+                .eq("folder_path", p)
+                .execute
+            )
+            for r in (eq.data or []):
+                if r.get("source_ref"):
+                    out.add(str(r["source_ref"]))
+            ch = await asyncio.to_thread(
+                supabase.table("knowledge_files")
+                .select("source_ref")
+                .eq("tenant_id", tenant_id)
+                .like("folder_path", f"{p}/%")
+                .limit(20_000)
+                .execute
+            )
+            for r in (ch.data or []):
+                if r.get("source_ref"):
+                    out.add(str(r["source_ref"]))
+        except Exception as e:
+            logger.warning("[/search] subtree resolve failed for %r: %s", p, e)
+    return sorted(out)
+
+
 @router.get("/search")
 async def search(
     query: str,
     tenant_id: str,
     file_ids: Optional[List[str]] = Query(default=None),
+    folder_paths: Optional[List[str]] = Query(default=None),
     top_k: int = Query(default=5, ge=1, le=50),
     exclude_chunk_ids: Optional[List[str]] = Query(default=None),
 ):
@@ -46,6 +87,8 @@ async def search(
         - ``tenant_id`` 필수
         - ``file_ids`` 옵셔널 — 1개 이상이면 그 파일들 중에서 검색 (``$in``).
           비우면 tenant 전체에서 검색.
+        - ``folder_paths`` 옵셔널 — 이 폴더(들)의 subtree 로 검색을 좁힌다. file_ids도 주면
+          ``folder subtree ∪ file_ids``. 폴더와 독립 첨부가 공존하는 선택을 보존한다.
         - ``exclude_chunk_ids`` 옵셔널 — 이 chunk_id 들은 결과에서 제외하고 top_k 채움.
 
     /retrieve 와 달리 small-doc 통째 반환 / glossary merge / room/proc_inst 분기 등
@@ -56,6 +99,23 @@ async def search(
 
     metadata_filter: dict = {"tenant_id": tenant_id}
     cleaned_files = [str(x) for x in (file_ids or []) if x]
+
+    cleaned_folders = [str(x) for x in (folder_paths or []) if x]
+    if cleaned_folders:
+        subtree_ids = await _resolve_subtree_file_ids(tenant_id, cleaned_folders)
+        if cleaned_files:
+            # 폴더 subtree ∪ 개별 file_ids — 둘 다 접근(공존 스코프: 폴더 + 방에 올린 파일 등).
+            # (예전엔 교집합이라, 폴더와 함께 온 개별 파일이 폴더 밖이면 사라졌음.)
+            cleaned_files = sorted(set(subtree_ids) | set(cleaned_files))
+        else:
+            cleaned_files = subtree_ids
+        if not cleaned_files:
+            logger.info(
+                "[/search] folder_paths=%s → subtree 0 files (no match) → empty result",
+                cleaned_folders,
+            )
+            return {"response": []}
+
     if cleaned_files:
         metadata_filter["file_id"] = cleaned_files
     excluded = [str(x) for x in (exclude_chunk_ids or []) if x]
@@ -296,8 +356,13 @@ async def list_documents(
     tenant_id: str,
     drive_folder_id: Optional[str] = None,
     include_images: bool = False,
+    folder_path: Optional[str] = None,
+    recursive: bool = False,
 ):
     """테넌트의 내부 지식공간 파일 목록을 knowledge_files에서 조회한다.
+
+    - folder_path 미지정: 테넌트 전체(전체 조회 — 대량 테넌트에선 무거움).
+    - folder_path 지정: 그 폴더 파일만(lazy 로딩). recursive=True 면 하위 포함.
 
     응답:
         files: [file_name, ...]                       (역호환)
@@ -305,11 +370,35 @@ async def list_documents(
         total: 개수
     """
     try:
-        from app.services.knowledge_files import list_for_tenant
+        from app.services.knowledge_files import list_for_tenant, list_for_folder
 
-        rows = await list_for_tenant(tenant_id)
+        if folder_path is not None and str(folder_path).strip().strip("/"):
+            rows = await list_for_folder(tenant_id, folder_path, recursive)
+        else:
+            rows = await list_for_tenant(tenant_id)
         if drive_folder_id:
             rows = [r for r in rows if r.get("drive_folder_id") == drive_folder_id]
+
+        # doc_role 별 요약(abstract) 적용 여부 — glossary/template/dataset 은 요약 없음(skip).
+        _SUMMARY_SKIP_ROLES = {"glossary", "template", "dataset"}
+
+        def _summary_status(r: dict) -> str:
+            """파일별 요약 상태: skipped | done | failed | pending.
+
+            list_for_tenant 가 doc_card 에서 abstract_status/abstract 를 평탄화해 주므로
+            여기서는 그 평탄 필드를 직접 읽는다.
+            """
+            role = (r.get("doc_role") or "content").strip().lower()
+            if role in _SUMMARY_SKIP_ROLES:
+                return "skipped"
+            st = r.get("abstract_status")
+            if st in ("done", "failed"):
+                return st
+            # 구버전 데이터(abstract_status 없음) 호환: abstract 유무로 추론.
+            if r.get("abstract"):
+                return "done"
+            # 인덱싱은 끝났는데 abstract 가 없으면 요약 실패로 간주(재요약 대상).
+            return "failed" if r.get("index_status") == "indexed" else "pending"
 
         file_names: List[str] = []
         file_details: List[dict] = []
@@ -329,6 +418,7 @@ async def list_documents(
                 "source_type": r.get("source_type"),
                 "source_ref": r.get("source_ref"),
                 "folder_path": r.get("folder_path") or "",
+                "path": r.get("path") or "",
                 "drive_folder_id": r.get("drive_folder_id"),
                 "mime_type": mime,
                 "size_bytes": r.get("size_bytes"),
@@ -341,6 +431,8 @@ async def list_documents(
                 "indexed_at": r.get("indexed_at"),
                 "updated_at": r.get("updated_at"),
                 "doc_role": r.get("doc_role") or "content",
+                # 요약 상태 (프론트 요약 인디케이터/재요약 버튼용)
+                "summary_status": _summary_status(r),
             })
 
         return {
@@ -579,25 +671,9 @@ async def get_chunks_with_embeddings(
                     from app.services.vector_store import get_vector_store
 
                     vsm = get_vector_store()
-                    fetched = await asyncio.to_thread(
-                        vsm.collection.get,
-                        ids=row_ids,
-                        include=["embeddings"],
-                    )
-                    _f_ids = fetched.get("ids")
-                    fetched_ids = list(_f_ids) if _f_ids is not None else []
-                    _f_embs = fetched.get("embeddings")
-                    fetched_embs = list(_f_embs) if _f_embs is not None else []
-                    for i, rid in enumerate(fetched_ids):
-                        if i < len(fetched_embs):
-                            emb = fetched_embs[i]
-                            if emb is not None:
-                                try:
-                                    embeddings_map[str(rid)] = list(emb)
-                                except Exception:
-                                    embeddings_map[str(rid)] = None
+                    embeddings_map = await vsm.get_embeddings_by_ids(row_ids)
                 except Exception as e:
-                    logger.warning("[chunks-with-embeddings] Chroma 임베딩 조회 실패: %s", e)
+                    logger.warning("[chunks-with-embeddings] 인덱스 임베딩 조회 실패: %s", e)
 
         chunks: List[dict] = []
         for row in text_rows:

@@ -14,7 +14,7 @@ from chromadb import PersistentClient
 
 
 def get_collection():
-    from app.core from app.core import config
+    from app.core import config
     client = PersistentClient(path=config.chroma_persist_directory())
     return client.get_collection(config.chroma_collection_name().strip())
 

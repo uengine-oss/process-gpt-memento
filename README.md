@@ -13,6 +13,32 @@ Google Drive, Supabase Storage, 로컬 파일에서 문서를 수집하고 청�
 - Chroma 기반 유사도 검색 + Supabase 원문 저장
 - Google OAuth 기반 테넌트별 Drive 접근
 - LLM 호출 경로를 `litellm proxy`로 전환 가능 (`llm.py`)
+- 문서 카드: 전문을 슬라이딩 윈도우로 읽어 만드는 리트리벌 표면 (`doc_cards.py`)
+
+## 문서 카드 (`knowledge_doc_cards`)
+
+에이전트가 폴더 수천 건에서 문서를 고르려면 "무엇에 대한 문서인가"가 아니라 **"이 문서를
+열어야 하는가"** 를 답하는 메타데이터가 필요하다. 기존 `knowledge_files.doc_card` 의
+abstract 는 앞 3쪽 + 뒤 1쪽만 보고 만든 한 줄이라 300쪽 문서에서는 후자를 답하지 못했다.
+
+`app/services/doc_cards.py` 는 문서 전문을 **길이 기반 슬라이딩 윈도우** 로 잘라 순서대로
+읽으며 카드를 갱신한다. 목차·헤딩·페이지 구조를 가정하지 않으므로 공문·엑셀·메일 뭉치가
+같은 경로를 탄다. 사실은 합집합으로 누적되고 요약만 교체되며, 예산(`KB_CARD_MAX_WINDOWS`,
+기본 16)을 넘으면 앞부분만 읽는 대신 문서 전체에 고르게 흩어 읽는다.
+
+카드 필드: `title`(본문 기준) · `summary` · `doc_type` · `topics` · `entities` · `keywords` ·
+`language` · `answers_questions`(리트리벌 표면) · `coverage`(얼마나 읽었는가).
+
+- 카드 생성은 인제스트를 막지 않는다 — 페이지 저장과 병행해 백그라운드로 돌고
+  `status`(pending/done/failed/empty)로 진행을 드러낸다.
+- 같은 내용(`content_sha256`)의 문서를 다시 올리면 카드를 재사용한다.
+- 텍스트 레이어가 없는 문서는 카드 대신 `has_text=false` 로 남는다. "자료에 없음" 과
+  "읽을 수 없음" 은 다른 결론이다.
+- 폴더 카드는 자식 카드의 `topics`/`answers_questions` 를 집계해 폴더 라우팅에 쓴다.
+
+마이그레이션: `sql/knowledge_doc_cards.sql`, `sql/kb_mirror.sql` (둘 다 멱등). 미적용
+상태에서도 서비스는 기존 `doc_card` 로 폴백해 동작한다. `kb_mirror.sql` 의 `kb_page_text`
+RPC 는 codex 지식베이스 미러가 파일별 전문을 배치로 가져오는 데 쓴다.
 
 ## 아키텍처 개요
 

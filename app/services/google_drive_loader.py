@@ -11,12 +11,12 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload, MediaIoBaseUpload
 import asyncio
 from supabase import create_client, Client
-from dotenv import load_dotenv
 import json
 from langchain.schema import Document
 from datetime import datetime
 
-from app.services.document_processor import DocumentProcessor
+from app.core.env_loader import load_project_dotenv
+from app.services.document_processor import get_document_processor
 
 import fitz  # PyMuPDF for PDF image extraction
 from PIL import Image
@@ -26,7 +26,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-load_dotenv()
+load_project_dotenv()
 
 SCOPES = [
     'https://www.googleapis.com/auth/drive.readonly',
@@ -50,7 +50,7 @@ class GoogleDriveLoader:
         self.token_path = token_path
         self.credentials = None
         self.service = drive_service
-        self.document_loader = DocumentProcessor()
+        self.document_loader = get_document_processor()  # 공유 싱글톤 — 청커 중복 생성 방지
         self.tenant_id = tenant_id
         
         # Initialize Supabase client if tenant_id is provided

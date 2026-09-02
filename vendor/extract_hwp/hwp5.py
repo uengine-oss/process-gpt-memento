@@ -200,9 +200,11 @@ def extract_text_from_hwp5(filepath: str) -> str:
             logging.warning(f"FileHeader 스트림이 없음: {filepath}")
             return ""
 
+        # 요약정보는 선택적 메타데이터라 본문 추출에 필요 없다. 실제로 읽지도 않는다.
+        # OLE 규약상 0x05 접두가 붙지만 이를 생략하는 생성기가 있어(예: rhwp 변환 산출물),
+        # 여기서 하드 실패시키면 본문이 멀쩡한 문서를 통째로 버리게 된다.
         if not ole.exists(HWP5_SUMMARY_INFO_STREAM_NAME):
-            logging.warning(f"SummaryInformation 스트림이 없음: {filepath}")
-            return ""
+            logging.info(f"SummaryInformation 스트림 없음(본문 추출은 계속): {filepath}")
 
         sections = []
         section_index = 0

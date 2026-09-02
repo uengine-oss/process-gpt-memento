@@ -57,7 +57,7 @@ class ImageStorageUtils:
             # Get public URL
             public_url_response = self.supabase.storage.from_("files").get_public_url(full_path)
             public_url = public_url_response.get('publicURL', '') if isinstance(public_url_response, dict) else str(public_url_response)
-            
+
             return {
                 'file_id': response.path,
                 'file_name': image_name,

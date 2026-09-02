@@ -24,46 +24,93 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Query
 
 from app.core.supabase_client import supabase
+from app.services.knowledge_files import compose_path
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _norm_folder(p: Optional[str]) -> str:
+    """폴더 경로 정규화 — 앞뒤 슬래시/공백 제거. 폴더 스코프 접두어 검사용."""
+    return (p or "").strip().strip("/")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 헬퍼 — file_name → file_id (source_ref) 해석
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _resolve_file_id(tenant_id: str, file_name: str) -> Optional[str]:
-    """동일 tenant 안에서 file_name 매칭되는 첫 knowledge_files row 의 source_ref 반환.
+async def _resolve_file_id(
+    tenant_id: str,
+    *,
+    path: Optional[str] = None,
+    file_name: Optional[str] = None,
+    folder_path: Optional[str] = None,
+) -> Optional[str]:
+    """문서 → knowledge_files.source_ref 해석.
 
-    동일 이름 파일이 여러 개면 가장 최근 modified 한 거 선택.
+    우선순위(견고한 표준 경로):
+    1) ``path`` (전체 상대경로 핸들) **정확 매칭**. 에이전트가 도구 출력의 path 를 *그대로 복사*해
+       넘기는 경로. 동명 파일도 path 가 사업별로 유일하므로 자동 구별 — 재조합 슬립 없음.
+    2) path 정확 매칭 실패 시: path 의 **basename 으로 file_name 매칭**(most-recent) — 모델이 path 를
+       살짝 틀리거나 레거시 행(path NULL)일 때의 폴백(이중 방어).
+    3) path 없이 ``file_name`` (+옵션 folder_path) — 레거시/`/document/raw` 호환.
+    다중이면 modified_time desc 로 가장 최근.
     """
+    def _ref(rows):
+        return rows[0].get("source_ref") if rows else None
+
     try:
-        result = await asyncio.to_thread(
-            supabase.table("knowledge_files")
-            .select("source_ref, source_type, modified_time, indexed_at")
-            .eq("tenant_id", tenant_id)
-            .eq("file_name", file_name)
-            .order("modified_time", desc=True)
-            .limit(1)
-            .execute
-        )
-        rows = result.data or []
-        if rows:
-            return rows[0].get("source_ref")
+        p = (path or "").strip().strip("/")
+        if p:
+            r = await asyncio.to_thread(
+                supabase.table("knowledge_files")
+                .select("source_ref, modified_time")
+                .eq("tenant_id", tenant_id).eq("path", p)
+                .order("modified_time", desc=True).limit(1).execute
+            )
+            ref = _ref(r.data or [])
+            if ref:
+                return ref
+            basename = p.rsplit("/", 1)[-1]
+            if basename:
+                r2 = await asyncio.to_thread(
+                    supabase.table("knowledge_files")
+                    .select("source_ref, modified_time")
+                    .eq("tenant_id", tenant_id).eq("file_name", basename)
+                    .order("modified_time", desc=True).limit(1).execute
+                )
+                ref = _ref(r2.data or [])
+                if ref:
+                    return ref
+        elif file_name:
+            q = (
+                supabase.table("knowledge_files")
+                .select("source_ref, modified_time")
+                .eq("tenant_id", tenant_id).eq("file_name", file_name)
+            )
+            if folder_path is not None and str(folder_path).strip() != "":
+                q = q.eq("folder_path", str(folder_path).strip().strip("/"))
+            r = await asyncio.to_thread(q.order("modified_time", desc=True).limit(1).execute)
+            ref = _ref(r.data or [])
+            if ref:
+                return ref
     except Exception as e:
         logger.warning(
-            "[navigator] resolve file_id failed (tenant=%s, name=%s): %s",
-            tenant_id, file_name, e,
+            "[navigator] resolve failed (tenant=%s path=%s name=%s): %s",
+            tenant_id, path, file_name, e,
         )
 
     # knowledge_files 가 없거나(로컬 dev) 매칭 실패 → processed_files(file_id=storage path) 폴백.
+    # path 만 받은 호출도 폴백을 타야 하므로 basename 을 이름으로 쓴다.
+    lookup_name = (file_name or "").strip() or (path or "").strip().strip("/").rsplit("/", 1)[-1]
+    if not lookup_name:
+        return None
     try:
         pf = await asyncio.to_thread(
             supabase.table("processed_files")
             .select("file_id")
             .eq("tenant_id", tenant_id)
-            .eq("file_name", file_name)
+            .eq("file_name", lookup_name)
             .limit(1)
             .execute
         )
@@ -73,7 +120,7 @@ async def _resolve_file_id(tenant_id: str, file_name: str) -> Optional[str]:
     except Exception as e2:
         logger.warning(
             "[navigator] resolve file_id processed_files 폴백 실패 (tenant=%s, name=%s): %s",
-            tenant_id, file_name, e2,
+            tenant_id, lookup_name, e2,
         )
     return None
 
@@ -87,6 +134,7 @@ async def catalog(
     tenant_id: str,
     file_ids: Optional[List[str]] = Query(default=None),
     file_names: Optional[List[str]] = Query(default=None),
+    folder_paths: Optional[List[str]] = Query(default=None),
 ):
     """선택 자료의 doc_card 목록 반환.
 
@@ -103,35 +151,61 @@ async def catalog(
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id required")
 
+    # 폴백(processed_files)이 except 밖에서도 쓰므로 스코프 변수와 out 은 try 밖에서 만든다.
     cleaned_ids = [str(x) for x in (file_ids or []) if x]
     cleaned_names = [str(x) for x in (file_names or []) if x]
-
+    cleaned_folders = [str(x) for x in (folder_paths or []) if x and str(x).strip().strip("/")]
     out: List[Dict[str, Any]] = []
+
+    _CATALOG_COLS = (
+        "source_ref, source_type, file_name, folder_path, path, mime_type, "
+        "size_bytes, modified_time, indexed_at, index_status, doc_card, doc_role"
+    )
     try:
-        query = (
-            supabase.table("knowledge_files")
-            .select(
-                "source_ref, source_type, file_name, folder_path, mime_type, "
-                "size_bytes, modified_time, indexed_at, index_status, doc_card, doc_role"
+        # 개별(file_ids/names) 과 폴더 스코프를 *union* 으로 합친다(공존 스코프: 폴더 + 방 첨부 등).
+        # 단일 소스면 각 분기 결과가 예전과 동일 → 기존 호출 영향 없음. 둘 다면 합쳐서 dedup.
+        rows: list = []
+        seen_refs: set = set()
+
+        def _add_rows(new_rows):
+            for r in (new_rows or []):
+                ref = r.get("source_ref")
+                if ref in seen_refs:
+                    continue
+                seen_refs.add(ref)
+                rows.append(r)
+
+        if cleaned_ids or cleaned_names:
+            query = (
+                supabase.table("knowledge_files")
+                .select(_CATALOG_COLS)
+                .eq("tenant_id", tenant_id)
             )
-            .eq("tenant_id", tenant_id)
-        )
-
-        if cleaned_ids:
-            query = query.in_("source_ref", cleaned_ids)
-        elif cleaned_names:
-            query = query.in_("file_name", cleaned_names)
-
-        query = query.order("file_name", desc=False)
-
-        response = await asyncio.to_thread(query.execute)
-        rows = response.data or []
+            if cleaned_ids:
+                query = query.in_("source_ref", cleaned_ids)
+            elif cleaned_names:
+                query = query.in_("file_name", cleaned_names)
+            response = await asyncio.to_thread(query.order("file_name", desc=False).execute)
+            _add_rows(response.data or [])
+        if cleaned_folders:
+            from app.services.knowledge_files import fetch_rows_by_folders
+            _add_rows(await fetch_rows_by_folders(tenant_id, _CATALOG_COLS, cleaned_folders))
+        if not cleaned_ids and not cleaned_names and not cleaned_folders:
+            # 스코프 없음 → tenant 전체. 채팅 첨부는 전체조회에 안 섞이게 제외.
+            from app.services.knowledge_files import _is_chat_attachment_ref
+            response = await asyncio.to_thread(
+                supabase.table("knowledge_files").select(_CATALOG_COLS)
+                .eq("tenant_id", tenant_id).order("file_name", desc=False).execute
+            )
+            _add_rows([r for r in (response.data or []) if not _is_chat_attachment_ref(r.get("source_ref"))])
+        rows = sorted(rows, key=lambda r: (r.get("file_name") or ""))
 
         for r in rows:
             out.append({
                 "file_id": r.get("source_ref"),
                 "file_name": r.get("file_name"),
                 "folder_path": r.get("folder_path") or "",
+                "path": r.get("path") or compose_path(r.get("folder_path"), r.get("file_name")),
                 "mime_type": r.get("mime_type"),
                 "size_bytes": r.get("size_bytes"),
                 "modified_time": r.get("modified_time"),
@@ -317,6 +391,44 @@ async def glossary_inline(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GET /glossary/terms
+# ─────────────────────────────────────────────────────────────────────────────
+# 구조화 용어사전(glossary_terms) 의 tenant 전체 용어를 반환. rfi-translate 등 소비자가
+# 이 목록으로 term-lock 매처를 만들어 '문서에 실제 등장한 용어만' 고정 번역한다.
+# (프롬프트 통째 주입이 아니라 소비자측 스캔 → 사전이 수만 개여도 스캔은 문서 길이에만 비례)
+# ─────────────────────────────────────────────────────────────────────────────
+@router.get("/glossary/terms")
+async def glossary_terms(
+    tenant_id: str,
+    file_ids: Optional[List[str]] = Query(default=None),
+):
+    """구조화 용어사전 행(영문/한글뜻/약어)을 반환.
+
+    Args:
+        tenant_id: 필수.
+        file_ids: 선택. 주면 해당 사전 파일들로 한정, 없으면 tenant 전체.
+
+    Returns:
+        ``{"response": [{english, korean, abbreviation}, ...], "count": int}``
+    """
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id required")
+
+    try:
+        from app.services.glossary_terms import list_terms
+        cleaned_ids = [str(x) for x in (file_ids or []) if x] or None
+        terms = await list_terms(tenant_id, file_ids=cleaned_ids)
+        logger.info(
+            "[/glossary/terms] tenant=%s ids=%s → %d terms",
+            tenant_id, (len(cleaned_ids) if cleaned_ids else "all"), len(terms),
+        )
+        return {"response": terms, "count": len(terms)}
+    except Exception as e:
+        logger.exception("[/glossary/terms] failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GET /document/grep
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -347,8 +459,10 @@ def _build_snippet(
 @router.get("/document/grep")
 async def document_grep(
     tenant_id: str,
-    file_name: str,
+    path: str,
     pattern: str,
+    file_ids: Optional[List[str]] = Query(default=None),
+    folder_paths: Optional[List[str]] = Query(default=None),
     regex: bool = Query(default=False),
     case_sensitive: bool = Query(default=False),
     context_lines: int = Query(default=0, ge=0, le=_GREP_MAX_CONTEXT_LINES),
@@ -357,7 +471,9 @@ async def document_grep(
     """한 문서 안에서 패턴 매칭 위치 찾기.
 
     Args:
-        tenant_id, file_name: 필수.
+        tenant_id: 필수.
+        path: **문서의 전체 상대경로 핸들** (open_folder/survey 출력의 path 그대로). 동명 파일도
+            path 가 사업별로 유일해 정확 구별. 서버가 path → source_ref 로 해석.
         pattern: 검색 패턴. ``regex=false``(기본)면 literal substring, ``true``면 정규식.
         case_sensitive: 기본 False (대소문자 무시).
         context_lines: 매칭 라인 좌/우로 같이 돌려줄 라인 수(0~5).
@@ -366,17 +482,31 @@ async def document_grep(
     Returns:
         ``{"response": [{file_name, page, line, snippet, context}, ...], "total_matches": N, "truncated": bool}``
     """
-    if not tenant_id or not file_name or not pattern:
-        raise HTTPException(status_code=400, detail="tenant_id, file_name, pattern required")
+    if not tenant_id or not path or not pattern:
+        raise HTTPException(status_code=400, detail="tenant_id, path, pattern required")
 
-    file_id = await _resolve_file_id(tenant_id, file_name)
+    file_id = await _resolve_file_id(tenant_id, path=path)
     if not file_id:
         return {
             "response": [],
             "total_matches": 0,
             "truncated": False,
-            "error": f"file_name '{file_name}' not found in tenant '{tenant_id}'",
+            "error": f"path '{path}' not found in tenant '{tenant_id}'",
         }
+    # ★ 보안 경계 — 선택한 자료(폴더 스코프 ∪ 개별 file_ids) 밖이면 본문 조회 거부.
+    #   folder_paths 는 path 접두어로 순수 검사(수천 refs 열거 없이 스케일). 폴더·파일 공존 시 union.
+    _allow = [str(x) for x in (file_ids or []) if x]
+    _scope = [_norm_folder(x) for x in (folder_paths or []) if _norm_folder(x)]
+    _path_norm = (path or "").strip().strip("/")
+    if _scope or _allow:
+        _in_folder = bool(_scope) and any(_path_norm == s or _path_norm.startswith(s + "/") for s in _scope)
+        _in_files = bool(_allow) and (file_id in _allow)
+        if not (_in_folder or _in_files):
+            return {
+                "response": [], "total_matches": 0, "truncated": False,
+                "error": f"path '{path}' 는 선택한 자료(폴더/파일) 범위 밖입니다.",
+            }
+    file_name = path  # 표시/인용용 (페이지 조회는 file_id 기준)
 
     # 패턴 컴파일 (regex 모드면 정규식, 아니면 literal escape)
     try:
@@ -504,20 +634,24 @@ def _parse_page_range(spec: str, n_pages_hint: Optional[int] = None) -> List[int
 @router.get("/document/page")
 async def document_page(
     tenant_id: str,
-    file_name: str,
+    path: str,
     pages: str,
+    file_ids: Optional[List[str]] = Query(default=None),
+    folder_paths: Optional[List[str]] = Query(default=None),
 ):
     """페이지 범위 본문 반환.
 
     Args:
-        tenant_id, file_name: 필수.
+        tenant_id: 필수.
+        path: **문서의 전체 상대경로 핸들** (open_folder/survey 출력의 path 그대로). 서버가
+            path → source_ref 로 해석. 동명 파일도 path 가 사업별로 유일해 정확 구별.
         pages: ``"5"`` / ``"5-8"`` / ``"5,7,12"`` / ``"3-5,9"`` 형식. 한 번 호출 최대 10페이지.
 
     Returns:
         ``{"file_name", "pages": [{"page_number", "content"}, ...]}``
     """
-    if not tenant_id or not file_name or not pages:
-        raise HTTPException(status_code=400, detail="tenant_id, file_name, pages required")
+    if not tenant_id or not path or not pages:
+        raise HTTPException(status_code=400, detail="tenant_id, path, pages required")
 
     page_numbers = _parse_page_range(pages)
     if not page_numbers:
@@ -531,13 +665,43 @@ async def document_page(
             ),
         )
 
-    file_id = await _resolve_file_id(tenant_id, file_name)
+    file_id = await _resolve_file_id(tenant_id, path=path)
+    file_name = path  # 응답 표시용 (페이지 조회는 file_id 기준)
     if not file_id:
         return {
             "file_name": file_name,
             "pages": [],
-            "error": f"file_name '{file_name}' not found in tenant '{tenant_id}'",
+            "error": f"path '{path}' not found in tenant '{tenant_id}'",
         }
+    # ★ 보안 경계 — 선택한 자료(폴더 스코프 ∪ 개별 file_ids) 밖이면 본문 조회 거부. 공존 시 union.
+    _allow = [str(x) for x in (file_ids or []) if x]
+    _scope = [_norm_folder(x) for x in (folder_paths or []) if _norm_folder(x)]
+    _path_norm = (path or "").strip().strip("/")
+    if _scope or _allow:
+        _in_folder = bool(_scope) and any(_path_norm == s or _path_norm.startswith(s + "/") for s in _scope)
+        _in_files = bool(_allow) and (file_id in _allow)
+        if not (_in_folder or _in_files):
+            return {
+                "file_name": file_name, "pages": [],
+                "error": f"path '{path}' 는 선택한 자료(폴더/파일) 범위 밖입니다.",
+            }
+
+    # 다운로드 핸들 — 출처 칩에서 원본 파일을 내려받게 source_type/source_ref/실제 file_name 동봉.
+    # (source_ref = drive: google file_id / upload: storage_path)
+    storage_type = ""
+    real_file_name = ""
+    try:
+        meta_resp = await asyncio.to_thread(
+            supabase.table("knowledge_files")
+            .select("source_type, file_name")
+            .eq("tenant_id", tenant_id).eq("source_ref", file_id)
+            .limit(1).execute
+        )
+        meta_row = (meta_resp.data or [{}])[0] if meta_resp.data else {}
+        storage_type = str(meta_row.get("source_type") or "")
+        real_file_name = str(meta_row.get("file_name") or "")
+    except Exception as e:  # noqa: BLE001 — 다운로드 핸들 조회 실패가 페이지 반환을 막지 않게
+        logger.warning("[/document/page] source meta lookup failed: %s", e)
 
     try:
         resp = await asyncio.to_thread(
@@ -562,25 +726,32 @@ async def document_page(
         "[/document/page] tenant=%s file=%s req=%s → pages=%d",
         tenant_id, file_name, pages, len(out_pages),
     )
-    return {"file_name": file_name, "pages": out_pages}
+    return {
+        "file_name": real_file_name or file_name,
+        "file_id": file_id,
+        "source_ref": file_id,
+        "storage_type": storage_type,
+        "pages": out_pages,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GET /document/raw
 #
-# 원본 파일 바이트 스트림 — data-analyst 서브에이전트가 sandbox 안에서 코드로 처리할
-# dataset (xlsx/csv) 파일을 받기 위해 호출. drive 소스가 아닌 upload 소스만 허용.
+# 원본 파일 바이트 스트림 — Codex가 선택한 문서의 작업 복사본을 만들 때 호출한다.
+# drive 소스가 아닌 upload 소스만 허용.
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/document/raw")
 async def document_raw(
     tenant_id: str,
-    file_name: str,
+    file_id: Optional[str] = None,
+    file_name: Optional[str] = None,
 ):
     """파일 원본 바이트를 binary stream 으로 반환.
 
     Args:
-        tenant_id, file_name: 필수.
+        tenant_id와 file_id가 정본이다. file_name은 구 클라이언트 호환용 폴백이다.
 
     제약:
         - upload 소스만 허용 (storage 'files' 버킷에서 다운로드).
@@ -591,27 +762,30 @@ async def document_raw(
     """
     from fastapi import Response
 
-    if not tenant_id or not file_name:
-        raise HTTPException(status_code=400, detail="tenant_id, file_name required")
+    if not tenant_id or not (file_id or file_name):
+        raise HTTPException(status_code=400, detail="tenant_id and file_id (or legacy file_name) required")
 
     try:
-        result = await asyncio.to_thread(
+        query = (
             supabase.table("knowledge_files")
-            .select("source_ref, source_type")
+            .select("source_ref, source_type, file_name, mime_type, size_bytes, file_hash")
             .eq("tenant_id", tenant_id)
-            .eq("file_name", file_name)
-            .order("modified_time", desc=True)
-            .limit(1)
-            .execute
         )
+        if file_id:
+            query = query.eq("source_ref", file_id)
+        else:
+            query = query.eq("file_name", file_name).order("modified_time", desc=True)
+        result = await asyncio.to_thread(query.limit(1).execute)
         rows = result.data or []
     except Exception as e:
         logger.exception("[/document/raw] resolve failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
     if not rows:
-        raise HTTPException(status_code=404, detail=f"file_name '{file_name}' not found in tenant '{tenant_id}'")
+        locator = f"file_id '{file_id}'" if file_id else f"file_name '{file_name}'"
+        raise HTTPException(status_code=404, detail=f"{locator} not found in tenant '{tenant_id}'")
     row = rows[0]
+    resolved_name = str(row.get("file_name") or file_name or "file")
     source_type = row.get("source_type")
     source_ref = row.get("source_ref")
     if source_type != "upload":
@@ -635,7 +809,7 @@ async def document_raw(
 
     logger.info(
         "[/document/raw] tenant=%s file=%s bytes=%d",
-        tenant_id, file_name, len(data),
+        tenant_id, resolved_name, len(data),
     )
     # Content-Disposition 의 filename 은 ASCII-safe 한 fallback + RFC 5987 utf-8 양쪽 제공.
     # ⚠ ``isalnum()`` 은 한글도 True 라서 그대로 쓰면 latin-1 헤더 인코딩 실패.
@@ -643,13 +817,17 @@ async def document_raw(
     import urllib.parse
     safe_name = "".join(
         c if (c.isascii() and (c.isalnum() or c in "._-")) else "_"
-        for c in file_name
+        for c in resolved_name
     ).strip("_") or "file"
-    quoted = urllib.parse.quote(file_name)
+    quoted = urllib.parse.quote(resolved_name)
+    response_headers = {
+        "Content-Disposition": f"attachment; filename=\"{safe_name}\"; filename*=UTF-8''{quoted}",
+        "X-ProcessGPT-File-Id": str(source_ref),
+    }
+    if row.get("file_hash"):
+        response_headers["X-ProcessGPT-Sha256"] = str(row["file_hash"])
     return Response(
         content=data,
-        media_type="application/octet-stream",
-        headers={
-            "Content-Disposition": f"attachment; filename=\"{safe_name}\"; filename*=UTF-8''{quoted}",
-        },
+        media_type=str(row.get("mime_type") or "application/octet-stream"),
+        headers=response_headers,
     )

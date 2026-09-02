@@ -6,7 +6,7 @@ from typing import Optional, Tuple, Union
 
 import httpx
 
-from app.core.config import resolve_llm_config, resolve_embedding_config
+from app.core.config import resolve_llm_config, resolve_sampling_config, resolve_embedding_config
 
 TimeoutType = Union[float, Tuple[float, float]]
 
@@ -49,27 +49,47 @@ def log_provider_config() -> None:
     print("\n".join(lines), flush=True)
 
 
+# ChatOpenAI 가 1급 인자로 받는 것과 vLLM 확장(extra_body 로 가야 하는 것)의 경계.
+_FIRST_CLASS_SAMPLING = ("top_p", "presence_penalty", "frequency_penalty")
+
+
 def create_llm(
     model: Optional[str] = None,
     streaming: bool = False,
-    temperature: float = 0.0,
+    temperature: Optional[float] = None,
     timeout: Optional[TimeoutType] = (10.0, 120.0),
     max_retries: int = 6,
 ):
+    """설정된 프로바이더의 LLM 클라이언트.
+
+    샘플링 값은 ``config/llm_sampling.json`` 에서 온다. ``temperature`` 를 명시하면
+    그 값이 이긴다 — 결정론이 필요한 호출부가 설정에 흔들리지 않게 한다.
+    """
     from langchain_openai import ChatOpenAI
 
     cfg = resolve_llm_config(model_override=model)
+    sampling = resolve_sampling_config(cfg["provider"])
+    extra_body = dict(sampling.pop("extra_body", {}) or {})
+    configured_temperature = sampling.pop("temperature", None)
 
     kwargs = dict(
         base_url=cfg["base_url"],
         api_key=cfg["api_key"],
         model=cfg["model"],
-        temperature=temperature,
+        temperature=temperature if temperature is not None else (configured_temperature or 0.0),
         streaming=streaming,
         disable_streaming=not streaming,
         timeout=timeout,
         max_retries=max_retries,
     )
+    for name in _FIRST_CLASS_SAMPLING:
+        if name in sampling:
+            kwargs[name] = sampling.pop(name)
+    # 남은 값은 프로바이더 확장이므로 요청 본문에 그대로 실어 보낸다.
+    # (langchain_openai 는 extra_body 를 model_kwargs 안에 숨기면 거부한다.)
+    extra_body.update(sampling)
+    if extra_body:
+        kwargs["extra_body"] = extra_body
     if cfg["extra_headers"]:
         kwargs["default_headers"] = cfg["extra_headers"]
 
