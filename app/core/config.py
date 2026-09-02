@@ -1,13 +1,44 @@
 """Static configuration. env holds secrets and per-env switches only."""
 from __future__ import annotations
 
+import json
+import logging
 import os
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+SAMPLING_CONFIG_PATH = PROJECT_ROOT / "config" / "llm_sampling.json"
 
 
 def _env(name: str, default: Any = None) -> Any:
     v = os.getenv(name)
     return default if v is None or v.strip() == "" else v
+
+
+@lru_cache(maxsize=1)
+def _sampling_file() -> Dict[str, Any]:
+    try:
+        data = json.loads(SAMPLING_CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("[config] llm_sampling.json 을 읽지 못했다: %s", exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def resolve_sampling_config(provider: str) -> Dict[str, Any]:
+    """프로바이더에 보낼 샘플링 파라미터.
+
+    사내 GPU 서버(vLLM)는 기본값으로 두면 사고 토큰까지 생성해 응답이 길고 느리다.
+    무엇을 보낼지는 코드가 아니라 ``config/llm_sampling.json`` 이 정한다.
+    """
+    section = _sampling_file().get(provider)
+    return dict(section) if isinstance(section, dict) else {}
 
 
 LLM_PROVIDERS: Dict[str, Dict[str, Any]] = {

@@ -170,6 +170,47 @@ async def _direct_files(tenant_id: str, folder_path: str, doc_role: str) -> List
         return []
 
 
+async def _child_card_signals(tenant_id: str, files: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """자식 문서 카드에서 폴더 라우팅에 쓸 신호를 모은다.
+
+    폴더 요약은 "무엇에 대한 폴더인가"만 답한다. 에이전트가 폴더를 고르려면 그 안의
+    문서들이 *어떤 질문에 답하는지* 를 알아야 해서, 자식 카드의 topics/answers_questions
+    를 빈도순으로 올려 준다. ``knowledge_doc_cards`` 가 없으면 빈 값(폴백).
+    """
+    file_ids = [str(f.get("source_ref") or "") for f in files if f.get("source_ref")]
+    if not file_ids:
+        return {"topics": [], "answers_questions": []}
+    try:
+        resp = await asyncio.to_thread(
+            supabase.table("knowledge_doc_cards")
+            .select("card")
+            .eq("tenant_id", tenant_id)
+            .in_("file_id", file_ids)
+            .execute
+        )
+        rows = resp.data or []
+    except Exception as e:
+        logger.info("[folder_cards] doc card 신호 조회 생략: %s", e)
+        return {"topics": [], "answers_questions": []}
+
+    topics: Counter[str] = Counter()
+    questions: List[str] = []
+    for row in rows:
+        card = row.get("card") if isinstance(row.get("card"), dict) else {}
+        for topic in (card.get("topics") or [])[:8]:
+            text = str(topic or "").strip()
+            if text:
+                topics[text] += 1
+        for question in (card.get("answers_questions") or [])[:4]:
+            text = str(question or "").strip()
+            if text and text not in questions:
+                questions.append(text)
+    return {
+        "topics": [topic for topic, _ in topics.most_common(_MAX_TOPICS)],
+        "answers_questions": questions[:12],
+    }
+
+
 async def _descendant_folder_paths(tenant_id: str, folder_path: str, doc_role: str) -> List[str]:
     """folder_path 하위(직접 아님 포함)의 distinct folder_path 들."""
     try:
@@ -406,9 +447,12 @@ async def build_folder_card(
     # LLM 요약 (1회)
     summary, topics = await _generate_summary(_leaf(fp) or fp, direct, child_summaries)
 
+    signals = await _child_card_signals(tenant_id, direct)
+
     card: Dict[str, Any] = {
         "summary": summary,
-        "topics": topics,
+        "topics": signals["topics"] or topics,
+        "answers_questions": signals["answers_questions"],
         "doc_types": _doc_types(file_names),
         "date_range": _date_range(years),
         "key_entities": _candidate_entities(file_names, abstracts),
