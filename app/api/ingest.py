@@ -380,11 +380,16 @@ async def save_to_storage(
     try:
         proc_inst_id = None
         room_id = None
+        raw_only = False
         if options:
             try:
                 options_dict = json.loads(options)
                 proc_inst_id = options_dict.get("proc_inst_id")
                 room_id = options_dict.get("room_id")
+                # 원본만 보관: 첨부를 워크스페이스의 실제 파일로 읽는 대화(Codex)는
+                # 벡터 검색을 쓰지 않는다. 그쪽에는 VLM 판독과 임베딩이 순수 낭비이고,
+                # 업로드가 느려지고 실패할 이유만 늘어난다.
+                raw_only = bool(options_dict.get("raw_only"))
             except json.JSONDecodeError:
                 pass
 
@@ -421,7 +426,7 @@ async def save_to_storage(
         image_extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]
         is_image = file_extension in image_extensions
         # 벡터 인덱싱 제외 확장자 — 표 격자는 청킹·임베딩이 무의미하다(아래 분기 주석 참고).
-        skip_vector_index = file_extension in {".xlsx", ".xlsm"}
+        skip_vector_index = file_extension in {".xlsx", ".xlsm"} or raw_only
 
         has_uploaded_images = False
         # 비이미지 문서의 페이지 docs — 아래에서 document_pages 등록에 재사용(채팅 첨부도
@@ -447,6 +452,12 @@ async def save_to_storage(
             elif documents:
                 for doc in documents:
                     doc.metadata["knowledge_scope"] = "global"
+        elif raw_only:
+            # 원본만 보관한다 — 이미지 추출·VLM 판독·청킹·임베딩을 모두 건너뛴다.
+            # 이 대화의 에이전트는 업로드된 원본을 자기 워크스페이스에서 직접 열어
+            # 읽으므로, 검색용 부산물은 만들어도 아무도 쓰지 않는다.
+            documents = []
+            print(f"[ingest:save-to-storage] raw_only → 파싱·임베딩 생략 (file={file_name!r})")
         else:
             file_io = io.BytesIO(file_content)
             processor = get_document_processor()
