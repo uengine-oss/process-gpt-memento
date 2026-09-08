@@ -413,7 +413,8 @@ async def save_to_storage(
 
         print(
             f"[ingest:save-to-storage] file={file_name!r} size={len(file_content)}B "
-            f"tenant={tenant_id!r} proc_inst_id={proc_inst_id!r} room_id={room_id!r}"
+            f"tenant={tenant_id!r} proc_inst_id={proc_inst_id!r} room_id={room_id!r} "
+            f"raw_only={raw_only} options={options!r}"
         )
 
         storage_loader = SupabaseStorageLoader()
