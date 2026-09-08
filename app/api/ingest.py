@@ -126,7 +126,11 @@ async def process_session_file(request: ProcessSessionFileRequest):
                 ),
             )
         # 벡터 인덱싱 제외 — /save-to-storage 와 같은 정책.
-        skip_vector_index = file_extension in {".xlsx", ".xlsm"}
+        # 호출자가 명시적으로 요청해도 건너뛴다: 첨부를 워크스페이스의 실제 파일로
+        # 읽는 쪽은 벡터 검색을 쓰지 않으므로 임베딩이 낭비다.
+        skip_vector_index = (
+            file_extension in {".xlsx", ".xlsm"} or bool(request.skip_vector_index)
+        )
 
         # 2) Storage object key를 stable file_id로 사용한다.
         # knowledge_files.source_ref는 원본 다운로드 경로이기도 하므로 별도의 session/... 논리 ID를

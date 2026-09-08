@@ -68,3 +68,7 @@ class ProcessSessionFileRequest(BaseModel):
     file_path: Optional[str] = None     # bucket 안 path (예: files/uuid.pdf)
     file_name: str                       # 원본 파일명
     doc_role: Optional[str] = "content"  # content / template / methodology / glossary
+    # 벡터 인덱싱을 건너뛴다. 첨부를 워크스페이스의 실제 파일로 읽는 호출자(Codex)는
+    # 벡터 검색을 쓰지 않으므로 임베딩이 순수 낭비이고, 임베딩 서버가 흔들리면
+    # 파일 등록까지 같이 실패한다. 등록·페이지 저장은 그대로 수행한다.
+    skip_vector_index: Optional[bool] = None
