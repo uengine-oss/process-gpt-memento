@@ -1,22 +1,45 @@
 from bs4 import BeautifulSoup
 from docx import Document
 
-def form_to_docx(html: str, values: dict) -> bytes:
+def resolve_form_values(values: dict, form_id: str | None = None) -> dict:
+    """워크아이템 output 에서 폼 값 맵을 고른다.
+
+    output 이 항상 {form_id: {필드: 값}} 인 것은 아니다. 사람이 폼으로 제출하든
+    에이전트가 만들든 평면 키({"customer_name": "...", ...})가 먼저 오는 경우가 흔하다.
+    예전에는 `next(iter(values.keys()))` 로 '첫 키' 를 폼 루트로 가정했는데, 그러면
+    평면 output 에서 문자열이 form_values 로 잡혀 extract_value 의 .get() 에서
+    'str' object has no attribute 'get' 로 터졌다(= 드라이브 적재 전량 실패).
+
+    순서대로: 호출자가 알려준 form_id → `_form` 으로 끝나는 키 → values 자체.
+    """
+    if not isinstance(values, dict) or not values:
+        return {}
+
+    if form_id and isinstance(values.get(form_id), dict):
+        return values[form_id]
+
+    for key, value in values.items():
+        if isinstance(key, str) and key.endswith("_form") and isinstance(value, dict):
+            return value
+
+    return values
+
+
+def form_to_docx(html: str, values: dict, form_id: str | None = None) -> bytes:
     """
     form html + form value(JSON)을 Word 문서(docx)로 변환
 
     Args:
         html: form html (string)
-        values: form value (dict)
+        values: form value (dict) — {form_id: {...}} 또는 평면 {필드: 값}
+        form_id: 폼 id. 주면 values 안에서 그 키를 우선해 폼 값을 찾는다.
     Returns:
         bytes: docx 파일의 bytes
     """
     doc = Document()
     soup = BeautifulSoup(html, "html.parser")
 
-    # 루트 키 추출 (예: contract_management_process_request_activity_form)
-    root_key = next(iter(values.keys()))
-    form_values = values[root_key]
+    form_values = resolve_form_values(values, form_id)
 
     for section in soup.find_all("section"):
         row_layout = section.find("row-layout")

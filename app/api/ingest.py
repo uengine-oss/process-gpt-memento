@@ -308,7 +308,7 @@ async def process_output(request: ProcessOutputRequest):
                 uploads.append(upload_meta)
         else:
             file_name = f"{activity_name}.docx"
-            docx_bytes = form_to_docx(form_html, output)
+            docx_bytes = form_to_docx(form_html, output, form_id)
             reports.append({
                 "file_content": io.BytesIO(docx_bytes),
                 "file_name": file_name,
