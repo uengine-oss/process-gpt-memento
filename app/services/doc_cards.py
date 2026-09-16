@@ -15,10 +15,11 @@ import hashlib
 import json
 import logging
 import os
-import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from app.services.llm_output import parse_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -161,24 +162,8 @@ def _labels(values: Any, *, limit: int, max_chars: int) -> List[str]:
 
 
 def parse_card_json(raw: str) -> Optional[Dict[str, Any]]:
-    """모델 출력에서 JSON 객체만 건져낸다. 실패는 실패로 남긴다(추측 금지)."""
-    if not isinstance(raw, str):
-        return None
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
-        text = re.sub(r"\n?```$", "", text).strip()
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.S)
-        if not match:
-            return None
-        try:
-            value = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return None
-    return value if isinstance(value, dict) else None
+    """모델 출력에서 카드 JSON 객체만 건져낸다."""
+    return parse_json_object(raw)
 
 
 def merge_window(card: DocumentCard, payload: Dict[str, Any]) -> bool:

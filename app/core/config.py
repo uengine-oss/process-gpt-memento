@@ -31,20 +31,70 @@ def _sampling_file() -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def resolve_sampling_config(provider: str) -> Dict[str, Any]:
-    """프로바이더에 보낼 샘플링 파라미터.
+def _sampling_section(key: str, name: str) -> Dict[str, Any]:
+    section = _sampling_file().get(key)
+    if not isinstance(section, dict):
+        return {}
+    value = section.get(name)
+    return dict(value) if isinstance(value, dict) else {}
 
-    사내 GPU 서버(vLLM)는 기본값으로 두면 사고 토큰까지 생성해 응답이 길고 느리다.
-    무엇을 보낼지는 코드가 아니라 ``config/llm_sampling.json`` 이 정한다.
+
+def resolve_provider_sampling(provider: str) -> Dict[str, Any]:
+    """프로바이더 기본 샘플링 값. 호출부가 명시하면 호출부가 이긴다."""
+    return _sampling_section("providers", provider)
+
+
+def resolve_model_rules(model: str) -> Dict[str, Any]:
+    """모델별 요청 규칙. 어떤 모델이 무엇을 받는지는 코드가 아니라 config 가 안다.
+
+    모델명 앞부분으로 맞추고, 여럿이 맞으면 가장 긴 규칙이 이긴다.
     """
-    section = _sampling_file().get(provider)
-    return dict(section) if isinstance(section, dict) else {}
+    models = _sampling_file().get("models")
+    if not isinstance(models, dict):
+        return {}
+    name = (model or "").rsplit("/", 1)[-1].strip().lower()
+    matched = [k for k, v in models.items() if isinstance(v, dict) and name.startswith(k.lower())]
+    if not matched:
+        return {}
+    return dict(models[max(matched, key=len)])
+
+
+def resolve_chat_params(
+    *,
+    provider: str,
+    model: str,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """요청 본문에 실을 샘플링 파라미터. 모델마다 이름도 허용값도 다르다.
+
+    우선순위는 ``locked`` > 호출부 인자 > 모델 기본값 > 프로바이더 기본값이다.
+    ``locked`` 는 모델이 강제하는 값이라 어기면 400 이므로 호출부보다 앞선다.
+
+    ``sampling`` 은 OpenAI 호환 1급 파라미터, ``extra_body`` 는 프로바이더 확장이다.
+    """
+    rules = resolve_model_rules(model)
+    locked = rules.pop("locked", None) or {}
+    max_tokens_field = rules.pop("max_tokens_field", None) or "max_tokens"
+
+    sampling = resolve_provider_sampling(provider)
+    extra_body = dict(sampling.pop("extra_body", {}) or {})
+    extra_body.update(rules.pop("extra_body", {}) or {})
+    sampling.update(rules)
+
+    if temperature is not None:
+        sampling["temperature"] = temperature
+    if max_tokens is not None:
+        sampling[max_tokens_field] = max_tokens
+    sampling.update(locked)
+
+    return {"sampling": sampling, "extra_body": extra_body}
 
 
 LLM_PROVIDERS: Dict[str, Dict[str, Any]] = {
     "openai": {
         "base_url": "https://api.openai.com/v1",
-        "model": "gpt-4o",
+        "model": "gpt-5.6-luna",
         "supports_vision": True,
         "api_key_env": [
             "OPENAI_LLM_API_KEY",
@@ -178,11 +228,13 @@ def resolve_llm_config(model_override: Optional[str] = None) -> Dict[str, Any]:
     if provider == "custom" and not base_url:
         raise ValueError("MEMENTO_LLM_PROVIDER=custom requires CUSTOM_LLM_BASE_URL")
 
+    model = model_override or _first_env(spec["model_env"]) or spec["model"]
+
     return {
         "provider": provider,
         "base_url": base_url,
         "api_key": _first_env(spec["api_key_env"]),
-        "model": model_override or _first_env(spec["model_env"]) or spec["model"],
+        "model": model,
         "supports_vision": bool(spec.get("supports_vision", False)),
         "extra_headers": _openrouter_headers() if provider == "openrouter" else {},
     }

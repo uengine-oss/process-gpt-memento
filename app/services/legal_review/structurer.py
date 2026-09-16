@@ -4,73 +4,36 @@
 contract_type 를 *블록 인덱스로* 반환) ≠ 재구성(인덱스 슬라이싱→원문 그대로, 환각·메모유실 0).
 번호스타일(제N조/Article/1.1/무번호)·언어·배경위치를 하드코딩하지 않는다.
 
-LLM: memento 설정(resolve_llm_config) 의 모델/엔드포인트. raw httpx + enable_thinking=False
-(frentis/Qwen 계열 reasoning 차단 — memento create_llm 은 thinking 을 끄지 않으므로 직접 호출).
+LLM: app.services.llm 의 chat_completion (모델/엔드포인트·모델별 파라미터 일괄 처리).
+enable_thinking=False 로 frentis/Qwen 계열 reasoning 을 차단한다.
 """
 from __future__ import annotations
 
-import json
 import logging
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import httpx
-
-from app.core.config import resolve_llm_config
 from app.plugins.parsers.docx_structured import parse as _docx_parse
+
+from app.services.llm_output import parse_json
 
 logger = logging.getLogger(__name__)
 
 
 # ── LLM ────────────────────────────────────────────────────────────────────
 def _llm(prompt: str, max_tokens: int = 4096, temperature: float = 0.0, retries: int = 3) -> str:
-    cfg = resolve_llm_config()
-    url = cfg["base_url"].rstrip("/") + "/chat/completions"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {cfg['api_key']}"}
-    if cfg.get("extra_headers"):
-        headers.update(cfg["extra_headers"])
-    payload = {
-        "model": cfg["model"],
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
-    last_err = None
-    for _ in range(retries):
-        try:
-            with httpx.Client(timeout=300.0) as client:
-                resp = client.post(url, json=payload, headers=headers)
-                resp.raise_for_status()
-                body = resp.json()
-            msg = (body.get("choices") or [{}])[0].get("message") or {}
-            content = msg.get("content") or msg.get("reasoning_content") or ""
-            if isinstance(content, list):
-                content = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
-            return str(content).strip()
-        except Exception as exc:  # noqa: BLE001
-            last_err = exc
-    logger.warning("[legal_review] LLM 호출 실패: %s", last_err)
-    return ""
+    from app.services.llm import chat_completion
 
-
-def _extract_json(text: str) -> Optional[Any]:
-    if not text:
-        return None
-    t = text.strip()
-    if t.startswith("```"):
-        t = t.split("\n", 1)[-1]
-        if t.endswith("```"):
-            t = t[: t.rfind("```")]
-    for open_c, close_c in (("{", "}"), ("[", "]")):
-        s, e = t.find(open_c), t.rfind(close_c)
-        if s != -1 and e > s:
-            try:
-                return json.loads(t[s : e + 1])
-            except Exception:  # noqa: BLE001
-                continue
-    return None
+    return chat_completion(
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=300.0,
+        retries=retries,
+        # frentis/Qwen 계열 reasoning 차단.
+        extra_payload={"chat_template_kwargs": {"enable_thinking": False}},
+        log_prefix="legal_review",
+    )
 
 
 # ── 결정적 추출: 순서있는 통합 블록 ────────────────────────────────────────
@@ -154,7 +117,7 @@ def _blocks_for_prompt(blocks: List[Dict[str, Any]]) -> str:
 def _detect_structure(blocks: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     listing = _blocks_for_prompt(blocks)
     prompt = _STRUCTURE_PROMPT + "[블록 목록]\n" + listing + "\n\nJSON만 출력:"
-    return _extract_json(_llm(prompt, max_tokens=8192))
+    return parse_json(_llm(prompt, max_tokens=8192))
 
 
 def _validate_structure(data: Any, n_blocks: int) -> Optional[Dict[str, Any]]:
@@ -231,7 +194,7 @@ def _normalize_background(bg_raw: str) -> Dict[str, Any]:
     if not bg_raw.strip():
         return {"industry": "", "parties": [], "subject": "", "purpose": "",
                 "region": "", "key_terms": [], "summary": ""}
-    p = _extract_json(_llm(_BG_PROMPT + bg_raw + "\n\nJSON만 출력:", max_tokens=1024))
+    p = parse_json(_llm(_BG_PROMPT + bg_raw + "\n\nJSON만 출력:", max_tokens=1024))
     if not isinstance(p, dict):
         p = {}
     for k in ("industry", "subject", "purpose", "region", "summary"):

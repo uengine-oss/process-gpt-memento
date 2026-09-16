@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
+import logging
+from typing import Any, Dict, Optional, Tuple, Union
 
 import httpx
 
-from app.core.config import resolve_llm_config, resolve_sampling_config, resolve_embedding_config
+from app.core.config import resolve_llm_config, resolve_chat_params, resolve_embedding_config
+from app.services.llm_output import message_text
+
+logger = logging.getLogger(__name__)
 
 TimeoutType = Union[float, Tuple[float, float]]
 
@@ -53,6 +57,19 @@ def log_provider_config() -> None:
 _FIRST_CLASS_SAMPLING = ("top_p", "presence_penalty", "frequency_penalty")
 
 
+def _resolved_params(
+    cfg: Dict[str, Any],
+    temperature: Optional[float],
+    max_tokens: Optional[int] = None,
+) -> Dict[str, Dict[str, Any]]:
+    return resolve_chat_params(
+        provider=cfg["provider"],
+        model=cfg["model"],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
 def create_llm(
     model: Optional[str] = None,
     streaming: bool = False,
@@ -62,26 +79,28 @@ def create_llm(
 ):
     """설정된 프로바이더의 LLM 클라이언트.
 
-    샘플링 값은 ``config/llm_sampling.json`` 에서 온다. ``temperature`` 를 명시하면
-    그 값이 이긴다 — 결정론이 필요한 호출부가 설정에 흔들리지 않게 한다.
+    무엇을 실어 보낼지는 ``config/llm_sampling.json`` 이 정한다. 호출부의
+    ``temperature`` 는 모델이 그 값을 허용할 때만 이긴다.
     """
     from langchain_openai import ChatOpenAI
 
     cfg = resolve_llm_config(model_override=model)
-    sampling = resolve_sampling_config(cfg["provider"])
-    extra_body = dict(sampling.pop("extra_body", {}) or {})
-    configured_temperature = sampling.pop("temperature", None)
+    resolved = _resolved_params(cfg, temperature)
+    sampling = dict(resolved["sampling"])
+    extra_body = dict(resolved["extra_body"])
 
-    kwargs = dict(
+    kwargs: Dict[str, Any] = dict(
         base_url=cfg["base_url"],
         api_key=cfg["api_key"],
         model=cfg["model"],
-        temperature=temperature if temperature is not None else (configured_temperature or 0.0),
         streaming=streaming,
         disable_streaming=not streaming,
         timeout=timeout,
         max_retries=max_retries,
     )
+    # langchain 은 temperature 를 늘 싣는다(필드 기본 0.7). 모델이 값을 강제하면
+    # 그 값으로 덮어야 하고, 아무 설정이 없으면 결정론을 위해 0.0 이다.
+    kwargs["temperature"] = sampling.pop("temperature", 0.0)
     for name in _FIRST_CLASS_SAMPLING:
         if name in sampling:
             kwargs[name] = sampling.pop(name)
@@ -94,6 +113,58 @@ def create_llm(
         kwargs["default_headers"] = cfg["extra_headers"]
 
     return ChatOpenAI(**kwargs)
+
+
+def chat_completion(
+    *,
+    messages: list,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    timeout: TimeoutType = 300.0,
+    retries: int = 1,
+    extra_payload: Optional[Dict[str, Any]] = None,
+    log_prefix: str = "llm",
+) -> str:
+    """OpenAI 호환 ``/chat/completions`` 직접 호출. 실패하면 빈 문자열.
+
+    langchain 을 거치지 않는 호출부(vision·구조화기)가 쓰는 단일 경로다. 모델별
+    파라미터를 여기서 한 번만 맞추므로 호출부는 messages 만 만들면 된다.
+    """
+    cfg = resolve_llm_config()
+    base_url = (cfg.get("base_url") or "").rstrip("/")
+    model = cfg.get("model") or ""
+    if not base_url or not model:
+        logger.warning("[%s] base_url/model 미설정 - skip", log_prefix)
+        return ""
+
+    resolved = _resolved_params(cfg, temperature, max_tokens)
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        **resolved["sampling"],
+        **resolved["extra_body"],
+        **(extra_payload or {}),
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {cfg.get('api_key') or 'not-needed'}",
+        **(cfg.get("extra_headers") or {}),
+    }
+
+    last_error = ""
+    for _ in range(max(1, retries)):
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                response = client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+            if response.status_code >= 400:
+                # 본문을 삼키면 무엇이 거부됐는지 못 본다.
+                last_error = f"{response.status_code} {response.text[:300]}"
+                continue
+            return message_text(response.json())
+        except Exception as exc:  # noqa: BLE001 - 호출 실패가 파싱 전체를 막지 않는다
+            last_error = str(exc)
+    logger.warning("[%s] 호출 실패: %s", log_prefix, last_error)
+    return ""
 
 
 class OpenAICompatibleEmbeddings:
