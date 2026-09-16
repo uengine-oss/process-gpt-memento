@@ -8,7 +8,7 @@ from app.services.vector_store import VectorStoreManager, get_vector_store
 from app.services.llm import create_llm
 from app.plugins.retrievers import get_retriever
 
-load_project_dotenv(override=True)
+load_project_dotenv()
 
 import logging as _logging
 _logger = _logging.getLogger(__name__)

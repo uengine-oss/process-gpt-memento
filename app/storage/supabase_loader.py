@@ -10,7 +10,7 @@ import asyncio
 
 from app.core.env_loader import load_project_dotenv
 
-load_project_dotenv(override=True)
+load_project_dotenv()
 
 class SupabaseStorageLoader:
     """Handles loading and processing of documents from Supabase Storage"""
