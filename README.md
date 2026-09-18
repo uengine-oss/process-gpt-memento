@@ -2,18 +2,20 @@
 
 # Process GPT Memento
 
-FastAPI 기반 멀티테넌트 문서 처리/검색(RAG) 서비스입니다.  
-Google Drive, Supabase Storage, 로컬 파일에서 문서를 수집하고 청킹/임베딩을 수행하며, 원문은 Supabase에 저장하고 검색 인덱스는 Chroma DB로 유지합니다.
+FastAPI 기반 멀티테넌트 지식베이스 서비스입니다.  
+업로드된 문서를 페이지 단위 원문으로 저장하고, 문서 카드와 폴더 카드로 **에이전트가 읽어
+내려갈 지도**를 만듭니다. 벡터 인덱스(Chroma)는 에이전트가 진입점을 잡는 검색 힌트로만
+씁니다. 설계 근거는 [docs/knowledge-map.md](docs/knowledge-map.md).
 
 ## 핵심 기능
 
-- 다양한 입력 소스 처리: `drive`, `storage`, `local`, `database`
-- 문서 파싱/청킹: PDF, DOCX, PPTX, XLSX, TXT, HWP, HWPX
+- 입력 소스: Supabase Storage 업로드(지식베이스), Google Drive, 로컬 파일
+- 문서 파싱: PDF, DOCX, PPTX, XLSX, TXT, HWP, HWPX → 페이지 단위 원문(`document_pages`)
+- 문서 카드 / 폴더 카드: 무엇이 있고 무엇부터 읽을지 (`doc_cards.py`, `folder_cards.py`)
+- 지도 API: 폴더 트리 · 폴더 열기 · 카탈로그 · 문서 grep · 페이지 읽기 (`folders.py`, `navigator.py`)
+- 보조 검색: Chroma 유사도 검색(`/search`) — 실패해도 문서 상태에 영향 없음
 - 이미지 추출 및 분석: PDF/DOCX/PPTX 및 단일 이미지(JPG/PNG/GIF/BMP/WEBP)
-- Chroma 기반 유사도 검색 + Supabase 원문 저장
-- Google OAuth 기반 테넌트별 Drive 접근
 - LLM 호출 경로를 `litellm proxy`로 전환 가능 (`llm.py`)
-- 문서 카드: 전문을 슬라이딩 윈도우로 읽어 만드는 리트리벌 표면 (`doc_cards.py`)
 
 ## 문서 카드 (`knowledge_doc_cards`)
 
@@ -26,15 +28,27 @@ abstract 는 앞 3쪽 + 뒤 1쪽만 보고 만든 한 줄이라 300쪽 문서에
 같은 경로를 탄다. 사실은 합집합으로 누적되고 요약만 교체되며, 예산(`KB_CARD_MAX_WINDOWS`,
 기본 16)을 넘으면 앞부분만 읽는 대신 문서 전체에 고르게 흩어 읽는다.
 
-카드 필드: `title`(본문 기준) · `summary` · `doc_type` · `topics` · `entities` · `keywords` ·
-`language` · `answers_questions`(리트리벌 표면) · `coverage`(얼마나 읽었는가).
+카드 필드: `title`(본문 기준) · `summary` · `doc_type` · `distinguishers`(옆 문서와 구별하는
+사실) · `topics` · `entities` · `keywords` · `language` · `answers_questions`(리트리벌 표면) ·
+`coverage`(얼마나 읽었는가).
 
-- 카드 생성은 인제스트를 막지 않는다 — 페이지 저장과 병행해 백그라운드로 돌고
+- 카드를 만들 때 같은 폴더의 다른 문서 제목을 함께 보여 준다. 동일 골격의 사업 문서가
+  여러 벌이면 문서 하나만 보고 쓴 요약은 서로 같아지기 때문이다.
+- 카드 생성은 인제스트를 막지 않는다 — 페이지 저장 뒤 백그라운드로 돌고
   `status`(pending/done/failed/empty)로 진행을 드러낸다.
 - 같은 내용(`content_sha256`)의 문서를 다시 올리면 카드를 재사용한다.
 - 텍스트 레이어가 없는 문서는 카드 대신 `has_text=false` 로 남는다. "자료에 없음" 과
   "읽을 수 없음" 은 다른 결론이다.
-- 폴더 카드는 자식 카드의 `topics`/`answers_questions` 를 집계해 폴더 라우팅에 쓴다.
+
+## 폴더 카드 (`knowledge_folder_cards`)
+
+폴더가 지도의 단위다. 자식 문서 카드와 하위 폴더 카드를 bottom-up 으로 모아 폴더당 LLM
+1회로 만든다. 필드: `summary` · `topics` · `reading_guide`(어떤 질문이면 무엇부터 열지) ·
+`start_with`(맥락을 가장 빨리 잡는 문서) · `answers_questions` · `cards`(직속 문서 카드
+준비 상태) · 결정론 필드(문서 수·기간·종류·후보 엔티티).
+
+`/folders/tree` 와 `/folders/open` 이 이 카드와 문서별 준비 상태(`ready/pending/failed/no_text`)를
+돌려주며, 관리 화면과 에이전트가 같은 응답을 본다.
 
 마이그레이션: `sql/knowledge_doc_cards.sql`, `sql/kb_mirror.sql` (둘 다 멱등). 미적용
 상태에서도 서비스는 기존 `doc_card` 로 폴백해 동작한다. `kb_mirror.sql` 의 `kb_page_text`
@@ -104,30 +118,37 @@ python main.py
 
 ## 주요 API
 
+### 지식베이스 관리 (`/knowledge/*`)
+
+- `POST /knowledge/files/upload` — 스토리지 저장 + `pending` 등록. 인제스트는 백그라운드 워커.
+- `GET /knowledge/ingest/status` — 테넌트 상태별 카운트 + 큐 스냅샷
+- `POST /knowledge/files/reindex` — 원본을 다시 받아 전체 재처리
+- `POST /knowledge/files/resummarize` — 저장된 페이지로 문서 카드만 다시 생성
+- `GET /knowledge/files/url` · `DELETE /knowledge/files` · `GET /knowledge/files/check-hash`
+- `GET|POST|DELETE /knowledge/folders`, `POST /knowledge/folders/rename`
+- `POST /knowledge/folders/refresh-cards` — 영향받은 폴더(+조상) 카드만 재생성
+- `POST /knowledge/folders/build-cards` — 테넌트 전체 백필(관리자)
+
+### 지도 (에이전트와 관리 화면이 같이 씀)
+
+- `GET /folders/tree` — 폴더 골격 + 폴더 카드 + 준비 상태
+- `GET /folders/open` — 한 폴더의 하위 폴더 + 문서 카드. `include_refs=true` 면 관리 필드 포함
+- `GET /folders/card` — 폴더 카드 1건
+- `GET /catalog` — 선택 자료의 문서 카드 목록
+- `GET /document/grep` · `GET /document/page` · `GET /document/raw`
+- `GET /glossary/inline` · `GET /glossary/terms`
+
+### 보조 검색
+
+- `GET /search` — 엄격한 벡터 top-k. `file_ids` / `folder_paths` 로 스코프
+- `GET /retrieve` — 레거시 호출자용(agent-sdk). 신규 코드는 `/search`
+- `GET /documents/list` · `GET /documents/full-text`
+
 ### 처리
 
-- `POST /process`  
-  - `storage_type=local|drive|storage`
-  - 로컬 디렉토리, Google Drive, Supabase Storage 파일 처리
-- `POST /process/database`  
-  - DB 레코드(`todolist`)를 문서로 변환해 벡터 저장
-- `POST /process-output`  
-  - 워크아이템 산출물 DOCX 생성 + Drive 업로드 + RAG 저장
-- `GET /process/drive/status`  
-  - Drive 폴더 인덱싱 백그라운드 작업 상태 조회
-
-### 조회/질의
-
-- `GET /retrieve`  
-  - 유사도 검색 결과(원문 청크) 반환
-- `GET /query`  
-  - RAG 기반 최종 답변 + 소스 메타데이터 반환
-- `POST /retrieve-by-indices`  
-  - 선택한 `chunk_index` 목록으로 청크 직접 조회
-- `GET /documents/list`  
-  - 문서 목록 조회
-- `GET /documents/chunks-metadata`  
-  - 문서별 청크 메타데이터 조회
+- `POST /process` — `storage_type=local|drive|storage`
+- `POST /process-output` — 워크아이템 산출물 DOCX 생성 + Drive 업로드
+- `GET /process/drive/status`
 
 ### 업로드
 
@@ -156,16 +177,17 @@ curl -X POST "http://localhost:8005/process" \
   }'
 ```
 
-### 2) 검색
+### 2) 지도 열기
 
 ```bash
-curl "http://localhost:8005/retrieve?query=교육&tenant_id=localhost&top_k=5"
+curl "http://localhost:8005/folders/tree?tenant_id=localhost&depth=2"
+curl "http://localhost:8005/folders/open?tenant_id=localhost&folder_path=A사업/계약"
 ```
 
-### 3) 질의응답
+### 3) 보조 검색
 
 ```bash
-curl "http://localhost:8005/query?query=프로젝트%20A의%20예산이%20얼마%20나왔지?&tenant_id=localhost"
+curl "http://localhost:8005/search?query=계약금액&tenant_id=localhost&top_k=5"
 ```
 
 ## 지원 파일 형식

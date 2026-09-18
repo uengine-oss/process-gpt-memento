@@ -1,11 +1,8 @@
-"""document_pages 서비스 — 페이지 단위 저장 + doc_card 생성.
+"""document_pages 서비스 — 페이지 단위 저장 + 문서 카드 생성.
 
-agent navigation(catalog + grep + page-read) 인프라의 ingest 측.
-기존 청크 RAG 파이프라인은 그대로 두고, 페이지 데이터를 *추가로* 저장한다.
-
-호출 시점: ``load_document()`` 직후 / ``process_documents()`` 호출 직전.
-페이지 단위 Document 들을 받아 ``document_pages`` 테이블에 INSERT 하고,
-별도로 abstract LLM 콜을 던져 ``knowledge_files.doc_card`` 를 채운다.
+지도(catalog + grep + page-read)의 인제스트 측. ``load_document()`` 직후 페이지 단위
+Document 들을 ``document_pages`` 에 INSERT 하고, 문서 카드 생성을 백그라운드로 넘긴다.
+페이지가 저장되면 에이전트가 그 문서를 읽을 수 있으므로 저장된 페이지 수가 성공 기준이다.
 
 실패는 격리(예외 안 던짐) — ingest 본 파이프라인이 계속 진행되도록.
 """
@@ -13,23 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from langchain.schema import Document
 
 from app.core.supabase_client import supabase
-from app.services.llm import create_llm
 
 logger = logging.getLogger(__name__)
-
-
-# abstract 생성 시 LLM 에 보여줄 페이지 범위 — 앞 N + 뒤 M
-_FIRST_N_PAGES = 3
-_LAST_N_PAGES = 1
-# 페이지 본문이 너무 길면 abstract 프롬프트에선 잘라서. 본 저장은 전체 유지.
-_PAGE_TEXT_LIMIT_FOR_ABSTRACT = 4000
 
 
 def _normalize_page_text(text: str) -> str:
@@ -155,87 +143,6 @@ async def save_pages(
         return 0
 
 
-def _build_abstract_prompt(page_docs: List[Document]) -> str:
-    """앞 N + 뒤 M 페이지 텍스트만 모아 프롬프트 구성."""
-    total = len(page_docs)
-    if total == 0:
-        return ""
-
-    if total <= _FIRST_N_PAGES + _LAST_N_PAGES:
-        selected = list(enumerate(page_docs))
-    else:
-        head = list(enumerate(page_docs[:_FIRST_N_PAGES]))
-        tail_start = total - _LAST_N_PAGES
-        tail = [(tail_start + i, page_docs[tail_start + i]) for i in range(_LAST_N_PAGES)]
-        selected = head + tail
-
-    parts: List[str] = []
-    for idx, doc in selected:
-        page_num = _extract_page_number(doc, idx)
-        text = _normalize_page_text(doc.page_content or "")[:_PAGE_TEXT_LIMIT_FOR_ABSTRACT]
-        if not text:
-            continue
-        parts.append(f"--- p.{page_num} ---\n{text}")
-
-    body = "\n\n".join(parts)
-    if not body:
-        return ""
-
-    return (
-        "다음은 어떤 문서의 앞부분과 마지막 페이지다. "
-        "이 문서가 무엇인지 1~2 문장의 한국어 평문으로 적어라.\n"
-        "여기에 없는 사실을 추가하지 마라. 추측 금지.\n"
-        "코드펜스·JSON·따옴표·머리말 없이 *답변 문장만* 출력하라.\n\n"
-        f"{body}\n\n"
-        "이 문서의 요약:"
-    )
-
-
-def _clean_abstract_output(text: str) -> str:
-    """모델이 흔히 붙이는 코드펜스·따옴표·머리말을 정리."""
-    if not isinstance(text, str):
-        return ""
-    text = text.strip()
-    # ```json ... ``` 형식 제거
-    if text.startswith("```"):
-        first_newline = text.find("\n")
-        if first_newline != -1:
-            text = text[first_newline + 1:]
-        if text.endswith("```"):
-            text = text[: -3]
-        text = text.strip()
-    # 양 끝 따옴표
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
-        text = text[1:-1].strip()
-    # 머리말 패턴 ("요약:", "Abstract:", ...) 제거
-    for prefix in ("요약:", "Abstract:", "abstract:", "Summary:"):
-        if text.startswith(prefix):
-            text = text[len(prefix):].lstrip()
-            break
-    return text.strip()
-
-
-async def _generate_abstract(page_docs: List[Document]) -> Optional[str]:
-    """abstract 1회 LLM 콜.
-
-    실패 시 ``None`` 반환 — caller 가 fallback(null) 처리.
-    """
-    prompt = _build_abstract_prompt(page_docs)
-    if not prompt:
-        return None
-    try:
-        llm = create_llm(temperature=0.0, timeout=(10.0, 60.0), max_retries=2)
-        response = await llm.ainvoke(prompt)
-        raw = getattr(response, "content", response)
-        if not isinstance(raw, str):
-            raw = str(raw)
-        cleaned = _clean_abstract_output(raw)
-        return cleaned or None
-    except Exception as e:
-        logger.warning("[document_pages] abstract LLM failed: %s", e)
-        return None
-
-
 def _resolve_generation_model() -> str:
     try:
         from app.core.config import resolve_llm_config
@@ -243,53 +150,6 @@ def _resolve_generation_model() -> str:
         return str(cfg.get("model") or "")
     except Exception:
         return ""
-
-
-async def update_doc_card(
-    tenant_id: str,
-    file_id: str,
-    page_docs: List[Document],
-) -> bool:
-    """abstract 생성 후 ``knowledge_files.doc_card`` UPDATE.
-
-    매칭 키: ``(tenant_id, source_ref=file_id)``. source_type 는 drive/upload 어느 쪽이든
-    source_ref 가 unique 하므로 조건에서 제외.
-    """
-    if not tenant_id or not file_id:
-        return False
-
-    abstract = await _generate_abstract(page_docs)
-    n_pages = sum(1 for d in page_docs if _normalize_page_text(d.page_content or ""))
-
-    # 요약 성공/실패를 명시적으로 기록 — abstract 가 null 인 채 indexed 로 묻히지 않게
-    # (프론트 '요약 실패' 인디케이터 + '다시 요약' 버튼, 폴더카드 재생성 판정의 근거).
-    card: Dict[str, Any] = {
-        "abstract": abstract,
-        "abstract_status": "done" if abstract else "failed",
-        "n_pages": n_pages,
-        "generated_at": datetime.utcnow().isoformat() + "Z",
-        "generation_model": _resolve_generation_model(),
-    }
-
-    try:
-        await asyncio.to_thread(
-            supabase.table("knowledge_files")
-            .update({"doc_card": card})
-            .eq("tenant_id", tenant_id)
-            .eq("source_ref", file_id)
-            .execute
-        )
-        logger.info(
-            "[document_pages] doc_card updated tenant=%s file_id=%s abstract=%s n_pages=%d",
-            tenant_id, file_id, "ok" if abstract else "null", n_pages,
-        )
-        return True
-    except Exception as e:
-        logger.warning(
-            "[document_pages] doc_card update failed (%s/%s): %s",
-            tenant_id, file_id, e,
-        )
-        return False
 
 
 def _document_text(page_docs: List[Document]) -> str:
@@ -360,8 +220,9 @@ async def build_and_store_card(
         )
         return
 
+    context = await doc_cards.load_neighbors(tenant_id, file_id)
     async with doc_cards.card_gate():
-        card = await doc_cards.build_card(file_name=file_name, text=text)
+        card = await doc_cards.build_card(file_name=file_name, text=text, context=context)
     # 모든 조각이 실패했으면 카드가 아니라 실패다. done 으로 묻으면 재시도 대상에서 빠진다.
     every_window_failed = (
         card.coverage.windows_read > 0
@@ -410,33 +271,27 @@ async def post_load_hook(
     page_docs: List[Document],
     *,
     skip_abstract: bool = False,
-) -> None:
-    """``load_document()`` 직후 호출 — 페이지 저장 + abstract 생성.
+) -> int:
+    """``load_document()`` 직후 호출 — 페이지 저장 + 문서 카드 생성.
 
-    ``tenant_id`` / ``file_id`` 둘 다 있어야 동작(로컬 dev 경로 등 file_id 없으면 noop).
-    페이지 INSERT 와 abstract LLM 콜은 *병렬* — abstract 가 INSERT 를 막지 않도록.
-    실패는 격리 — 본 ingest 파이프라인이 계속 가게.
+    페이지가 저장되면 에이전트가 그 문서를 읽을 수 있다. 그래서 이 반환값(저장된 페이지 수)이
+    인제스트 성공의 기준이다. 카드는 백그라운드로 돌고, 실패해도 페이지는 남는다.
 
     Args:
-        skip_abstract: True 면 abstract LLM 콜을 생략 (페이지 저장만). 용어사전·양식 등
-            abstract 가 의미 없는 doc_role 에서 사용. 기본 False — 기존 호출자는 영향 없음.
+        skip_abstract: True 면 카드 생성을 생략 (페이지 저장만). 용어사전·양식 등
+            카드가 의미 없는 doc_role 에서 사용.
     """
     if not tenant_id or not file_id or not page_docs:
-        return
+        return 0
 
     try:
-        if skip_abstract:
-            await save_pages(tenant_id, file_id, page_docs)
-        else:
-            # 카드는 문서 전체를 읽으므로 오래 걸린다. 인제스트를 막지 않게 백그라운드로
-            # 돌리고, 그동안 미러는 페이지 본문만으로도 동작한다(카드는 가속기).
-            await asyncio.gather(
-                save_pages(tenant_id, file_id, page_docs),
-                schedule_card_build(tenant_id, file_id, page_docs),
-                return_exceptions=True,
-            )
+        saved = await save_pages(tenant_id, file_id, page_docs)
+        if saved and not skip_abstract:
+            await schedule_card_build(tenant_id, file_id, page_docs)
+        return saved
     except Exception as e:
         logger.warning(
             "[document_pages] post_load_hook failed (%s/%s): %s",
             tenant_id, file_id, e,
         )
+        return 0

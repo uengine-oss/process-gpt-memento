@@ -91,14 +91,18 @@ async def _index_uploaded_file(
     doc_role: Optional[str],
     public_url: Optional[str] = None,
 ) -> Optional[str]:
-    """스토리지에 올라온 파일을 파싱·인덱싱하고 ``index_status`` 를 갱신한다 (upload/reindex 공용).
+    """스토리지에 올라온 파일을 파싱해 지도에 올리고 ``index_status`` 를 갱신한다 (upload/reindex 공용).
 
-    반환: 실패 사유 문자열(str) 또는 ``None``(성공). 실패 시 ``mark_status(FAILED)`` 까지 처리.
+    반환: 실패 사유 문자열(str) 또는 ``None``(성공).
 
-    ── doc_role 별 인덱싱 정책 ──
-      content/reference : 풀 파이프라인 (pages + abstract + 청킹 + 임베딩)
-      glossary/template : 페이지만 저장 (abstract·청킹·임베딩 skip)
-      dataset           : 페이지·청킹·임베딩 skip, workbook_card 만 추출해 doc_card 저장
+    성공 기준은 *페이지 저장* 이다 — 페이지가 있으면 에이전트가 그 문서를 읽을 수 있다.
+    문서 카드는 백그라운드, 벡터 인덱스(검색 힌트)는 그 뒤의 보조 단계라 실패해도
+    ``indexed`` 를 되돌리지 않고 ``index_error`` 에만 남긴다.
+
+    ── doc_role 별 정책 ──
+      content/reference : 페이지 + 카드 + (보조) 청킹·임베딩
+      glossary/template : 페이지만 저장
+      dataset           : 페이지 없음, workbook_card 만 추출해 doc_card 저장
     """
     from app.services.knowledge_files import normalize_doc_role  # 동일 정규화 사용
     role_norm = normalize_doc_role(doc_role)
@@ -112,6 +116,7 @@ async def _index_uploaded_file(
 
     documents = []
     indexing_error: Optional[str] = None
+    pages_saved = 0
     try:
         # 멱등성: 재시도/재시작 복구/재인덱싱 시 이전(부분) 산출물을 먼저 정리해 청크 중복 방지.
         # 최초 인덱싱이면 사실상 no-op(인덱스 조회라 저렴). 스토리지 원본/knowledge_files row 는 유지.
@@ -158,20 +163,12 @@ async def _index_uploaded_file(
             processor = get_document_processor()
             docs = await processor.load_document(file_io, file_name)
             if docs:
-                # 페이지 단위 저장 — 모든 role 에서 수행. glossary/template 는 abstract LLM skip.
-                # file_id 는 storage_path 와 동일 (chunk metadata.file_id 와도 일치).
-                # 실패는 격리 — 청크 RAG 파이프라인은 계속.
-                try:
-                    from app.services.document_pages import post_load_hook
-                    await post_load_hook(
-                        tenant_id, storage_path, docs,
-                        skip_abstract=skip_abstract,
-                    )
-                except Exception as page_err:
-                    logger.warning(
-                        "[knowledge_admin] post_load_hook failed for %s: %s",
-                        file_name, page_err,
-                    )
+                # 페이지 저장이 곧 "읽을 수 있음" — file_id 는 storage_path (chunk metadata.file_id 와 동일).
+                from app.services.document_pages import post_load_hook
+                pages_saved = await post_load_hook(
+                    tenant_id, storage_path, docs,
+                    skip_abstract=skip_abstract,
+                )
 
                 if not skip_chunking_and_embedding:
                     if role_norm == "legal_review":
@@ -279,19 +276,17 @@ async def _index_uploaded_file(
                 "[knowledge_admin] %s: pages-only ingest (role=%s, skipped chunking/embedding)",
                 file_name, role_norm,
             )
+        elif pages_saved or (is_image and documents):
+            await mark_status(
+                tenant_id=tenant_id,
+                source_type="upload",
+                source_ref=storage_path,
+                status=INDEX_STATUS_INDEXED,
+            )
+            if documents:
+                await _index_search_hints(tenant_id, storage_path, file_name, documents)
         elif documents:
-            rag = get_rag_chain()
-            success = await rag.process_and_store_documents(documents, tenant_id)
-            if success:
-                await rag.save_processed_files([storage_path], tenant_id, [file_name])
-                await mark_status(
-                    tenant_id=tenant_id,
-                    source_type="upload",
-                    source_ref=storage_path,
-                    status=INDEX_STATUS_INDEXED,
-                )
-            else:
-                indexing_error = "Vector store processing failed"
+            indexing_error = "페이지 저장 실패"
         else:
             indexing_error = "No content extracted"
     except Exception as e:
@@ -302,6 +297,39 @@ async def _index_uploaded_file(
     # (transient 를 여기서 failed 로 찍으면 재시도 때 깜빡이고, 그 사이 크래시 시 failed 로 굳어
     #  pending/processing 만 복구하는 sweeper 가 못 살림. 성공 시 indexed 마킹은 위에서 이미 수행.)
     return indexing_error
+
+
+async def _index_search_hints(
+    tenant_id: str, storage_path: str, file_name: str, documents: list
+) -> None:
+    """청킹·임베딩 — 에이전트가 진입점을 잡는 의미 검색용 보조 인덱스.
+
+    문서는 이미 ``indexed`` 다. 여기서 실패하면 힌트만 없는 것이라 상태는 두고
+    ``index_error`` 에 사유를 남겨 화면이 "검색 힌트 없음" 으로 보이게 한다.
+    """
+    from app.core.supabase_client import supabase
+
+    error: Optional[str] = None
+    try:
+        rag = get_rag_chain()
+        if await rag.process_and_store_documents(documents, tenant_id):
+            await rag.save_processed_files([storage_path], tenant_id, [file_name])
+            return
+        error = "vector index write failed"
+    except Exception as e:  # noqa: BLE001 - 힌트 실패는 문서를 되돌리지 않는다
+        error = str(e)[:300]
+    logger.warning("[knowledge_admin] %s: search hints unavailable: %s", file_name, error)
+    try:
+        await asyncio.to_thread(
+            supabase.table("knowledge_files")
+            .update({"index_error": f"hints: {error}"})
+            .eq("tenant_id", tenant_id)
+            .eq("source_type", "upload")
+            .eq("source_ref", storage_path)
+            .execute
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.info("[knowledge_admin] hint error note skipped: %s", e)
 
 
 @router.post("/knowledge/files/upload")
@@ -502,14 +530,14 @@ async def resummarize_knowledge_file(
     source_type: str = Form("upload"),
     requester_uid: Optional[str] = Form(None),
 ):
-    """파일의 *요약(abstract)만* 재생성한다 — 재파싱·재임베딩 없이 저장된 페이지 재사용.
+    """파일의 *문서 카드만* 다시 만든다 — 재파싱·재임베딩 없이 저장된 페이지 재사용.
 
-    요약 실패(``doc_card.abstract_status='failed'``)한 파일의 '다시 요약' 버튼용. 완료 후
-    해당 폴더 카드도 재생성(요약이 폴더 카드의 입력이므로). 권한: 관리자 또는 업로더 본인.
+    카드 실패/구버전 카드의 '카드 다시 만들기' 버튼용. 완료 후 해당 폴더 카드도 재생성
+    (문서 카드가 폴더 카드의 입력이므로). 권한: 관리자 또는 업로더 본인.
     """
     from app.core.supabase_client import supabase
     from app.services.knowledge_files import normalize_doc_role
-    from app.services.document_pages import update_doc_card
+    from app.services.document_pages import build_and_store_card
     from langchain.schema import Document
 
     entry = await get_entry(tenant_id, source_type, source_ref)
@@ -519,11 +547,11 @@ async def resummarize_knowledge_file(
     is_admin = await _resolve_admin(requester_uid, tenant_id)
     is_owner = bool(requester_uid) and str(entry.get("uploaded_by_uid") or "") == str(requester_uid)
     if not (is_admin or is_owner):
-        raise HTTPException(status_code=403, detail="재요약 권한이 없습니다 (관리자 또는 업로더 본인).")
+        raise HTTPException(status_code=403, detail="카드 재생성 권한이 없습니다 (관리자 또는 업로더 본인).")
 
     role = normalize_doc_role(entry.get("doc_role"))
     if role in ("glossary", "template", "dataset"):
-        raise HTTPException(status_code=400, detail="이 분류는 요약을 생성하지 않습니다.")
+        raise HTTPException(status_code=400, detail="이 분류는 문서 카드를 만들지 않습니다.")
 
     # 저장된 페이지 재사용 (재파싱/재임베딩 없음)
     try:
@@ -545,37 +573,33 @@ async def resummarize_knowledge_file(
         Document(page_content=(r.get("content") or ""), metadata={"page_number": r.get("page_number")})
         for r in rows
     ]
-    await update_doc_card(tenant_id, source_ref, page_docs)
+    file_name = entry.get("file_name") or Path(source_ref).name
+    await build_and_store_card(tenant_id, source_ref, file_name, page_docs)
 
-    # 요약은 폴더 카드의 입력 → 해당 폴더(+조상) 카드 재생성 (백그라운드, fire-and-forget)
+    # 문서 카드는 폴더 카드의 입력 → 해당 폴더(+조상) 카드 재생성 (백그라운드)
     folder_path = (entry.get("folder_path") or "").strip().strip("/")
     if folder_path:
         from app.services.folder_cards import rebuild_folders
         background_tasks.add_task(rebuild_folders, tenant_id, [folder_path], role)
 
-    # 실제 요약 성공 여부 재확인 (doc_card 직접 조회)
-    summarized = False
-    abstract_status = "failed"
+    status = "failed"
     try:
         chk = await asyncio.to_thread(
-            supabase.table("knowledge_files")
-            .select("doc_card")
+            supabase.table("knowledge_doc_cards")
+            .select("status")
             .eq("tenant_id", tenant_id)
-            .eq("source_ref", source_ref)
+            .eq("file_id", source_ref)
             .limit(1)
             .execute
         )
-        card = ((chk.data or [{}])[0] or {}).get("doc_card") or {}
-        if isinstance(card, dict):
-            summarized = bool(card.get("abstract"))
-            abstract_status = card.get("abstract_status") or ("done" if summarized else "failed")
+        status = str(((chk.data or [{}])[0] or {}).get("status") or "failed")
     except Exception as e:
-        logger.warning("[knowledge_admin] resummarize verify failed: %s", e)
+        logger.warning("[knowledge_admin] card rebuild verify failed: %s", e)
 
     return {
         "source_ref": source_ref,
-        "summarized": summarized,
-        "abstract_status": abstract_status,
+        "summarized": status == "done",
+        "card_status": status,
     }
 
 

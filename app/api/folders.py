@@ -125,12 +125,102 @@ async def _fetch_folder_cards(
 
 
 def _card_brief(card: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """tree/open 응답에 실을 폴더카드 요약(요약문 + 토픽)."""
+    """tree/open 응답에 실을 폴더카드 요약 — 무엇이 있고 무엇부터 읽는지."""
     if not isinstance(card, dict):
         return None
     return {
         "summary": card.get("summary") or "",
         "topics": card.get("topics") or [],
+        "reading_guide": card.get("reading_guide") or [],
+        "start_with": card.get("start_with") or [],
+        "answers_questions": card.get("answers_questions") or [],
+        "built_at": card.get("built_at"),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 문서 카드 상태 — 지도가 얼마나 채워졌는지(readiness)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_READY_STATES = ("ready", "pending", "failed", "no_text")
+
+
+async def _fetch_doc_card_index(
+    tenant_id: str, refs: Optional[List[str]] = None
+) -> Dict[str, Dict[str, Any]]:
+    """``knowledge_doc_cards`` 에서 ``{file_id: {status, card}}``. 테이블이 없으면 빈 dict.
+
+    refs 를 주면 그 파일들만(IN 청크), 없으면 tenant 전체(status 만, 가볍게).
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        if refs is None:
+            resp = await asyncio.to_thread(
+                supabase.table("knowledge_doc_cards")
+                .select("file_id, status")
+                .eq("tenant_id", tenant_id)
+                .limit(_TREE_FETCH_LIMIT)
+                .execute
+            )
+            rows = resp.data or []
+        else:
+            rows = []
+            clean = [str(r) for r in refs if r]
+            for i in range(0, len(clean), _IN_CHUNK):
+                resp = await asyncio.to_thread(
+                    supabase.table("knowledge_doc_cards")
+                    .select("file_id, status, card")
+                    .eq("tenant_id", tenant_id)
+                    .in_("file_id", clean[i:i + _IN_CHUNK])
+                    .execute
+                )
+                rows.extend(resp.data or [])
+    except Exception as e:
+        logger.debug("[/folders] doc_cards unavailable: %s", e)
+        return out
+    for r in rows:
+        fid = str(r.get("file_id") or "")
+        if fid:
+            out[fid] = r
+    return out
+
+
+def _doc_state(row: Dict[str, Any], card_row: Optional[Dict[str, Any]]) -> str:
+    """문서 한 건이 지도에서 어떤 상태인가: ready / pending / failed / no_text."""
+    if row.get("has_text") is False:
+        return "no_text"
+    status = (card_row or {}).get("status")
+    if status in ("done",):
+        return "ready"
+    if status == "failed":
+        return "failed"
+    if status == "empty":
+        return "no_text"
+    if status == "pending":
+        return "pending"
+    if _abstract_of(row):
+        return "ready"  # 구식 abstract 만 있는 문서 — 지도에는 있다
+    if row.get("index_status") == "failed":
+        return "failed"
+    return "pending"
+
+
+def _empty_readiness() -> Dict[str, int]:
+    return {state: 0 for state in _READY_STATES} | {"total": 0}
+
+
+def _doc_card_brief(card_row: Optional[Dict[str, Any]], row: Dict[str, Any]) -> Dict[str, Any]:
+    """open 응답의 문서 한 줄 — 새 카드가 있으면 그것, 없으면 구식 abstract."""
+    card = (card_row or {}).get("card") if isinstance((card_row or {}).get("card"), dict) else {}
+    return {
+        "title": str(card.get("title") or "").strip(),
+        "doc_type": str(card.get("doc_type") or "").strip(),
+        "summary": str(card.get("summary") or _abstract_of(row) or "").strip(),
+        "distinguishers": card.get("distinguishers") or [],
+        "answers_questions": card.get("answers_questions") or [],
+        "topics": card.get("topics") or [],
+        "coverage": card.get("coverage") if isinstance(card.get("coverage"), dict) else None,
+        "state": _doc_state(row, card_row),
     }
 
 
@@ -192,7 +282,7 @@ async def folders_tree(
     doc_role: Optional[str] = Query(default=None),
     depth: int = Query(default=_DEFAULT_TREE_DEPTH, ge=1, le=_MAX_TREE_DEPTH),
 ):
-    """선택 루트들 아래의 폴더 골격(+폴더카드, +자식 문서 abstract 샘플)을 반환.
+    """선택 루트들 아래의 폴더 골격(+폴더카드, +준비 상태, +자식 문서 abstract 샘플)을 반환.
 
     Args:
         tenant_id: 필수.
@@ -201,9 +291,10 @@ async def folders_tree(
         depth: 루트 기준 하위 몇 단계까지 펼칠지(기본 2). 더 깊은 곳은 ``/folders/open`` 으로.
 
     Returns:
-        ``{"tree": [node, ...], "truncated": bool}``
+        ``{"tree": [node, ...], "truncated": bool, "readiness": {...}}``
         node = {folder_path, name, n_docs_direct, n_docs_total, n_subfolders,
-                card, sample_abstracts, children}
+                card, readiness, sample_abstracts, children}
+        readiness = {ready, pending, failed, no_text, total} — 하위 전체 문서 기준.
     """
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id required")
@@ -214,7 +305,7 @@ async def folders_tree(
     #   - 둘 다 없으면 레거시/직접호출 하위호환으로 tenant 전체.
     allow = [str(x) for x in (file_ids or []) if x]
     scope_folders = [str(x) for x in (folder_paths or []) if x and str(x).strip().strip("/")]
-    _COLS = "source_ref, file_name, folder_path, doc_card, doc_role"
+    _COLS = "source_ref, file_name, folder_path, doc_card, doc_role, has_text, index_status"
     try:
         # 개별 file_ids(allow) 와 폴더 스코프(scope_folders)를 union. 단일 소스면 예전과 동일 결과.
         rows = []
@@ -259,6 +350,10 @@ async def folders_tree(
     direct: Dict[str, int] = {}
     total: Dict[str, int] = {}
     children: Dict[str, set[str]] = {}
+    readiness: Dict[str, Dict[str, int]] = {}
+    overall = _empty_readiness()
+
+    card_index = await _fetch_doc_card_index(tenant_id)
 
     for r in rows:
         fp = _norm(r.get("folder_path"))
@@ -266,9 +361,15 @@ async def folders_tree(
             continue  # 루트 직속(폴더 없는) 파일은 트리 네비 대상 아님
         files_by_folder.setdefault(fp, []).append(r)
         direct[fp] = direct.get(fp, 0) + 1
+        state = _doc_state(r, card_index.get(str(r.get("source_ref") or "")))
+        overall[state] += 1
+        overall["total"] += 1
         for anc in _ancestors(fp):
             all_folders.add(anc)
             total[anc] = total.get(anc, 0) + 1
+            bucket = readiness.setdefault(anc, _empty_readiness())
+            bucket[state] += 1
+            bucket["total"] += 1
 
     for fp in all_folders:
         par = _parent(fp)
@@ -307,6 +408,7 @@ async def folders_tree(
             "n_docs_total": total.get(fp, 0),
             "n_subfolders": len(children.get(fp, set())),
             "card": _card_brief(cards.get(fp)),
+            "readiness": readiness.get(fp) or _empty_readiness(),
             "sample_abstracts": samples,
             "children": kids,
         }
@@ -316,7 +418,7 @@ async def folders_tree(
         "[/folders/tree] tenant=%s roots=%d doc_role=%s files=%d folders=%d start=%d depth=%d",
         tenant_id, len(norm_roots), doc_role, len(rows), len(all_folders), len(start), depth,
     )
-    return {"tree": tree, "truncated": truncated}
+    return {"tree": tree, "truncated": truncated, "readiness": overall}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -372,7 +474,12 @@ _MAX_CHUNK_TOP_K = 2000
 # query 모드에서 랭킹 후보로 훑을 직속 문서 수 상한 (source_ref 한 컬럼만 읽음).
 _MAX_DIRECT_SCAN = 20_000
 
-_DOC_COLS = "source_ref, file_name, folder_path, path, doc_card, doc_role, mime_type"
+_DOC_COLS = "source_ref, file_name, folder_path, path, doc_card, doc_role, mime_type, has_text, index_status"
+# 관리 화면용 — 식별자·업로더·크기까지. 에이전트 경로(include_refs=false)에는 내려가지 않는다.
+_DOC_COLS_ADMIN = (
+    _DOC_COLS + ", source_type, size_bytes, modified_time, indexed_at, index_error, "
+    "uploaded_by_uid, uploaded_by_name, page_count"
+)
 
 
 def _empty_open(fp: str) -> Dict[str, Any]:
@@ -515,8 +622,9 @@ async def folders_open(
     query: Optional[str] = Query(default=None),
     limit: int = Query(default=_OPEN_QUERY_LIMIT, ge=1, le=500),
     list_threshold: int = Query(default=_OPEN_LIST_THRESHOLD, ge=1, le=2000),
+    include_refs: bool = Query(default=False),
 ):
-    """한 폴더의 직속 자식 — 하위폴더(카드 요약) + 문서(abstract) — 반환.
+    """한 폴더의 직속 자식 — 하위폴더(카드 요약) + 문서(카드 요약) — 반환.
 
     출력 크기는 폴더 크기가 아니라 파라미터가 정한다. 직속 문서가 ``list_threshold`` 를
     넘으면 나열하지 않고, ``query`` 가 오면 그 질의 관련 상위 ``limit`` 개만 돌려준다.
@@ -529,12 +637,15 @@ async def folders_open(
         query: 이 폴더 안에서 찾는 내용. 임계 초과 시 이걸로 문서를 추린다.
         limit: query 모드에서 남길 문서 수.
         list_threshold: 이 수를 넘으면 나열 대신 query 모드.
+        include_refs: 관리 화면용. 문서에 source_ref·크기·업로더·인덱스 오류를 함께 싣는다.
+            에이전트 경로는 false — 긴 식별자를 모델에 노출하지 않는다.
 
     Returns:
         ``{"folder_path", "subfolders", "docs", "n_docs_direct", "n_subfolders_total",
            "overflow", "query", "role_counts", "card"}``
         subfolders = {folder_path, name, n_docs_total, card}
-        docs = {file_name, folder_path, path, abstract, doc_role, n_pages, mime_type}
+        docs = {file_name, folder_path, path, abstract, doc_role, n_pages, mime_type,
+                card: {title, doc_type, summary, distinguishers, answers_questions, state}}
     """
     if not tenant_id or not folder_path:
         raise HTTPException(status_code=400, detail="tenant_id, folder_path required")
@@ -551,6 +662,7 @@ async def folders_open(
         return _empty_open(fp)
 
     q = (query or "").strip()
+    doc_cols = _DOC_COLS_ADMIN if include_refs else _DOC_COLS
 
     # ── 직속 문서 ──
     #   폴더 스코프 안을 여는 중이면(scope_folders) 폴더 직속 문서 *전부*. 개별 file_ids 모드
@@ -561,7 +673,7 @@ async def folders_open(
     role_counts: Dict[str, int] = {}
     try:
         probe_rows = await _direct_docs_query(
-            tenant_id, fp, cols=_DOC_COLS, doc_role=doc_role,
+            tenant_id, fp, cols=doc_cols, doc_role=doc_role,
             allow=allow, scope_folders=scope_folders, limit=list_threshold + 1,
         )
         overflow = len(probe_rows) > list_threshold
@@ -590,7 +702,7 @@ async def folders_open(
                 by_ref = {
                     str(r.get("source_ref")): r
                     for r in await _fetch_kf_by_refs(
-                        tenant_id, _DOC_COLS, top_refs, doc_role=doc_role, folder_eq=fp,
+                        tenant_id, doc_cols, top_refs, doc_role=doc_role, folder_eq=fp,
                     )
                     if r.get("source_ref")
                 }
@@ -646,18 +758,39 @@ async def folders_open(
         for cfp, cnt in top_subfolders[:_OPEN_MAX_SUBFOLDERS]
     ]
 
-    docs = [
-        {
+    card_index = await _fetch_doc_card_index(
+        tenant_id, [str(r.get("source_ref")) for r in direct_rows if r.get("source_ref")]
+    )
+    docs = []
+    for r in direct_rows:
+        card_row = card_index.get(str(r.get("source_ref") or ""))
+        brief = _doc_card_brief(card_row, r)
+        doc = {
             "file_name": r.get("file_name"),
             "folder_path": _norm(r.get("folder_path")),
             "path": r.get("path") or compose_path(r.get("folder_path"), r.get("file_name")),
-            "abstract": _abstract_of(r),
+            "abstract": brief["summary"],
             "doc_role": r.get("doc_role") or "content",
-            "n_pages": _n_pages_of(r),
+            "n_pages": r.get("page_count") or _n_pages_of(r),
             "mime_type": r.get("mime_type"),
+            "card": brief,
         }
-        for r in direct_rows
-    ]
+        if include_refs:
+            doc.update({
+                "source_ref": r.get("source_ref"),
+                "source_type": r.get("source_type") or "upload",
+                "size_bytes": r.get("size_bytes"),
+                "modified_time": r.get("modified_time"),
+                "indexed_at": r.get("indexed_at"),
+                "index_status": r.get("index_status"),
+                "index_error": r.get("index_error"),
+                "has_text": r.get("has_text"),
+                "uploaded_by_uid": r.get("uploaded_by_uid"),
+                "uploaded_by_name": r.get("uploaded_by_name"),
+            })
+        docs.append(doc)
+    if include_refs:
+        docs.sort(key=lambda d: str(d.get("file_name") or "").casefold())
 
     logger.info(
         "[/folders/open] tenant=%s folder=%s q=%r → subfolders=%d/%d docs=%d/%d overflow=%s",

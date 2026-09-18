@@ -45,9 +45,31 @@ WINDOW_SLACK = 400
 MAX_WINDOWS = int(os.getenv("KB_CARD_MAX_WINDOWS", "16"))
 MAX_LABELS = 12
 MAX_QUESTIONS = 10
+MAX_DISTINGUISHERS = 6
+MAX_NEIGHBORS = 12
 LABEL_MAX_CHARS = 60
 QUESTION_MAX_CHARS = 160
-CARD_VERSION = 2
+CARD_VERSION = 3
+
+
+@dataclass(frozen=True)
+class CardContext:
+    """카드를 만들 때 함께 보여 주는 이웃 — 같은 폴더의 다른 문서 제목들.
+
+    동일 골격의 사업 문서가 여러 벌이면 문서 하나만 보고 쓴 요약은 서로 같아진다.
+    이웃을 보여 줘야 모델이 "이 문서만의" 사실(사업명·발주처·연도·차수)을 골라낸다.
+    """
+    folder_path: str = ""
+    neighbors: Tuple[str, ...] = ()
+
+    def render(self) -> str:
+        lines: List[str] = []
+        if self.folder_path:
+            lines.append(f"[폴더] {self.folder_path}")
+        if self.neighbors:
+            lines.append("[같은 폴더의 다른 문서]")
+            lines.extend(f"- {name}" for name in self.neighbors[:MAX_NEIGHBORS])
+        return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -90,6 +112,7 @@ class DocumentCard:
     entities: List[str] = field(default_factory=list)
     keywords: List[str] = field(default_factory=list)
     answers_questions: List[str] = field(default_factory=list)
+    distinguishers: List[str] = field(default_factory=list)
     coverage: Coverage = field(default_factory=Coverage)
 
     def as_dict(self) -> Dict[str, Any]:
@@ -103,6 +126,7 @@ class DocumentCard:
             "entities": self.entities,
             "keywords": self.keywords,
             "answers_questions": self.answers_questions,
+            "distinguishers": self.distinguishers,
             "coverage": self.coverage.as_dict(),
             "generated_at": datetime.utcnow().isoformat() + "Z",
         }
@@ -194,6 +218,8 @@ def merge_window(card: DocumentCard, payload: Dict[str, Any]) -> bool:
         ("new_keywords", card.keywords, MAX_LABELS, LABEL_MAX_CHARS),
         ("answers_questions", card.answers_questions, MAX_QUESTIONS, QUESTION_MAX_CHARS),
         ("new_questions", card.answers_questions, MAX_QUESTIONS, QUESTION_MAX_CHARS),
+        ("distinguishers", card.distinguishers, MAX_DISTINGUISHERS, LABEL_MAX_CHARS),
+        ("new_distinguishers", card.distinguishers, MAX_DISTINGUISHERS, LABEL_MAX_CHARS),
     ):
         existing = {value.casefold() for value in target}
         for value in _labels(payload.get(key), limit=limit, max_chars=max_chars):
@@ -210,6 +236,7 @@ _CORE_RULES = """\
 - 수치·단위·법령조항·고유명사는 글자 그대로 옮긴다.
 - 없는 내용을 비워 두는 것이 지어내는 것보다 낫다.
 - 모든 내용 필드는 문서의 언어를 그대로 쓴다.
+- summary 첫 문장은 이 문서를 같은 폴더의 다른 문서와 구별하는 사실(사업명·발주처·상대방·연도·차수·버전)로 시작한다. "~에 관한 문서" 같은 장르 설명으로 시작하지 마라.
 """
 
 _JSON_SHAPE = """\
@@ -217,6 +244,7 @@ _JSON_SHAPE = """\
  "doc_type": "장르 명사 — 계약서/공고/회의록/명세서/보고서 등",
  "language": "ko/en 등",
  "summary": "이 문서가 무엇인지 2~3문장",
+ "distinguishers": ["같은 종류의 다른 문서와 이 문서를 구별하는 사실 — 사업명·발주처·상대방·연도·차수·금액·버전. 자료에 있는 것만"],
  "topics": ["이 문서가 다루는 대상 — 사업명·기관·주제"],
  "entities": ["기관·사람·제품·코드 등 고유명사"],
  "keywords": ["문서가 실제로 쓰는 어휘(동의어 브리지용)"],
@@ -224,26 +252,36 @@ _JSON_SHAPE = """\
 """
 
 
-def build_first_prompt(file_name: str, window: Window) -> str:
+def _context_block(context: Optional[CardContext]) -> str:
+    rendered = context.render() if context else ""
+    return rendered + "\n" if rendered else ""
+
+
+def build_first_prompt(file_name: str, window: Window, context: Optional[CardContext] = None) -> str:
     return (
         "당신은 문서를 카드로 정리하는 사서다. 아래는 문서의 일부다.\n"
         f"[파일명] {file_name}\n"
+        f"{_context_block(context)}"
         f"[범위] 전체 {window.total}조각 중 {window.index + 1}번째\n\n"
         "이 조각만 보고 아래 JSON 을 채워라. 다른 조각은 나중에 따로 본다.\n"
         f"{_JSON_SHAPE}\n"
         f"규칙:\n{_CORE_RULES}"
         "- answers_questions 는 요약이 아니라 *검색 표면* 이다. 이 문서에만 있는 정보를 묻는 질문을 적어라.\n"
+        "- distinguishers 는 같은 폴더의 다른 문서(위 목록)와 헷갈리지 않게 해 주는 사실만 담는다.\n"
         "- JSON 객체만 출력한다. 코드펜스·설명 금지.\n\n"
         f"[자료]\n{window.text}\n\n[JSON]"
     )
 
 
-def build_update_prompt(file_name: str, window: Window, card: DocumentCard) -> str:
+def build_update_prompt(
+    file_name: str, window: Window, card: DocumentCard, context: Optional[CardContext] = None
+) -> str:
     current = json.dumps(
         {
             "title": card.title,
             "doc_type": card.doc_type,
             "summary": card.summary,
+            "distinguishers": card.distinguishers,
             "topics": card.topics,
             "entities": card.entities,
             "keywords": card.keywords,
@@ -254,11 +292,12 @@ def build_update_prompt(file_name: str, window: Window, card: DocumentCard) -> s
     return (
         "같은 문서의 다음 조각이다. 지금까지의 카드를 갱신하라.\n"
         f"[파일명] {file_name}\n"
+        f"{_context_block(context)}"
         f"[범위] 전체 {window.total}조각 중 {window.index + 1}번째\n\n"
         f"[현재 카드]\n{current}\n\n"
         "출력 JSON:\n"
         '{"summary": "이 조각까지 반영한 전체 요약 3~4문장(기존 요약에 덧붙이지 말고 새로 쓴다)",\n'
-        ' "new_topics": [], "new_entities": [], "new_keywords": [], "new_questions": [],\n'
+        ' "new_distinguishers": [], "new_topics": [], "new_entities": [], "new_keywords": [], "new_questions": [],\n'
         ' "title": "카드의 제목이 틀렸을 때만", "doc_type": "카드의 종류가 틀렸을 때만"}\n\n'
         f"규칙:\n{_CORE_RULES}"
         "- new_* 는 카드에 아직 없는 것만 담는다. 이미 있는 항목을 반복하지 마라.\n"
@@ -286,6 +325,7 @@ async def build_card(
     *,
     file_name: str,
     text: str,
+    context: Optional[CardContext] = None,
     max_windows: int = MAX_WINDOWS,
     ask=_ask,
 ) -> DocumentCard:
@@ -304,9 +344,9 @@ async def build_card(
         )
     for position, window in enumerate(selected):
         prompt = (
-            build_first_prompt(file_name, window)
+            build_first_prompt(file_name, window, context)
             if position == 0 or not card.summary
-            else build_update_prompt(file_name, window, card)
+            else build_update_prompt(file_name, window, card, context)
         )
         payload = await ask(prompt)
         card.coverage.windows_read += 1
@@ -421,8 +461,61 @@ async def save_text_stats(*, tenant_id: str, file_id: str, text: str, page_count
         logger.info("[doc_cards] text stats 저장 건너뜀: %s", exc)
 
 
+async def load_neighbors(tenant_id: str, file_id: str) -> CardContext:
+    """같은 폴더의 다른 문서 이름(카드 제목이 있으면 그것)을 모아 컨텍스트로 만든다."""
+    from app.core.supabase_client import supabase
+
+    try:
+        me = await asyncio.to_thread(
+            supabase.table("knowledge_files")
+            .select("folder_path, doc_role")
+            .eq("tenant_id", tenant_id)
+            .eq("source_ref", file_id)
+            .limit(1)
+            .execute
+        )
+        rows = getattr(me, "data", None) or []
+        if not rows:
+            return CardContext()
+        folder_path = str(rows[0].get("folder_path") or "").strip().strip("/")
+        if not folder_path:
+            return CardContext()
+        siblings = await asyncio.to_thread(
+            supabase.table("knowledge_files")
+            .select("source_ref, file_name")
+            .eq("tenant_id", tenant_id)
+            .eq("folder_path", folder_path)
+            .eq("doc_role", rows[0].get("doc_role") or "content")
+            .neq("source_ref", file_id)
+            .order("file_name")
+            .limit(MAX_NEIGHBORS)
+            .execute
+        )
+        sib_rows = getattr(siblings, "data", None) or []
+        names = {str(r.get("source_ref")): str(r.get("file_name") or "") for r in sib_rows}
+        if names:
+            cards = await asyncio.to_thread(
+                supabase.table("knowledge_doc_cards")
+                .select("file_id, card")
+                .eq("tenant_id", tenant_id)
+                .in_("file_id", list(names))
+                .eq("status", "done")
+                .execute
+            )
+            for row in getattr(cards, "data", None) or []:
+                card = row.get("card") if isinstance(row.get("card"), dict) else {}
+                title = str(card.get("title") or "").strip()
+                if title:
+                    names[str(row.get("file_id"))] = f"{names[str(row.get('file_id'))]} — {title}"
+        return CardContext(folder_path=folder_path, neighbors=tuple(v for v in names.values() if v))
+    except Exception as exc:  # noqa: BLE001 - 이웃은 있으면 좋은 것이지 필수가 아니다
+        logger.info("[doc_cards] 이웃 조회 생략 (%s): %s", file_id, exc)
+        return CardContext()
+
+
 __all__ = [
     "CARD_VERSION",
+    "CardContext",
     "Coverage",
     "DocumentCard",
     "Window",
@@ -433,6 +526,7 @@ __all__ = [
     "content_sha256",
     "evenly_spaced",
     "load_existing_card",
+    "load_neighbors",
     "make_windows",
     "merge_window",
     "parse_card_json",
