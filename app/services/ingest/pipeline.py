@@ -398,29 +398,3 @@ async def process_supabase_storage(request: ProcessRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-async def process_database_records(request: ProcessRequest):
-    try:
-        if not request.options:
-            raise HTTPException(status_code=400, detail="options is required")
-
-        supabase_storage_loader = SupabaseStorageLoader()
-        sb = supabase_storage_loader.supabase
-        if sb is None:
-            raise HTTPException(status_code=500, detail="Failed to get Supabase client")
-
-        query = sb.table("todolist").select("*")
-        for key, value in request.options.items():
-            query = query.eq(key, value)
-        result = query.execute()
-
-        if result.data is None:
-            raise HTTPException(status_code=404, detail="No documents found in the database")
-
-        rag = get_rag_chain()
-        success = await rag.process_database_records(result.data, request.tenant_id, request.options)
-        if success:
-            return {"message": "Successfully processed and stored documents"}
-        raise HTTPException(status_code=500, detail="Failed to process and store documents")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))

@@ -17,7 +17,6 @@ from app.services.document_processor import get_document_processor
 from app.services.google_drive_loader import GoogleDriveLoader
 from app.services.ingest.image import process_image_file
 from app.services.ingest.pipeline import (
-    process_database_records,
     process_google_drive,
     process_local_documents,
     process_supabase_storage,
@@ -67,11 +66,6 @@ async def get_drive_indexing_status(tenant_id: str):
                 "error": job.get("error"),
             }
     return {"status": "idle"}
-
-
-@router.post("/process/database")
-async def process_database(request: ProcessRequest):
-    return await process_database_records(request)
 
 
 @router.post("/process-session-file")

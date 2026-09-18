@@ -1,7 +1,7 @@
 """API 요청/응답 Pydantic 스키마."""
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Optional
 from pydantic import BaseModel
 
 
@@ -34,13 +34,6 @@ class GoogleOAuthCallbackRequest(BaseModel):
 class UploadRequest(BaseModel):
     tenant_id: str
     options: Optional[dict] = None
-
-
-class RetrieveByIndicesRequest(BaseModel):
-    tenant_id: str
-    file_name: str
-    chunk_indices: List[int]
-    drive_folder_id: Optional[str] = None
 
 
 class ProcessRequest(BaseModel):

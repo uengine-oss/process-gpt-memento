@@ -4,7 +4,7 @@ from typing import List, Dict, Any, Optional
 import asyncio
 from langchain.schema import Document
 from app.core.env_loader import load_project_dotenv
-from app.services.vector_store import VectorStoreManager, get_vector_store
+from app.services.vector_store import get_vector_store
 from app.services.llm import create_llm
 from app.plugins.retrievers import get_retriever
 
@@ -98,12 +98,6 @@ class RAGChain:
             Answer: """
         }
 
-    def detect_language(self, text: str) -> str:
-        """Detect the language of the input text"""
-        # 간단한 한글 감지 (한글 유니코드 범위: AC00-D7A3)
-        if any('\uAC00' <= char <= '\uD7A3' for char in text):
-            return 'ko'
-        return 'en'
 
     async def retrieve(self, query: str, filter: Optional[Dict[str, Any]] = None, top_k: int = 5) -> Dict[str, Any]:
         """
@@ -132,87 +126,7 @@ class RAGChain:
             print(f"Error in retrieve: {e}")
             return {"source_documents": []}
         
-    def _format_context_documents(self, source_documents: List[Document]) -> str:
-        """Format retrieved documents into a compact context block for the LLM."""
-        context_parts: List[str] = []
 
-        for index, doc in enumerate(source_documents, start=1):
-            metadata = doc.metadata or {}
-            file_name = metadata.get("file_name") or metadata.get("source") or "unknown"
-            section_title = metadata.get("section_title") or ""
-            page_number = metadata.get("page_number") or metadata.get("page")
-            chunk_index = metadata.get("chunk_index")
-
-            header_parts = [f"문서 {index}", f"파일: {file_name}"]
-            if section_title:
-                header_parts.append(f"섹션: {section_title}")
-            if page_number is not None:
-                header_parts.append(f"페이지: {page_number}")
-            if chunk_index is not None:
-                header_parts.append(f"청크: {chunk_index}")
-
-            context_parts.append(
-                "\n".join(
-                    [
-                        " | ".join(header_parts),
-                        doc.page_content or "",
-                    ]
-                ).strip()
-            )
-
-        return "\n\n".join(part for part in context_parts if part).strip()
-
-    async def answer(
-        self,
-        query: str,
-        filter: Optional[Dict[str, Any]] = None,
-        top_k: int = 5,
-    ) -> Dict[str, Any]:
-        """Answer a query using the RAG chain."""
-        lang = self.detect_language(query)
-        try:
-            print(f"Detected language: {lang}")
-
-            prompt_template = self.prompts[lang]
-            retrieval_result = await self.retrieve(query, filter=filter, top_k=top_k)
-            source_documents = retrieval_result.get("source_documents", [])
-
-            if not source_documents:
-                return {
-                    "answer": (
-                        "I don't have enough information to answer that question."
-                        if lang == "en"
-                        else "질문에 답변하기에 충분한 정보가 없습니다."
-                    ),
-                    "source_documents": [],
-                }
-
-            context = self._format_context_documents(source_documents)
-            final_prompt = prompt_template.format(context=context, question=query)
-
-            print("Running direct RAG prompt with retrieved context...")
-            response = await self.llm.ainvoke(final_prompt)
-            answer = getattr(response, "content", response)
-            if not isinstance(answer, str):
-                answer = str(answer)
-
-            print(f"Answer: {answer}")
-            print(f"Number of source documents: {len(source_documents)}")
-
-            return {
-                "answer": answer,
-                "source_documents": source_documents,
-            }
-        except Exception as e:
-            print(f"Error in answer_question: {e}")
-            return {
-                "answer": (
-                    "An error occurred while processing your question."
-                    if lang == "en"
-                    else "질문을 처리하는 중 오류가 발생했습니다."
-                ),
-                "source_documents": [],
-            }
     
     async def process_and_store_documents(self, documents: list[Document], tenant_id: str) -> bool:
         """Process and store documents in the vector store with integrated image analysis."""
@@ -471,42 +385,6 @@ class RAGChain:
             print(f"Error deleting processed file: {e}")
             return False
 
-    async def process_database_records(self, records: List[Dict[str, Any]], tenant_id: str, options: Optional[Dict[str, Any]] = None) -> bool:
-        """Process database records and store them in the vector store."""
-        try:
-            print(f"\nProcessing {len(records)} database records...")
-            
-            documents = []
-            for record in records:
-                if 'output' not in record:
-                    print(f"Warning: Record {record.get('id', 'unknown')} has no 'output' column")
-                    continue
-                    
-                output_json = record['output']
-                # Convert dictionary to formatted string
-                output_text = "\n".join([f"{key}: {value}" for key, value in output_json.items()])
-                
-                metadata = {
-                    "tenant_id": tenant_id,
-                    "source_type": "database",
-                    "created_at": record.get('created_at', ''),
-                    "updated_at": record.get('updated_at', ''),
-                    **options
-                }
-                
-                # Create Document object
-                doc = Document(
-                    page_content=output_text,
-                    metadata=metadata
-                )
-                documents.append(doc)
-            
-            # Store documents in vector store
-            return await self.vector_store.add_documents(documents, tenant_id)
-            
-        except Exception as e:
-            print(f"Error in process_database_records: {e}")
-            return False
 
     async def analyze_images_with_llm(
         self,
@@ -609,16 +487,3 @@ def get_rag_chain() -> "RAGChain":
             if _rag_chain_instance is None:
                 _rag_chain_instance = RAGChain()
     return _rag_chain_instance
-
-
-# Example usage
-if __name__ == "__main__":
-    rag = RAGChain()
-    result = rag.answer(
-        "What is the budget for Project A?",
-        filter={"storage_type": "Local"}
-    )
-    print(f"Answer: {result['answer']}")
-    print("\nSources:")
-    for source in result["sources"]:
-        print(f"- {source[:100]}...") 
