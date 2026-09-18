@@ -50,9 +50,10 @@ abstract 는 앞 3쪽 + 뒤 1쪽만 보고 만든 한 줄이라 300쪽 문서에
 `/folders/tree` 와 `/folders/open` 이 이 카드와 문서별 준비 상태(`ready/pending/failed/no_text`)를
 돌려주며, 관리 화면과 에이전트가 같은 응답을 본다.
 
-마이그레이션: `sql/knowledge_doc_cards.sql`, `sql/kb_mirror.sql` (둘 다 멱등). 미적용
-상태에서도 서비스는 기존 `doc_card` 로 폴백해 동작한다. `kb_mirror.sql` 의 `kb_page_text`
-RPC 는 codex 지식베이스 미러가 파일별 전문을 배치로 가져오는 데 쓴다.
+마이그레이션(모두 멱등, Supabase SQL 에디터에서 1회): `sql/knowledge_doc_cards.sql`,
+`sql/knowledge_folder_cards.sql`, `sql/kb_mirror.sql`. `/folders/tree`·`/folders/open` 이
+`knowledge_files.has_text`/`page_count`(kb_mirror.sql) 를 읽으므로 이 셋은 지도 API 의 전제다.
+`kb_mirror.sql` 의 `kb_page_text` RPC 는 codex 미러가 파일별 전문을 배치로 가져오는 데 쓴다.
 
 ## 아키텍처 개요
 
