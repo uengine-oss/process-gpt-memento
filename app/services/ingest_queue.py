@@ -29,6 +29,7 @@ from app.services.knowledge_files import (
     INDEX_STATUS_PROCESSING,
     mark_status,
 )
+from app.storage.artifact_bucket import bucket_for
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +179,7 @@ async def _gate() -> None:
 
 async def _download_bytes(source_ref: str) -> Optional[bytes]:
     try:
-        data = await asyncio.to_thread(supabase.storage.from_("files").download, source_ref)
+        data = await asyncio.to_thread(supabase.storage.from_(bucket_for(source_ref)).download, source_ref)
         return data if isinstance(data, (bytes, bytearray)) else None
     except Exception as e:
         logger.warning("[ingest] storage download failed (%s): %s", source_ref, e)

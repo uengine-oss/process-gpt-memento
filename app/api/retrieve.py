@@ -13,6 +13,7 @@ from app.core.supabase_client import supabase
 from app.schemas import RetrieveByIndicesRequest
 from app.services.glossary import retrieve_glossary_terms
 from app.services.rag_chain import get_rag_chain
+from app.storage.artifact_bucket import bucket_for
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -805,7 +806,7 @@ async def preview_pdf_highlight(
 
     try:
         pdf_bytes = await asyncio.to_thread(
-            supabase.storage.from_("files").download, file_id
+            supabase.storage.from_(bucket_for(file_id)).download, file_id
         )
     except Exception as exc:
         raise HTTPException(status_code=404, detail=f"PDF not found in storage: {file_id} ({exc})")

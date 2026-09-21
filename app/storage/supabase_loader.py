@@ -114,7 +114,7 @@ class SupabaseStorageLoader:
             print(f"Error uploading image to storage: {e}")
             raise
 
-    async def upload_file_to_storage(self, file_content: bytes, file_name: str, folder_path: str = "files", content_type: Optional[str] = None) -> dict:
+    async def upload_file_to_storage(self, file_content: bytes, file_name: str, folder_path: str = "files", content_type: Optional[str] = None, bucket: Optional[str] = None, key: Optional[str] = None) -> dict:
         """
         Upload a file to Supabase Storage
         
@@ -134,7 +134,10 @@ class SupabaseStorageLoader:
             # Generate unique file name to avoid conflicts
             file_extension = os.path.splitext(file_name)[1]
             unique_file_name = f"{uuid.uuid4()}{file_extension}"
-            full_path = f"{folder_path}/{unique_file_name}"
+            # 산출물처럼 키를 부르는 쪽이 정하는 경우가 있다 — 그 키의 접두사가
+            # 어느 버킷인지를 말하기 때문이다(app/storage/artifact_bucket.py).
+            full_path = key or f"{folder_path}/{unique_file_name}"
+            target_bucket = bucket or "files"
             
             # Determine content type
             if not content_type:
@@ -144,7 +147,7 @@ class SupabaseStorageLoader:
             
             # Upload to Supabase Storage
             response = await asyncio.to_thread(
-                self.supabase.storage.from_("files").upload,
+                self.supabase.storage.from_(target_bucket).upload,
                 full_path,
                 file_content,
                 {"content-type": content_type}
@@ -152,9 +155,23 @@ class SupabaseStorageLoader:
             
             if not response.path:
                 raise Exception(f"Upload failed: {response}")
-            
+
+            # 비공개 버킷에는 공개 주소가 없다. 주소는 서명으로만 나간다.
+            from app.storage.artifact_bucket import is_artifact_key, signed_url
+
+            if is_artifact_key(full_path):
+                url, expires_at = await asyncio.to_thread(signed_url, full_path)
+                return {
+                    'file_path': full_path,
+                    'file_name': file_name,
+                    'original_file_name': file_name,
+                    'signed_url': url,
+                    'url_expires_at': expires_at,
+                    'content_type': content_type
+                }
+
             # Get public URL
-            public_url_response = self.supabase.storage.from_("files").get_public_url(full_path)
+            public_url_response = self.supabase.storage.from_(target_bucket).get_public_url(full_path)
             public_url = public_url_response.get('publicURL', '') if isinstance(public_url_response, dict) else str(public_url_response)
 
             return {

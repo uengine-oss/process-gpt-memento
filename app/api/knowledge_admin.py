@@ -32,6 +32,7 @@ from app.services.knowledge_files import (
 )
 from app.services.rag_chain import get_rag_chain
 from app.storage.supabase_loader import SupabaseStorageLoader
+from app.storage.artifact_bucket import bucket_for
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -624,7 +625,7 @@ async def get_knowledge_file_url(
             url: Optional[str] = None
             # 1) signed URL 시도 (private 버킷 대응) — 1시간 만료
             try:
-                signed = supabase.storage.from_("files").create_signed_url(source_ref, 3600)
+                signed = supabase.storage.from_(bucket_for(source_ref)).create_signed_url(source_ref, 3600)
                 if isinstance(signed, dict):
                     url = signed.get("signedURL") or signed.get("signedUrl") or signed.get("url")
                 else:
@@ -634,7 +635,7 @@ async def get_knowledge_file_url(
 
             # 2) public URL fallback
             if not url:
-                public = supabase.storage.from_("files").get_public_url(source_ref)
+                public = supabase.storage.from_(bucket_for(source_ref)).get_public_url(source_ref)
                 url = public.get("publicURL") if isinstance(public, dict) else str(public)
 
 

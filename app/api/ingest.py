@@ -1,6 +1,7 @@
 """인제스트 라우터: /process, /process-output, /save-to-storage."""
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 from datetime import datetime
@@ -24,6 +25,12 @@ from app.services.ingest.pipeline import (
 )
 from app.services.ingest.state import cleanup_drive_jobs, drive_jobs, tenant_active_job
 from app.services.rag_chain import get_rag_chain
+from app.storage.artifact_bucket import (
+    ARTIFACT_BUCKET,
+    DEFAULT_TTL_SECONDS,
+    new_key as new_artifact_key,
+    signed_url as artifact_signed_url,
+)
 from app.storage.supabase_loader import SupabaseStorageLoader
 
 router = APIRouter()
@@ -381,11 +388,15 @@ async def save_to_storage(
         proc_inst_id = None
         room_id = None
         raw_only = False
+        private = False
         if options:
             try:
                 options_dict = json.loads(options)
                 proc_inst_id = options_dict.get("proc_inst_id")
                 room_id = options_dict.get("room_id")
+                # 에이전트 산출물은 비공개 버킷에 넣고 서명 주소로만 내보낸다.
+                # 사용자가 올린 첨부와 달리, 이건 우리가 만들어 준 결과물이다.
+                private = bool(options_dict.get("private"))
                 # 원본만 보관: 첨부를 워크스페이스의 실제 파일로 읽는 대화(Codex)는
                 # 벡터 검색을 쓰지 않는다. 그쪽에는 VLM 판독과 임베딩이 순수 낭비이고,
                 # 업로드가 느려지고 실패할 이유만 늘어난다.
@@ -398,7 +409,9 @@ async def save_to_storage(
         file_extension = Path(file_name).suffix.lower()
 
         # 채팅방 직접 첨부 정책 — 프론트 검증을 우회해도 서버에서 동일하게 차단한다.
-        if room_id:
+        # 산출물(private)은 이 정책을 타지 않는다. 사람이 올리는 첨부를 좁히려고 둔 제한이라
+        # 여기에 걸면 에이전트가 만든 csv·png·md 가 주소 없이 사라진다.
+        if room_id and not private:
             # /process-session-file 의 _CHAT_ALLOWED_EXTS 및 프론트 채팅 첨부 목록과 같은 집합이어야
             # 한다. 여기만 좁으면 업로드가 400 이라 URL 이 안 생기고, 에이전트는 파일이 없는 것처럼 돈다.
             chat_allowed_extensions = {".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".pptx", ".txt", ".xlsx"}
@@ -419,15 +432,63 @@ async def save_to_storage(
             f"raw_only={raw_only} options={options!r}"
         )
 
+        if private:
+            artifact_allowed_extensions = {
+                ".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".pptx", ".xlsx",
+                ".csv", ".json", ".txt", ".md", ".markdown", ".png", ".jpg", ".jpeg",
+            }
+            artifact_max_file_size = 50 * 1024 * 1024
+            if file_extension not in artifact_allowed_extensions:
+                raise HTTPException(status_code=400, detail=f"지원하지 않는 산출물 형식입니다: {file_extension}")
+            if len(file_content) > artifact_max_file_size:
+                raise HTTPException(status_code=413, detail="산출물은 50MB 이하만 저장할 수 있습니다.")
+
         storage_loader = SupabaseStorageLoader()
-        upload_result = await storage_loader.upload_file_to_storage(
-            file_content, file_name, folder_path="files"
-        )
+        if private:
+            upload_result = await storage_loader.upload_file_to_storage(
+                file_content, file_name,
+                bucket=ARTIFACT_BUCKET, key=new_artifact_key(file_name),
+            )
+        else:
+            upload_result = await storage_loader.upload_file_to_storage(
+                file_content, file_name, folder_path="files"
+            )
         storage_file_path = upload_result["file_path"]
         print(f"[ingest:save-to-storage] uploaded path={storage_file_path}")
 
+        # 주소는 한 벌로 묶어 모든 응답 갈래가 같은 것을 돌려주게 한다. 갈래마다 따로
+        # 채우던 때는 벡터 처리에 실패한 응답에만 주소가 빠져 화면에서 파일이 사라졌다.
+        url_fields = {
+            "public_url": upload_result.get("public_url"),
+            "signed_url": upload_result.get("signed_url"),
+            "url_expires_at": upload_result.get("url_expires_at"),
+            "file_url": upload_result.get("signed_url") or upload_result.get("public_url"),
+        }
+
+        if private:
+            # 산출물은 올리자마자 카탈로그에 올린다. 아래의 파싱·색인 갈래는 형식에 따라
+            # 중간에 빠져나가고(본문을 못 뽑은 파일, 벡터 저장 실패), 그 갈래로 나가면 등록이
+            # 남지 않는다. 등록이 없으면 /artifact-url 이 "이 조직의 산출물"임을 확인할 길이
+            # 없어 링크가 만료된 뒤 다시 발급해 줄 수 없다 — 파일을 영영 못 받는다.
+            from app.services.knowledge_files import register_uploaded_file, INDEX_STATUS_INDEXED
+            await register_uploaded_file(
+                tenant_id=tenant_id,
+                storage_path=storage_file_path,
+                file_name=file_name,
+                folder_path="",
+                mime_type=file.content_type,
+                size_bytes=len(file_content),
+                initial_status=INDEX_STATUS_INDEXED,
+                doc_role="content",
+            )
+
         image_extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]
-        is_image = file_extension in image_extensions
+        # 산출물 이미지는 이 갈래를 타지 않는다. 이 갈래는 비공개 산출물을 색인에 싣겠다고
+        # **공개 버킷에 같은 그림을 한 벌 더 올린다**(app/services/ingest/image.py) — 비공개로
+        # 둔 뜻이 그 자리에서 사라진다. 에이전트가 그린 그림은 원본만 보관한다.
+        is_image = file_extension in image_extensions and not private
+        if private and file_extension in image_extensions:
+            raw_only = True
         # 벡터 인덱싱 제외 확장자 — 표 격자는 청킹·임베딩이 무의미하다(아래 분기 주석 참고).
         skip_vector_index = file_extension in {".xlsx", ".xlsm"} or raw_only
 
@@ -466,15 +527,26 @@ async def save_to_storage(
             processor = get_document_processor()
 
             file_id_for_images = storage_file_path.replace("/", "_").replace("\\", "_")
-            uploaded_images = await processor.extract_and_upload_images_batched(
-                file_content, file_name, file_id_for_images, tenant_id, batch_size=15,
-            )
-            has_uploaded_images = len(uploaded_images) > 0
-
-            docs = await processor.load_document(file_io, file_name)
+            try:
+                uploaded_images = await processor.extract_and_upload_images_batched(
+                    file_content, file_name, file_id_for_images, tenant_id, batch_size=15,
+                )
+                has_uploaded_images = len(uploaded_images) > 0
+                docs = await processor.load_document(file_io, file_name)
+            except Exception:
+                # 산출물의 본문 추출은 있으면 좋은 것이지, 내주는 조건이 아니다. 보관은 이미
+                # 끝났다 — 여기서 예외가 올라가면 주소가 호출자에게 돌아가지 못해, 만들어 놓고
+                # 못 내주는 꼴이 된다. 산출물 형식은 첨부보다 넓어서(csv·md·png) 여기 걸리기 쉽다.
+                if not private:
+                    raise
+                print(f"[ingest:save-to-storage] 산출물 본문 추출 실패 → 보관만 (file={file_name!r})")
+                docs = []
             if not docs:
-                raise HTTPException(status_code=400, detail="Failed to load document")
-            page_docs_for_reg = docs  # document_pages 등록용(페이지 단위 본문)
+                if not private:
+                    raise HTTPException(status_code=400, detail="Failed to load document")
+                documents = []
+                skip_vector_index = True
+            page_docs_for_reg = docs or None  # document_pages 등록용(페이지 단위 본문)
 
             if skip_vector_index:
                 # 엑셀은 셀 격자라 의미 검색 대상이 아니다. 표를 800자로 잘라 임베딩하면 행이
@@ -510,7 +582,7 @@ async def save_to_storage(
                 "message": "File uploaded to storage (no content extracted)",
                 "file_path": storage_file_path,
                 "file_name": file_name,
-                "public_url": upload_result.get("public_url"),
+                **url_fields,
                 "processed": False,
             }
 
@@ -524,7 +596,7 @@ async def save_to_storage(
                     "message": "File uploaded to storage (vector processing failed)",
                     "file_path": storage_file_path,
                     "file_name": file_name,
-                    "public_url": upload_result.get("public_url"),
+                    **url_fields,
                     "processed": False,
                 }
 
@@ -560,7 +632,7 @@ async def save_to_storage(
             "file_id": storage_file_path,   # ← 프론트가 이걸 에이전트 payload 로 넘기면 재-ingest 스킵
             "file_path": storage_file_path,
             "file_name": file_name,
-            "public_url": upload_result.get("public_url"),
+            **url_fields,
             "processed": True,
         }
 
@@ -568,3 +640,40 @@ async def save_to_storage(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/artifact-url")
+async def artifact_url(tenant_id: str, file_id: str, ttl_seconds: int = DEFAULT_TTL_SECONDS):
+    """산출물의 서명 주소를 다시 발급한다.
+
+    서명 주소는 만료된다. 어제 대화를 열어 파일을 받으려는 사람은 그때 새 주소가 필요하다.
+    그래서 화면은 만료된 주소를 쓰는 대신 이 엔드포인트로 다시 받아 간다.
+
+    **다른 조직의 산출물을 내주지 않는다.** 객체 키를 알아도 그 키가 이 조직의 것으로
+    등록돼 있지 않으면 발급하지 않는다 — 키는 우연히도, 실수로도 새어 나갈 수 있다.
+    """
+    if not tenant_id or not file_id:
+        raise HTTPException(status_code=400, detail="tenant_id and file_id required")
+
+    try:
+        result = await asyncio.to_thread(
+            supabase.table("knowledge_files")
+            .select("source_ref")
+            .eq("tenant_id", tenant_id)
+            .eq("source_ref", file_id)
+            .limit(1)
+            .execute
+        )
+        rows = result.data or []
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"lookup failed: {exc}")
+
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"file_id not found in tenant '{tenant_id}'")
+
+    try:
+        url, expires_at = await asyncio.to_thread(artifact_signed_url, file_id, ttl_seconds)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"sign failed: {exc}")
+
+    return {"file_id": file_id, "file_url": url, "url_expires_at": expires_at}
