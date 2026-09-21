@@ -658,7 +658,7 @@ async def artifact_url(tenant_id: str, file_id: str, ttl_seconds: int = DEFAULT_
     try:
         result = await asyncio.to_thread(
             supabase.table("knowledge_files")
-            .select("source_ref")
+            .select("source_ref, file_name")
             .eq("tenant_id", tenant_id)
             .eq("source_ref", file_id)
             .limit(1)
@@ -676,4 +676,11 @@ async def artifact_url(tenant_id: str, file_id: str, ttl_seconds: int = DEFAULT_
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"sign failed: {exc}")
 
-    return {"file_id": file_id, "file_url": url, "url_expires_at": expires_at}
+    # 이름도 함께 돌려준다. 답변 본문에 박힌 링크에는 이름이 없어서, 이것이 없으면
+    # 사용자가 받는 파일이 `752d7a33-….xlsx` 같은 객체 키로 떨어진다 — 무엇인지 알 수 없다.
+    return {
+        "file_id": file_id,
+        "file_url": url,
+        "url_expires_at": expires_at,
+        "file_name": str(rows[0].get("file_name") or ""),
+    }
