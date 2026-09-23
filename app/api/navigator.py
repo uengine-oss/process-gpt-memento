@@ -666,9 +666,12 @@ async def document_raw(
     if not source_ref:
         raise HTTPException(status_code=500, detail="source_ref empty")
 
+    # 산출물은 비공개 버킷에 있다. 키의 접두사가 어느 버킷인지 말한다.
+    from app.storage.artifact_bucket import bucket_for
+
     try:
         data: bytes = await asyncio.to_thread(
-            supabase.storage.from_("files").download, source_ref
+            supabase.storage.from_(bucket_for(source_ref)).download, source_ref
         )
     except Exception as e:
         logger.exception("[/document/raw] download failed (path=%s): %s", source_ref, e)

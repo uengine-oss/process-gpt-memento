@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 from app.core.supabase_client import supabase
+from app.storage.artifact_bucket import bucket_for
 
 logger = logging.getLogger(__name__)
 
@@ -420,7 +421,7 @@ async def delete_entry(
     if source_type == "upload":
         try:
             await asyncio.to_thread(
-                supabase.storage.from_("files").remove, [source_ref]
+                supabase.storage.from_(bucket_for(source_ref)).remove, [source_ref]
             )
             result["storage_deleted"] = True
         except Exception as e:

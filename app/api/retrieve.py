@@ -1,11 +1,14 @@
 """검색/조회 라우터: /search, /retrieve, /documents/list, /documents/full-text.
 
+/documents/chunks-metadata, /retrieve-by-indices, /preview/pdf-highlight 는 office-mcp 가 호출한다.
+
 벡터 검색은 에이전트가 진입점을 잡는 힌트다(codex 미러의 HINTS.md). 문서를 실제로 읽는
 경로는 navigator/folders 라우터의 지도(카드·grep·페이지)이고, 여기는 그 보조다.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from typing import List, Optional
 
@@ -13,8 +16,10 @@ from fastapi import APIRouter, HTTPException, Query
 from langchain.schema import Document
 
 from app.core.supabase_client import supabase
+from app.schemas import RetrieveByIndicesRequest
 from app.services.glossary import retrieve_glossary_terms
 from app.services.rag_chain import get_rag_chain
+from app.storage.artifact_bucket import bucket_for
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -454,3 +459,146 @@ async def get_full_text(
     )
     return out
 
+
+@router.get("/documents/chunks-metadata")
+async def get_chunks_metadata(tenant_id: str, file_name: str, drive_folder_id: Optional[str] = None):
+    """특정 문서의 모든 청크 메타데이터를 반환."""
+    try:
+        from app.services.vector_store import get_vector_store
+        vsm = get_vector_store()
+        chunks = await vsm.get_all_chunks_metadata(
+            tenant_id=tenant_id,
+            file_name=file_name,
+            drive_folder_id=drive_folder_id,
+        )
+        return {"file_name": file_name, "total_chunks": len(chunks), "chunks": chunks}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/preview/pdf-highlight")
+async def preview_pdf_highlight(
+    tenant_id: str,
+    file_id: str,
+    page: int,
+    bbox: str,
+    dpi: int = 150,
+):
+    """PDF 한 페이지 + bbox 하이라이트를 PNG로 렌더링해 Supabase에 캐시 후 public URL 반환."""
+    import pymupdf
+
+    try:
+        bbox_parts = [float(v.strip()) for v in bbox.split(",")]
+        if len(bbox_parts) != 4:
+            raise ValueError("bbox must be 'x0,y0,x1,y1'")
+        x0, y0, x1, y1 = bbox_parts
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid bbox: {exc}")
+    if not file_id:
+        raise HTTPException(status_code=400, detail="file_id required")
+
+    cache_key_src = f"{file_id}|{page}|{x0:.2f},{y0:.2f},{x1:.2f},{y1:.2f}|dpi={dpi}"
+    cache_key = hashlib.sha1(cache_key_src.encode("utf-8")).hexdigest()
+    cache_path = f"pdf-highlight-cache/{tenant_id}/{cache_key}.png"
+
+    try:
+        existing = await asyncio.to_thread(
+            supabase.storage.from_("files").download, cache_path
+        )
+        if existing:
+            public_url_resp = supabase.storage.from_("files").get_public_url(cache_path)
+            cached_url = (
+                public_url_resp.get("publicURL", "")
+                if isinstance(public_url_resp, dict) else str(public_url_resp)
+            )
+            if cached_url:
+                return {
+                    "url": cached_url,
+                    "cache_key": cache_key,
+                    "page": page,
+                    "cached": True,
+                }
+    except Exception:
+        pass
+
+    try:
+        pdf_bytes = await asyncio.to_thread(
+            supabase.storage.from_(bucket_for(file_id)).download, file_id
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"PDF not found in storage: {file_id} ({exc})")
+    if not pdf_bytes:
+        raise HTTPException(status_code=404, detail=f"PDF empty: {file_id}")
+
+    def _render() -> tuple[bytes, int, int]:
+        pdf = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            if page < 0 or page >= pdf.page_count:
+                raise ValueError(f"page {page} out of range (0..{pdf.page_count - 1})")
+            pg = pdf.load_page(page)
+            rect = pymupdf.Rect(x0, y0, x1, y1)
+            rect = rect & pg.rect
+            pg.draw_rect(
+                rect,
+                color=(1, 0.75, 0),
+                fill=(1, 0.92, 0.2),
+                fill_opacity=0.35,
+                width=1.5,
+            )
+            pix = pg.get_pixmap(dpi=dpi)
+            return pix.tobytes("png"), pix.width, pix.height
+        finally:
+            pdf.close()
+
+    try:
+        png_bytes, img_w, img_h = await asyncio.to_thread(_render)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"render failed: {exc}")
+
+    try:
+        await asyncio.to_thread(
+            supabase.storage.from_("files").upload,
+            cache_path,
+            png_bytes,
+            {"content-type": "image/png", "upsert": "true"},
+        )
+    except Exception as exc:
+        print(f"[pdf-highlight] 캐시 업로드 실패: {exc}")
+
+    public_url_resp = supabase.storage.from_("files").get_public_url(cache_path)
+    public_url = (
+        public_url_resp.get("publicURL", "")
+        if isinstance(public_url_resp, dict) else str(public_url_resp)
+    )
+    return {
+        "url": public_url,
+        "cache_key": cache_key,
+        "page": page,
+        "width": img_w,
+        "height": img_h,
+        "cached": False,
+    }
+
+
+@router.post("/retrieve-by-indices")
+async def retrieve_by_indices(request: RetrieveByIndicesRequest):
+    """LLM이 선택한 chunk_index 리스트로 청크를 직접 조회."""
+    try:
+        from app.services.vector_store import get_vector_store
+        vsm = get_vector_store()
+        docs = await vsm.get_chunks_by_indices(
+            tenant_id=request.tenant_id,
+            file_name=request.file_name,
+            chunk_indices=request.chunk_indices,
+            drive_folder_id=request.drive_folder_id,
+        )
+        return {
+            "response": [
+                {"page_content": doc.page_content, "metadata": doc.metadata}
+                for doc in docs
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
