@@ -18,7 +18,7 @@ from app.core import config
 
 # 필터에 실제로 쓰이는 metadata 키. Qdrant 는 payload 인덱스가 없는 키로 필터하면
 # 세그먼트를 전수 스캔하므로(on_disk_payload 면 디스크까지 훑는다) 반드시 인덱싱한다.
-# 출처: app/api/retrieve.py, app/api/folders.py, app/api/legal_review.py,
+# 출처: app/api/retrieve.py, app/api/folders.py,
 #       app/services/knowledge_files.py 의 필터 구성부.
 #
 # ★ 여기에 *쓰지도 않는 키*를 넣지 말 것. payload 인덱스는 RAM 에 상주하고, 값이 고유할수록

@@ -191,48 +191,21 @@ async def mark_status(
         logger.warning("[knowledge_files] mark_status failed (%s): %s", status, e)
 
 
-VALID_DOC_ROLES = ("content", "glossary", "template", "reference", "dataset", "legal_review")
+# ── 업로드 허용 확장자 ────────────────────────────────────────────────────
+# 관문은 하나뿐이다: 파서가 페이지를 만들 수 있는 형식인가.
+# 지도의 값어치는 완결성에서 나오므로 올라온 파일은 분류 없이 전부 같은 길을 간다
+# (페이지 저장 → 문서 카드 → 폴더 카드). 읽히지 않은 문서는 지도에 no_text 로 남는다.
+# 화이트리스트를 두는 이유는 하나 — 지도에 보이지도 않을 파일이 스토리지에 쌓이는 것 방지.
+ALLOWED_EXTENSIONS: tuple = (
+    ".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".pptx", ".txt", ".csv", ".xlsx",
+)
 
 
-def normalize_doc_role(role: Optional[str]) -> str:
-    """클라이언트가 보낸 doc_role 값 정규화 — 미지정/오타는 'content' 폴백."""
-    r = (role or "").strip().lower()
-    return r if r in VALID_DOC_ROLES else "content"
-
-
-# 내부 호환용 alias (기존 코드가 underscore 버전 import 한 경우 대비)
-_normalize_doc_role = normalize_doc_role
-
-
-# ── 업로드 허용 확장자 정책 (doc_role 별) ──────────────────────────────────
-# 지식베이스 업로드는 분류(doc_role)별로 받는 확장자를 제한한다.
-#   content/reference          : 일반 문서 (pdf/hwp/hwpx/doc/docx/pptx/txt)
-#   glossary (용어 사전)       : 고정형 CSV(영문,한글뜻,약어) 전용 — glossary_terms 테이블로
-#                                직행시키는 소스 (term-lock 소비). csv 만 허용.
-#   template (양식)            : 편집형 양식만 (hwpx/docx)
-#   dataset (데이터)           : 정량 데이터만 (xlsx)
-#   legal_review (검토 사례)   : 변호사 메모 추출이 docx XML 한정 → docx 만
-_DOC_EXTS: tuple = (".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".pptx", ".txt")
-ROLE_ALLOWED_EXTENSIONS: Dict[str, tuple] = {
-    "content": _DOC_EXTS,
-    "glossary": (".csv",),
-    "reference": _DOC_EXTS,
-    "template": (".hwpx", ".docx"),
-    "dataset": (".xlsx",),
-    "legal_review": (".docx",),
-}
-
-
-def allowed_extensions_for_role(role: Optional[str]) -> tuple:
-    """해당 doc_role 에서 업로드 허용되는 확장자 튜플."""
-    return ROLE_ALLOWED_EXTENSIONS.get(normalize_doc_role(role), _DOC_EXTS)
-
-
-def is_extension_allowed_for_role(file_name: str, role: Optional[str]) -> bool:
-    """file_name 의 확장자가 해당 doc_role 에서 허용되는지."""
+def is_extension_allowed(file_name: str) -> bool:
+    """file_name 의 확장자가 지식베이스 업로드에서 허용되는지."""
     name = file_name or ""
     ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
-    return ext in allowed_extensions_for_role(role)
+    return ext in ALLOWED_EXTENSIONS
 
 
 async def register_uploaded_file(
@@ -247,7 +220,6 @@ async def register_uploaded_file(
     file_hash: Optional[str] = None,
     uploaded_by_uid: Optional[str] = None,
     uploaded_by_name: Optional[str] = None,
-    doc_role: Optional[str] = None,
 ) -> None:
     """직접 업로드한 파일을 knowledge_files에 등록한다 (source_type='upload')."""
     payload = {
@@ -264,7 +236,6 @@ async def register_uploaded_file(
         "uploaded_by_name": uploaded_by_name,
         "file_hash": file_hash,
         "index_status": initial_status,
-        "doc_role": _normalize_doc_role(doc_role),
         "modified_time": datetime.utcnow().isoformat(),
     }
     try:
@@ -974,14 +945,9 @@ async def _move_one_file(
     return True
 
 
-async def rename_folder(
-    tenant_id: str,
-    old_path: str,
-    new_path: str,
-    doc_role: Optional[str] = None,
-) -> int:
-    """upload 소스의 폴더 이름을 변경. doc_role 지정 시 해당 role 안에서만.
-    - knowledge_files.folder_path prefix 치환 (role scope)
+async def rename_folder(tenant_id: str, old_path: str, new_path: str) -> int:
+    """upload 소스의 폴더 이름을 변경.
+    - knowledge_files.folder_path prefix 치환
     - storage 객체도 새 경로로 move
     - documents.metadata.file_id, processed_files.file_id 도 동기화
 
@@ -990,7 +956,6 @@ async def rename_folder(
     if not old_path or not new_path or old_path == new_path:
         return 0
 
-    role = _normalize_doc_role(doc_role) if doc_role else None
     affected = 0
 
     # 1) 정확히 그 폴더의 파일들
@@ -1002,8 +967,6 @@ async def rename_folder(
             .eq("source_type", "upload")
             .eq("folder_path", old_path)
         )
-        if role:
-            eq = eq.eq("doc_role", role)
         exact = await asyncio.to_thread(eq.execute)
         for row in (exact.data or []):
             ok = await _move_one_file(tenant_id, row, new_path)
@@ -1021,8 +984,6 @@ async def rename_folder(
             .eq("source_type", "upload")
             .like("folder_path", f"{old_path}/%")
         )
-        if role:
-            cq = cq.eq("doc_role", role)
         children = await asyncio.to_thread(cq.execute)
         for row in (children.data or []):
             old_folder = row.get("folder_path") or ""
@@ -1034,7 +995,7 @@ async def rename_folder(
         logger.warning("[knowledge_files] rename children query failed: %s", e)
 
     # 3) knowledge_folders 메타 row도 같이 갱신 (빈 폴더 영속화)
-    await rename_folder_meta(tenant_id, old_path, new_path, doc_role=role)
+    await rename_folder_meta(tenant_id, old_path, new_path)
 
     return affected
 
@@ -1043,11 +1004,9 @@ async def list_files_in_folder_recursive(
     tenant_id: str,
     folder_path: str,
     source_type: str = "upload",
-    doc_role: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """특정 폴더 + 그 하위에 속한 파일 row 반환. doc_role 지정 시 해당 role 안에서만."""
+    """특정 폴더 + 그 하위에 속한 파일 row 반환."""
     rows: List[Dict[str, Any]] = []
-    role = _normalize_doc_role(doc_role) if doc_role else None
     try:
         eq = (
             supabase.table("knowledge_files")
@@ -1056,8 +1015,6 @@ async def list_files_in_folder_recursive(
             .eq("source_type", source_type)
             .eq("folder_path", folder_path)
         )
-        if role:
-            eq = eq.eq("doc_role", role)
         exact = await asyncio.to_thread(eq.execute)
         rows.extend(exact.data or [])
     except Exception as e:
@@ -1071,8 +1028,6 @@ async def list_files_in_folder_recursive(
             .eq("source_type", source_type)
             .like("folder_path", f"{folder_path}/%")
         )
-        if role:
-            cq = cq.eq("doc_role", role)
         children = await asyncio.to_thread(cq.execute)
         rows.extend(children.data or [])
     except Exception as e:
@@ -1085,20 +1040,17 @@ async def list_folders_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
     """knowledge_folders 테이블에서 빈 폴더 포함 모든 등록된 폴더 row 반환.
 
     Returns:
-        [{"folder_path": str, "doc_role": str}, ...]
+        [{"folder_path": str}, ...]
     """
     try:
         result = await asyncio.to_thread(
             supabase.table("knowledge_folders")
-            .select("folder_path, doc_role")
+            .select("folder_path")
             .eq("tenant_id", tenant_id)
             .execute
         )
         return [
-            {
-                "folder_path": r["folder_path"],
-                "doc_role": (r.get("doc_role") or "content"),
-            }
+            {"folder_path": r["folder_path"]}
             for r in (result.data or [])
             if r.get("folder_path")
         ]
@@ -1107,16 +1059,16 @@ async def list_folders_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
         return []
 
 
-async def create_folder(tenant_id: str, folder_path: str, doc_role: Optional[str] = None) -> bool:
+async def create_folder(tenant_id: str, folder_path: str) -> bool:
+    # doc_role 은 knowledge_folders 유니크 키에 남아 있어 상수로 채운다(스키마 미변경).
     folder_path = (folder_path or "").strip().strip("/")
     if not folder_path:
         return False
-    role = _normalize_doc_role(doc_role)
     try:
         await asyncio.to_thread(
             supabase.table("knowledge_folders")
             .upsert(
-                {"tenant_id": tenant_id, "folder_path": folder_path, "doc_role": role},
+                {"tenant_id": tenant_id, "folder_path": folder_path, "doc_role": "content"},
                 on_conflict="tenant_id,doc_role,folder_path",
             )
             .execute
@@ -1127,18 +1079,12 @@ async def create_folder(tenant_id: str, folder_path: str, doc_role: Optional[str
         return False
 
 
-async def rename_folder_meta(
-    tenant_id: str,
-    old_path: str,
-    new_path: str,
-    doc_role: Optional[str] = None,
-) -> int:
+async def rename_folder_meta(tenant_id: str, old_path: str, new_path: str) -> int:
     """knowledge_folders 테이블에서 폴더 row 자체와 자식 폴더들 prefix 치환.
-    rename_folder()에서 함께 호출됨. doc_role 지정 시 해당 role 안에서만 적용.
+    rename_folder()에서 함께 호출됨.
     """
     if not old_path or not new_path or old_path == new_path:
         return 0
-    role = _normalize_doc_role(doc_role) if doc_role else None
     affected = 0
     try:
         q = (
@@ -1147,8 +1093,6 @@ async def rename_folder_meta(
             .eq("tenant_id", tenant_id)
             .eq("folder_path", old_path)
         )
-        if role:
-            q = q.eq("doc_role", role)
         await asyncio.to_thread(q.execute)
         affected += 1
     except Exception as e:
@@ -1161,8 +1105,6 @@ async def rename_folder_meta(
             .eq("tenant_id", tenant_id)
             .like("folder_path", f"{old_path}/%")
         )
-        if role:
-            cq = cq.eq("doc_role", role)
         children = await asyncio.to_thread(cq.execute)
         for row in (children.data or []):
             old_p = row.get("folder_path") or ""
@@ -1183,17 +1125,10 @@ async def rename_folder_meta(
     return affected
 
 
-async def delete_folder_meta(
-    tenant_id: str,
-    folder_path: str,
-    doc_role: Optional[str] = None,
-) -> int:
-    """knowledge_folders에서 해당 폴더 + 모든 자식 폴더 row 삭제.
-    doc_role 지정 시 해당 role 안에서만 삭제.
-    """
+async def delete_folder_meta(tenant_id: str, folder_path: str) -> int:
+    """knowledge_folders에서 해당 폴더 + 모든 자식 폴더 row 삭제."""
     if not folder_path:
         return 0
-    role = _normalize_doc_role(doc_role) if doc_role else None
     try:
         q1 = (
             supabase.table("knowledge_folders")
@@ -1201,8 +1136,6 @@ async def delete_folder_meta(
             .eq("tenant_id", tenant_id)
             .eq("folder_path", folder_path)
         )
-        if role:
-            q1 = q1.eq("doc_role", role)
         await asyncio.to_thread(q1.execute)
 
         q2 = (
@@ -1211,8 +1144,6 @@ async def delete_folder_meta(
             .eq("tenant_id", tenant_id)
             .like("folder_path", f"{folder_path}/%")
         )
-        if role:
-            q2 = q2.eq("doc_role", role)
         await asyncio.to_thread(q2.execute)
         return 1
     except Exception as e:
@@ -1259,7 +1190,7 @@ async def get_entry(
             supabase.table("knowledge_files")
             .select(
                 "source_type, source_ref, file_name, folder_path, owner, "
-                "uploaded_by_uid, uploaded_by_name, doc_role"
+                "uploaded_by_uid, uploaded_by_name"
             )
             .eq("tenant_id", tenant_id)
             .eq("source_type", source_type)
@@ -1274,37 +1205,12 @@ async def get_entry(
         return None
 
 
-async def list_by_role(
-    tenant_id: str,
-    doc_role: str,
-    source_refs: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    """tenant 안에서 doc_role 매칭 파일 row 반환 (옵션: source_refs로 추가 필터)."""
-    if not tenant_id or not doc_role:
-        return []
-    try:
-        q = (
-            supabase.table("knowledge_files")
-            .select("source_type, source_ref, file_name, folder_path, doc_role")
-            .eq("tenant_id", tenant_id)
-            .eq("doc_role", doc_role)
-        )
-        cleaned = [s for s in (source_refs or []) if s]
-        if cleaned:
-            q = q.in_("source_ref", cleaned)
-        result = await asyncio.to_thread(q.execute)
-        return list(result.data or [])
-    except Exception as e:
-        logger.warning("[knowledge_files] list_by_role(%s) failed: %s", doc_role, e)
-        return []
-
-
 # 프론트 목록/모달이 쓰는 knowledge_files 조회 필드(요약 상태만 평탄화, 무거운 doc_card 전체는 제외)
 _KF_LIST_SELECT = (
     "source_type, source_ref, file_name, folder_path, path, drive_folder_id, "
     "mime_type, size_bytes, modified_time, owner, "
     "uploaded_by_uid, uploaded_by_name, index_status, "
-    "index_error, indexed_at, updated_at, doc_role, "
+    "index_error, indexed_at, updated_at, "
     "abstract_status:doc_card->>abstract_status, abstract:doc_card->>abstract"
 )
 
@@ -1332,44 +1238,41 @@ async def list_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
 
 
 async def list_counts(tenant_id: str) -> Dict[str, Any]:
-    """가벼운 카운트 집계 — 폴더 lazy 로딩 시 트리 배지/역할 탭 카운트용.
+    """가벼운 카운트 집계 — 폴더 lazy 로딩 시 트리 배지용.
 
-    파일 전체 행(무거운 abstract 등) 대신 (folder_path, doc_role, index_status) 3개 컬럼만 읽어
-    role별 총계 / role별 폴더 직속 파일수 / 상태별 총계를 서버에서 집계해 *작은 JSON* 으로 반환한다.
-    (수만 건이어도 3컬럼이라 전체 조회보다 훨씬 가볍고, 프론트는 수만 항목을 렌더하지 않음)
+    파일 전체 행(무거운 abstract 등) 대신 (folder_path, index_status) 2개 컬럼만 읽어
+    폴더 직속 파일수 / 상태별 총계를 서버에서 집계해 *작은 JSON* 으로 반환한다.
+    (수만 건이어도 전체 조회보다 훨씬 가볍고, 프론트는 수만 항목을 렌더하지 않음)
     """
-    role_totals: Dict[str, int] = {}
-    folder_direct: Dict[str, Dict[str, int]] = {}
-    # 인덱싱 완료(indexed) 파일만의 role별 폴더 직속 카운트 — 채팅 모달(선택 가능한 파일만 노출)에서
+    folder_direct: Dict[str, int] = {}
+    # 인덱싱 완료(indexed) 파일만의 폴더 직속 카운트 — 채팅 모달(선택 가능한 파일만 노출)에서
     # 폴더 체크박스의 '전체 선택됨' 판정 기준. folder_direct 는 모든 상태 포함(목록 페이지 배지용).
-    folder_direct_indexed: Dict[str, Dict[str, int]] = {}
+    folder_direct_indexed: Dict[str, int] = {}
     status_totals: Dict[str, int] = {}
+    total = 0
     try:
         rows = (await asyncio.to_thread(
             supabase.table("knowledge_files")
-            .select("folder_path, doc_role, index_status, source_ref")
+            .select("folder_path, index_status, source_ref")
             .eq("tenant_id", tenant_id).limit(200000).execute
         )).data or []
     except Exception as e:
         logger.warning("[knowledge_files] list_counts failed: %s", e)
-        return {"role_totals": {}, "folder_direct": {}, "folder_direct_indexed": {}, "status_totals": {}}
+        return {"total": 0, "folder_direct": {}, "folder_direct_indexed": {}, "status_totals": {}}
     for r in rows:
-        # 채팅 첨부는 카운트에서 제외 (KB 브라우저 배지/역할탭 오염 방지)
+        # 채팅 첨부는 카운트에서 제외 (KB 브라우저 배지 오염 방지)
         if _is_chat_attachment_ref(r.get("source_ref")):
             continue
-        role = (r.get("doc_role") or "content")
         st = r.get("index_status") or "unknown"
         fp = (r.get("folder_path") or "").strip().strip("/")
-        role_totals[role] = role_totals.get(role, 0) + 1
+        total += 1
         status_totals[st] = status_totals.get(st, 0) + 1
         if fp:
-            d = folder_direct.setdefault(role, {})
-            d[fp] = d.get(fp, 0) + 1
+            folder_direct[fp] = folder_direct.get(fp, 0) + 1
             if st == "indexed":
-                di = folder_direct_indexed.setdefault(role, {})
-                di[fp] = di.get(fp, 0) + 1
+                folder_direct_indexed[fp] = folder_direct_indexed.get(fp, 0) + 1
     return {
-        "role_totals": role_totals,
+        "total": total,
         "folder_direct": folder_direct,
         "folder_direct_indexed": folder_direct_indexed,
         "status_totals": status_totals,
@@ -1416,7 +1319,6 @@ async def fetch_rows_by_folders(
     select_cols: str,
     folder_paths: List[str],
     *,
-    doc_role: Optional[str] = None,
     limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """여러 폴더의 *subtree* row 를 폴더 경로로 직접 조회(폴더 스코프).
@@ -1438,8 +1340,6 @@ async def fetch_rows_by_folders(
                     .eq("tenant_id", tenant_id)
                 )
                 q = q.eq("folder_path", p) if like is None else q.like("folder_path", like)
-                if doc_role:
-                    q = q.eq("doc_role", doc_role)
                 if limit is not None:
                     q = q.limit(limit)
                 rows = (await asyncio.to_thread(q.execute)).data or []

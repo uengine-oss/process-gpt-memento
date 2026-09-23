@@ -159,7 +159,7 @@ async def catalog(
 
     _CATALOG_COLS = (
         "source_ref, source_type, file_name, folder_path, path, mime_type, "
-        "size_bytes, modified_time, indexed_at, index_status, doc_card, doc_role"
+        "size_bytes, modified_time, indexed_at, index_status, doc_card"
     )
     try:
         # 개별(file_ids/names) 과 폴더 스코프를 *union* 으로 합친다(공존 스코프: 폴더 + 방 첨부 등).
@@ -213,7 +213,6 @@ async def catalog(
                 "index_status": r.get("index_status"),
                 "source_type": r.get("source_type"),
                 "doc_card": r.get("doc_card"),
-                "doc_role": r.get("doc_role") or "content",
             })
     except Exception as e:
         # knowledge_files 테이블이 없거나(PGRST205) 조회 실패해도 500 으로 죽지 않는다.
@@ -249,7 +248,6 @@ async def catalog(
                     "index_status": "indexed",
                     "source_type": "upload",
                     "doc_card": None,
-                    "doc_role": "content",
                 })
         except Exception as e2:
             logger.exception("[/catalog] processed_files 폴백도 실패: %s", e2)
@@ -260,134 +258,6 @@ async def catalog(
         tenant_id, len(cleaned_ids), len(cleaned_names), len(out),
     )
     return {"response": out}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GET /glossary/inline
-#
-# 선택된 file_ids 중 doc_role='glossary' 인 자료들의 본문(페이지 전체)을 모아
-# 반환한다. deep-agents-temp 의 채팅 진입점에서 호출 — 사용자 메시지에
-# ``[용어 사전 — 자동 첨부]`` 섹션으로 prepend 해서, 모든 sub 가 일관된
-# 용어 매핑을 보게 한다.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# 컨텍스트 폭주 방지를 위한 상한 (문자 단위, 대략 토큰의 4배)
-_GLOSSARY_INLINE_MAX_CHARS = 32_000
-
-
-@router.get("/glossary/inline")
-async def glossary_inline(
-    tenant_id: str,
-    file_ids: Optional[List[str]] = Query(default=None),
-    max_chars: int = Query(default=_GLOSSARY_INLINE_MAX_CHARS, ge=1_000, le=200_000),
-):
-    """선택된 file_ids 중 ``doc_role='glossary'`` 인 자료의 본문을 페이지 순으로 합쳐 반환.
-
-    Args:
-        tenant_id: 필수.
-        file_ids: knowledge_files.source_ref 리스트. *반드시 사용자가 선택한 파일* 만 넘긴다.
-        max_chars: 합쳐진 본문 길이 상한. 초과 시 truncate 표시 후 잘림.
-
-    Returns:
-        ``{"response": [{file_name, file_id, content, n_pages, truncated}, ...],
-          "total_chars": int, "truncated": bool}``
-    """
-    if not tenant_id:
-        raise HTTPException(status_code=400, detail="tenant_id required")
-
-    cleaned_ids = [str(x) for x in (file_ids or []) if x]
-    if not cleaned_ids:
-        return {"response": [], "total_chars": 0, "truncated": False}
-
-    try:
-        # ★ 우선순위: knowledge_files.glossary_compact (정제본 컬럼) > 페이지 합본 (fallback).
-        # 정제본은 ingest 시 LLM 추출로 만들어진 형식-자유 마크다운 → 토큰 크게 절약.
-        rows_resp = await asyncio.to_thread(
-            supabase.table("knowledge_files")
-            .select("source_ref, file_name, glossary_compact, doc_card")
-            .eq("tenant_id", tenant_id)
-            .eq("doc_role", "glossary")
-            .in_("source_ref", cleaned_ids)
-            .execute
-        )
-        glossary_rows = rows_resp.data or []
-        if not glossary_rows:
-            return {"response": [], "total_chars": 0, "truncated": False}
-
-        out: List[Dict[str, Any]] = []
-        total_chars = 0
-        global_truncated = False
-
-        for row in glossary_rows:
-            file_id = row.get("source_ref") or ""
-            if not file_id:
-                continue
-            file_name = row.get("file_name") or ""
-            compact = row.get("glossary_compact")
-            card = row.get("doc_card") if isinstance(row.get("doc_card"), dict) else {}
-
-            content: str
-            source: str
-            n_pages: int
-
-            if isinstance(compact, str) and compact.strip():
-                # 정제본 사용
-                content = compact.strip()
-                source = "compact"
-                n_pages = int(card.get("n_pages") or 0) if card else 0
-            else:
-                # fallback: 페이지 본문 합본
-                page_resp = await asyncio.to_thread(
-                    supabase.table("document_pages")
-                    .select("page_number, content")
-                    .eq("tenant_id", tenant_id)
-                    .eq("file_id", file_id)
-                    .order("page_number", desc=False)
-                    .execute
-                )
-                pages = page_resp.data or []
-                text_parts: List[str] = []
-                for p in pages:
-                    t = (p.get("content") or "").strip()
-                    if t:
-                        text_parts.append(t)
-                content = "\n\n".join(text_parts)
-                source = "raw_pages"
-                n_pages = len(pages)
-
-            # max_chars truncate (정제본·raw 공통)
-            file_truncated = False
-            remaining = max_chars - total_chars
-            if remaining <= 0:
-                file_truncated = True
-                content = ""
-                global_truncated = True
-            elif len(content) > remaining:
-                content = content[:remaining] + "\n…(truncated)"
-                file_truncated = True
-                global_truncated = True
-
-            total_chars += len(content)
-            out.append({
-                "file_name": file_name,
-                "file_id": file_id,
-                "n_pages": n_pages,
-                "content": content,
-                "truncated": file_truncated,
-                "source": source,    # 'compact' | 'raw_pages' (디버그·표시용)
-            })
-
-        logger.info(
-            "[/glossary/inline] tenant=%s ids=%d → %d glossary files, %d chars "
-            "(sources=%s, truncated=%s)",
-            tenant_id, len(cleaned_ids), len(out), total_chars,
-            [o["source"] for o in out], global_truncated,
-        )
-        return {"response": out, "total_chars": total_chars, "truncated": global_truncated}
-
-    except Exception as e:
-        logger.exception("[/glossary/inline] failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

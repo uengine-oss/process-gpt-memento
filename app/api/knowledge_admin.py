@@ -88,7 +88,6 @@ async def _index_uploaded_file(
     storage_path: str,
     file_content: bytes,
     file_name: str,
-    doc_role: Optional[str],
     public_url: Optional[str] = None,
 ) -> Optional[str]:
     """스토리지에 올라온 파일을 파싱해 지도에 올리고 ``index_status`` 를 갱신한다 (upload/reindex 공용).
@@ -99,17 +98,8 @@ async def _index_uploaded_file(
     문서 카드는 백그라운드, 벡터 인덱스(검색 힌트)는 그 뒤의 보조 단계라 실패해도
     ``indexed`` 를 되돌리지 않고 ``index_error`` 에만 남긴다.
 
-    ── doc_role 별 정책 ──
-      content/reference : 페이지 + 카드 + (보조) 청킹·임베딩
-      glossary/template : 페이지만 저장
-      dataset           : 페이지 없음, workbook_card 만 추출해 doc_card 저장
+    분류는 없다. 올라온 파일은 전부 같은 길을 간다 — 지도의 값어치가 완결성에서 나오므로.
     """
-    from app.services.knowledge_files import normalize_doc_role  # 동일 정규화 사용
-    role_norm = normalize_doc_role(doc_role)
-    skip_chunking_and_embedding = role_norm in ("glossary", "template", "dataset")
-    skip_abstract = role_norm in ("glossary", "template", "dataset")
-    skip_page_extraction = role_norm == "dataset"  # dataset 은 페이지 단위 자체가 의미 없음
-
     file_extension = Path(file_name).suffix.lower()
     image_extensions = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
     is_image = file_extension in image_extensions
@@ -133,31 +123,6 @@ async def _index_uploaded_file(
             )
             for doc in (documents or []):
                 doc.metadata["knowledge_scope"] = "global"
-        elif skip_page_extraction:
-            # dataset role — 페이지/청킹/임베딩 모두 skip. workbook_card 만 추출해 doc_card 에 저장.
-            # 아래 `if skip_chunking_and_embedding:` 블록이 mark_status(indexed) 처리.
-            from app.services.workbook_card import extract_workbook_card
-            from app.core.supabase_client import supabase
-            card = extract_workbook_card(file_content, file_name)
-            try:
-                await asyncio.to_thread(
-                    supabase.table("knowledge_files")
-                        .update({"doc_card": card})
-                        .eq("tenant_id", tenant_id)
-                        .eq("source_type", "upload")
-                        .eq("source_ref", storage_path)
-                        .execute
-                )
-                logger.info(
-                    "[knowledge_admin] %s: dataset ingest (workbook_card saved, n_sheets=%d)",
-                    file_name, len(card.get("sheets", [])),
-                )
-            except Exception as card_err:
-                logger.warning(
-                    "[knowledge_admin] %s: workbook_card save failed: %s",
-                    file_name, card_err,
-                )
-            documents = []
         else:
             file_io = io.BytesIO(file_content)
             processor = get_document_processor()
@@ -165,118 +130,24 @@ async def _index_uploaded_file(
             if docs:
                 # 페이지 저장이 곧 "읽을 수 있음" — file_id 는 storage_path (chunk metadata.file_id 와 동일).
                 from app.services.document_pages import post_load_hook
-                pages_saved = await post_load_hook(
-                    tenant_id, storage_path, docs,
-                    skip_abstract=skip_abstract,
-                )
+                pages_saved = await post_load_hook(tenant_id, storage_path, docs)
 
-                if not skip_chunking_and_embedding:
-                    if role_norm == "legal_review":
-                        # 검토 사례 — 조항 단위 구조화 청크(사업배경 1개 + 조항 N개, 메모 동승).
-                        # 일반 청킹(process_documents) 대신 전용 구조화기 사용.
-                        from app.services.legal_review import build_legal_review_documents
-                        documents = await asyncio.to_thread(
-                            build_legal_review_documents,
-                            file_content, file_name, storage_path, tenant_id,
-                        )
-                        logger.info(
-                            "[knowledge_admin] %s: legal_review 구조화 (chunks=%d)",
-                            file_name, len(documents or []),
-                        )
-                    else:
-                        documents = await processor.process_documents(docs, {
-                            "storage_type": "storage",
-                            "file_path": storage_path,
-                            "file_name": file_name,
-                            "tenant_id": tenant_id,
-                        })
-                        for doc in documents:
-                            doc.metadata.update({
-                                "file_id": storage_path,
-                                "file_name": file_name,
-                                "tenant_id": tenant_id,
-                                "storage_type": "storage",
-                                "knowledge_scope": "global",
-                            })
+                documents = await processor.process_documents(docs, {
+                    "storage_type": "storage",
+                    "file_path": storage_path,
+                    "file_name": file_name,
+                    "tenant_id": tenant_id,
+                })
+                for doc in documents:
+                    doc.metadata.update({
+                        "file_id": storage_path,
+                        "file_name": file_name,
+                        "tenant_id": tenant_id,
+                        "storage_type": "storage",
+                        "knowledge_scope": "global",
+                    })
 
-        if skip_chunking_and_embedding:
-            # glossary/template — 페이지 저장만으로 인덱싱 완료 처리.
-            # processed_files 에는 저장 안 함 (RAG 청크 매칭 키라서 의미 없음).
-            #
-            # ── glossary 추가 단계: 페이지 본문에서 LLM 으로 용어 매핑 정제 추출 ──
-            # 추출본은 doc_card.glossary_compact 에 저장. /glossary/inline 이 우선 활용.
-            # 실패해도 인덱싱은 indexed 로 남김 (raw page fallback 동작).
-            if role_norm == "glossary":
-                # ── 우선: 고정형 CSV(영문,한글뜻,약어) 는 구조화 테이블(glossary_terms)로 직행 ──
-                # LLM 정제 없이 행 그대로 저장 → rfi-translate 등 소비자가 term-lock 으로 활용.
-                # 구조화 파싱이 성립하면 compact 추출은 건너뛴다(중복/토큰낭비 방지).
-                structured_done = False
-                try:
-                    from app.services.glossary_terms import (
-                        parse_glossary_terms,
-                        replace_file_terms,
-                    )
-                    parsed_terms = parse_glossary_terms(file_content, file_name)
-                    if parsed_terms is not None:
-                        n_terms = await replace_file_terms(
-                            tenant_id, storage_path, file_name, parsed_terms,
-                        )
-                        structured_done = True
-                        logger.info(
-                            "[knowledge_admin] %s: structured glossary imported "
-                            "(%d terms → glossary_terms)",
-                            file_name, n_terms,
-                        )
-                except Exception as struct_err:
-                    logger.warning(
-                        "[knowledge_admin] %s: structured glossary parse failed "
-                        "(%s) — fallback: LLM compact 추출",
-                        file_name, struct_err,
-                    )
-
-                try:
-                    if structured_done:
-                        gloss_result = {"saved": False, "structured": True}
-                    else:
-                        from app.services.glossary_extraction import extract_and_save_glossary_compact
-                        gloss_result = await extract_and_save_glossary_compact(
-                            tenant_id=tenant_id, file_id=storage_path,
-                        )
-                    if gloss_result.get("structured"):
-                        pass  # 구조화 저장 완료 — 위에서 이미 로깅.
-                    elif gloss_result.get("saved"):
-                        logger.info(
-                            "[knowledge_admin] %s: glossary extracted & saved "
-                            "(terms=%d, ok_batches=%d/%d)",
-                            file_name,
-                            gloss_result.get("term_count", 0),
-                            gloss_result.get("ok_batches", 0),
-                            gloss_result.get("n_batches", 0),
-                        )
-                    else:
-                        logger.warning(
-                            "[knowledge_admin] %s: glossary extraction failed/empty "
-                            "(errors=%s) — fallback: /glossary/inline 이 raw page 사용",
-                            file_name, (gloss_result.get("errors") or [])[:3],
-                        )
-                except Exception as gloss_err:
-                    logger.warning(
-                        "[knowledge_admin] %s: glossary extraction crashed: %s "
-                        "— fallback: /glossary/inline 이 raw page 사용",
-                        file_name, gloss_err,
-                    )
-
-            await mark_status(
-                tenant_id=tenant_id,
-                source_type="upload",
-                source_ref=storage_path,
-                status=INDEX_STATUS_INDEXED,
-            )
-            logger.info(
-                "[knowledge_admin] %s: pages-only ingest (role=%s, skipped chunking/embedding)",
-                file_name, role_norm,
-            )
-        elif pages_saved or (is_image and documents):
+        if pages_saved or (is_image and documents):
             await mark_status(
                 tenant_id=tenant_id,
                 source_type="upload",
@@ -341,7 +212,6 @@ async def upload_knowledge_file(
     file_hash: Optional[str] = Form(None),
     uploaded_by_uid: Optional[str] = Form(None),
     uploaded_by_name: Optional[str] = Form(None),
-    doc_role: Optional[str] = Form(None),
 ):
     """설정 페이지에서 내부 지식공간 파일을 직접 업로드.
 
@@ -356,24 +226,12 @@ async def upload_knowledge_file(
     file_name = (file.filename or "unknown").replace("\\", "/").rstrip("/").split("/")[-1] or "unknown"
     size_bytes = len(file_content)
 
-    # doc_role(분류)별 허용 확장자 정책 — storage 업로드 전에 거부해 orphan 파일 방지.
-    #   content/glossary/reference: pdf/hwp/hwpx/doc/docx/pptx/txt
-    #   template(양식): hwpx/docx · dataset(데이터): xlsx · legal_review(검토 사례): docx
-    from app.services.knowledge_files import (
-        normalize_doc_role as _norm_role_early,
-        allowed_extensions_for_role as _allowed_exts,
-        is_extension_allowed_for_role as _ext_ok,
-    )
-    if not _ext_ok(file_name, doc_role):
-        _allowed = ", ".join(_allowed_exts(doc_role))
-        _hint = (
-            " (검토 사례는 변호사 메모 추출이 docx XML 한정)"
-            if _norm_role_early(doc_role) == "legal_review"
-            else ""
-        )
+    # 허용 확장자 — storage 업로드 전에 거부해 orphan 파일 방지.
+    from app.services.knowledge_files import ALLOWED_EXTENSIONS, is_extension_allowed
+    if not is_extension_allowed(file_name):
         raise HTTPException(
             status_code=400,
-            detail=f"이 분류에서는 {_allowed} 형식만 업로드할 수 있습니다{_hint}.",
+            detail=f"{', '.join(ALLOWED_EXTENSIONS)} 형식만 업로드할 수 있습니다.",
         )
 
     # SHA-256 해시 — 클라이언트가 보낸 값을 신뢰하지 않고 서버에서 재계산해 검증/저장
@@ -415,7 +273,6 @@ async def upload_knowledge_file(
         file_hash=file_hash,
         uploaded_by_uid=(uploaded_by_uid or None),
         uploaded_by_name=(uploaded_by_name or None),
-        doc_role=doc_role,
         initial_status=INDEX_STATUS_PENDING,
     )
 
@@ -428,9 +285,7 @@ async def upload_knowledge_file(
         for _seg in [s for s in _fp.split("/") if s]:
             _acc.append(_seg)
             try:
-                await kf_create_folder(
-                    tenant_id=tenant_id, folder_path="/".join(_acc), doc_role=doc_role
-                )
+                await kf_create_folder(tenant_id=tenant_id, folder_path="/".join(_acc))
             except Exception as _e:
                 logger.warning("[knowledge_admin] folder register failed (%s): %s", "/".join(_acc), _e)
 
@@ -438,7 +293,7 @@ async def upload_knowledge_file(
     #    (브라우저가 인덱싱 끝까지 연결을 붙잡지 않음 → 대량 폴더 업로드도 수 분 내 접수 완료.
     #     실제 인덱싱 진행은 프론트가 index_status 폴링으로 확인. 폴더 카드 갱신도 인덱싱 완료 후.)
     from app.services.ingest_queue import enqueue_index_job
-    enqueue_index_job(tenant_id, storage_path, file_name, doc_role, folder_path or "")
+    enqueue_index_job(tenant_id, storage_path, file_name, folder_path or "")
 
     return {
         "source_type": "upload",
@@ -504,7 +359,6 @@ async def reindex_knowledge_file(
         raise HTTPException(status_code=403, detail="재인덱싱 권한이 없습니다 (관리자 또는 업로더 본인).")
 
     file_name = entry.get("file_name") or Path(source_ref).name
-    doc_role = entry.get("doc_role")
 
     # 재인덱싱도 백그라운드 워커풀에 위임 — pending 으로 돌리고 enqueue(워커가 멱등 정리 후 재처리).
     await mark_status(
@@ -512,7 +366,7 @@ async def reindex_knowledge_file(
         status=INDEX_STATUS_PENDING,
     )
     from app.services.ingest_queue import enqueue_index_job
-    enqueue_index_job(tenant_id, source_ref, file_name, doc_role, entry.get("folder_path") or "")
+    enqueue_index_job(tenant_id, source_ref, file_name, entry.get("folder_path") or "")
     return {
         "source_type": source_type,
         "source_ref": source_ref,
@@ -536,7 +390,6 @@ async def resummarize_knowledge_file(
     (문서 카드가 폴더 카드의 입력이므로). 권한: 관리자 또는 업로더 본인.
     """
     from app.core.supabase_client import supabase
-    from app.services.knowledge_files import normalize_doc_role
     from app.services.document_pages import build_and_store_card
     from langchain.schema import Document
 
@@ -548,10 +401,6 @@ async def resummarize_knowledge_file(
     is_owner = bool(requester_uid) and str(entry.get("uploaded_by_uid") or "") == str(requester_uid)
     if not (is_admin or is_owner):
         raise HTTPException(status_code=403, detail="카드 재생성 권한이 없습니다 (관리자 또는 업로더 본인).")
-
-    role = normalize_doc_role(entry.get("doc_role"))
-    if role in ("glossary", "template", "dataset"):
-        raise HTTPException(status_code=400, detail="이 분류는 문서 카드를 만들지 않습니다.")
 
     # 저장된 페이지 재사용 (재파싱/재임베딩 없음)
     try:
@@ -580,7 +429,7 @@ async def resummarize_knowledge_file(
     folder_path = (entry.get("folder_path") or "").strip().strip("/")
     if folder_path:
         from app.services.folder_cards import rebuild_folders
-        background_tasks.add_task(rebuild_folders, tenant_id, [folder_path], role)
+        background_tasks.add_task(rebuild_folders, tenant_id, [folder_path])
 
     status = "failed"
     try:
@@ -713,7 +562,7 @@ async def delete_knowledge_file(
 
 @router.get("/knowledge/folders")
 async def list_knowledge_folders(tenant_id: str = Query(...)):
-    """빈 폴더 포함 등록된 모든 폴더 row 반환 ([{folder_path, doc_role}, ...])."""
+    """빈 폴더 포함 등록된 모든 폴더 row 반환 ([{folder_path}, ...])."""
     folders = await list_folders_for_tenant(tenant_id)
     return {"folders": folders}
 
@@ -722,7 +571,6 @@ async def list_knowledge_folders(tenant_id: str = Query(...)):
 async def build_folder_cards(
     background_tasks: BackgroundTasks,
     tenant_id: str = Form(...),
-    doc_role: Optional[str] = Form(None),
     requester_uid: Optional[str] = Form(None),
     background: bool = Form(True),
 ):
@@ -732,7 +580,6 @@ async def build_folder_cards(
     폴더당 LLM 1회라 문서 수와 무관하게 비용 bounded. (관리자 전용)
 
     Args:
-        doc_role: 옵션 — 특정 role 만. 미지정 시 등장한 모든 role.
         background: True(기본)면 백그라운드 실행 후 즉시 응답. False 면 끝까지 기다려 요약 반환.
     """
     is_admin = await _resolve_admin(requester_uid, tenant_id)
@@ -742,10 +589,10 @@ async def build_folder_cards(
     from app.services.folder_cards import backfill_tenant
 
     if background:
-        background_tasks.add_task(backfill_tenant, tenant_id, doc_role)
-        return {"ok": True, "scheduled": True, "tenant_id": tenant_id, "doc_role": doc_role}
+        background_tasks.add_task(backfill_tenant, tenant_id)
+        return {"ok": True, "scheduled": True, "tenant_id": tenant_id}
 
-    result = await backfill_tenant(tenant_id, doc_role)
+    result = await backfill_tenant(tenant_id)
     return {"ok": True, "scheduled": False, **result}
 
 
@@ -753,16 +600,13 @@ async def build_folder_cards(
 async def create_knowledge_folder(
     tenant_id: str = Form(...),
     folder_path: str = Form(...),
-    doc_role: Optional[str] = Form(None),
     requester_uid: Optional[str] = Form(None),
 ):
-    """빈 폴더 생성 (knowledge_folders에 row 추가). doc_role 미지정 시 'content'."""
+    """빈 폴더 생성 (knowledge_folders에 row 추가)."""
     folder_path = (folder_path or "").strip().strip("/")
     if not folder_path:
         raise HTTPException(status_code=400, detail="folder_path required")
-    ok = await kf_create_folder(
-        tenant_id=tenant_id, folder_path=folder_path, doc_role=doc_role
-    )
+    ok = await kf_create_folder(tenant_id=tenant_id, folder_path=folder_path)
     return {"ok": ok, "folder_path": folder_path}
 
 
@@ -771,7 +615,6 @@ async def refresh_folder_cards(
     background_tasks: BackgroundTasks,
     tenant_id: str = Form(...),
     folder_paths: List[str] = Form([]),
-    doc_role: Optional[str] = Form(None),
 ):
     """업로드/삭제 *배치 후* 영향받은 폴더 카드만 갱신 — storm 없는 자동 경로.
 
@@ -787,9 +630,9 @@ async def refresh_folder_cards(
 
     cleaned = [str(p).strip().strip("/") for p in (folder_paths or []) if str(p or "").strip().strip("/")]
     if cleaned:
-        background_tasks.add_task(rebuild_folders, tenant_id, cleaned, doc_role or "content")
+        background_tasks.add_task(rebuild_folders, tenant_id, cleaned)
     else:
-        background_tasks.add_task(backfill_tenant, tenant_id, doc_role)
+        background_tasks.add_task(backfill_tenant, tenant_id)
     return {"ok": True, "scheduled": True, "folders": (len(cleaned) or "all")}
 
 
@@ -799,9 +642,8 @@ async def rename_knowledge_folder(
     old_path: str = Form(...),
     new_path: str = Form(...),
     requester_uid: Optional[str] = Form(None),
-    doc_role: Optional[str] = Form(None),
 ):
-    """업로드 폴더 이름 변경 — 하위 경로도 prefix 치환 (role scope). (관리자 전용)"""
+    """업로드 폴더 이름 변경 — 하위 경로도 prefix 치환. (관리자 전용)"""
     is_admin = await _resolve_admin(requester_uid, tenant_id)
     if not is_admin:
         raise HTTPException(status_code=403, detail="관리자만 폴더를 변경할 수 있습니다.")
@@ -815,7 +657,6 @@ async def rename_knowledge_folder(
         tenant_id=tenant_id,
         old_path=old_path,
         new_path=new_path,
-        doc_role=doc_role,
     )
     return {"ok": True, "affected": affected}
 
@@ -825,9 +666,8 @@ async def delete_knowledge_folder(
     tenant_id: str = Query(...),
     folder_path: str = Query(...),
     requester_uid: Optional[str] = Query(None),
-    doc_role: Optional[str] = Query(None),
 ):
-    """업로드 폴더 삭제 — 하위 모든 파일을 storage/RAG/knowledge_files에서 영구 제거 (role scope). (관리자 전용)"""
+    """업로드 폴더 삭제 — 하위 모든 파일을 storage/RAG/knowledge_files에서 영구 제거. (관리자 전용)"""
     is_admin = await _resolve_admin(requester_uid, tenant_id)
     if not is_admin:
         raise HTTPException(status_code=403, detail="관리자만 폴더를 삭제할 수 있습니다.")
@@ -839,7 +679,6 @@ async def delete_knowledge_folder(
         tenant_id=tenant_id,
         folder_path=folder_path,
         source_type="upload",
-        doc_role=doc_role,
     )
     # 파일별 delete_entry 루프(파일당 풀스캔 N회)는 대량 폴더에서 폭발 → 집합 기반 일괄 삭제로 대체.
     entries = [
@@ -865,15 +704,15 @@ async def delete_knowledge_folder(
     failed = 0 if rows_ok else len(rows)
 
     if rows_ok:
-        # knowledge_folders 메타 row도 정리 (빈 폴더 + 자식 폴더, role scope)
-        await delete_folder_meta(tenant_id=tenant_id, folder_path=folder_path, doc_role=doc_role)
+        # knowledge_folders 메타 row도 정리 (빈 폴더 + 자식 폴더)
+        await delete_folder_meta(tenant_id=tenant_id, folder_path=folder_path)
         # 폴더 카드 정리: 삭제된 폴더 + 하위(subtree) 카드 행 제거 후, *부모* 카드 재생성
         # (부모는 하위폴더 1개가 줄었으므로 요약/카운트 갱신 필요).
         from app.services.folder_cards import delete_folder_cards, rebuild_folders
-        await delete_folder_cards(tenant_id=tenant_id, folder_path=folder_path, doc_role=doc_role)
+        await delete_folder_cards(tenant_id=tenant_id, folder_path=folder_path)
         _parent = folder_path.rsplit("/", 1)[0] if "/" in folder_path else ""
         if _parent:
-            await rebuild_folders(tenant_id, [_parent], doc_role or "content")
+            await rebuild_folders(tenant_id, [_parent])
     else:
         logger.warning(
             "[knowledge_admin] folder delete FAILED to remove rows: tenant=%s folder=%s files=%d bulk=%s",

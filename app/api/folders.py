@@ -95,9 +95,7 @@ def _n_pages_of(row: Dict[str, Any]) -> Optional[int]:
 # 폴더카드 조회 (Stage 2 테이블 — 없으면 graceful 빈 dict)
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _fetch_folder_cards(
-    tenant_id: str, doc_role: Optional[str] = None
-) -> Dict[str, Dict[str, Any]]:
+async def _fetch_folder_cards(tenant_id: str) -> Dict[str, Dict[str, Any]]:
     """``knowledge_folder_cards`` 에서 {folder_path: card} 반환.
 
     테이블이 아직 없거나(Stage 1) 조회 실패면 빈 dict. 호출부는 ``.get(fp)`` 로 None 허용.
@@ -108,8 +106,6 @@ async def _fetch_folder_cards(
             .select("folder_path, card")
             .eq("tenant_id", tenant_id)
         )
-        if doc_role:
-            q = q.eq("doc_role", doc_role)
         resp = await asyncio.to_thread(q.execute)
         out: Dict[str, Dict[str, Any]] = {}
         for r in (resp.data or []):
@@ -238,7 +234,6 @@ async def _fetch_kf_by_refs(
     select_cols: str,
     refs: List[str],
     *,
-    doc_role: Optional[str] = None,
     folder_eq: Optional[str] = None,
     folder_like: Optional[str] = None,
     limit: Optional[int] = None,
@@ -260,8 +255,6 @@ async def _fetch_kf_by_refs(
             .eq("tenant_id", tenant_id)
             .in_("source_ref", chunk)
         )
-        if doc_role:
-            q = q.eq("doc_role", doc_role)
         if folder_eq is not None:
             q = q.eq("folder_path", folder_eq)
         if folder_like is not None:
@@ -279,7 +272,6 @@ async def folders_tree(
     roots: Optional[List[str]] = Query(default=None),
     file_ids: Optional[List[str]] = Query(default=None),
     folder_paths: Optional[List[str]] = Query(default=None),
-    doc_role: Optional[str] = Query(default=None),
     depth: int = Query(default=_DEFAULT_TREE_DEPTH, ge=1, le=_MAX_TREE_DEPTH),
 ):
     """선택 루트들 아래의 폴더 골격(+폴더카드, +준비 상태, +자식 문서 abstract 샘플)을 반환.
@@ -287,7 +279,6 @@ async def folders_tree(
     Args:
         tenant_id: 필수.
         roots: 선택된 folder_path 들(옵션). 비면 tenant 전체 최상위부터.
-        doc_role: 옵션. 주면 그 role 자료만 집계.
         depth: 루트 기준 하위 몇 단계까지 펼칠지(기본 2). 더 깊은 곳은 ``/folders/open`` 으로.
 
     Returns:
@@ -305,7 +296,7 @@ async def folders_tree(
     #   - 둘 다 없으면 레거시/직접호출 하위호환으로 tenant 전체.
     allow = [str(x) for x in (file_ids or []) if x]
     scope_folders = [str(x) for x in (folder_paths or []) if x and str(x).strip().strip("/")]
-    _COLS = "source_ref, file_name, folder_path, doc_card, doc_role, has_text, index_status"
+    _COLS = "source_ref, file_name, folder_path, doc_card, has_text, index_status"
     try:
         # 개별 file_ids(allow) 와 폴더 스코프(scope_folders)를 union. 단일 소스면 예전과 동일 결과.
         rows = []
@@ -320,11 +311,11 @@ async def folders_tree(
                 rows.append(r)
 
         if allow:
-            _add_tree_rows(await _fetch_kf_by_refs(tenant_id, _COLS, allow, doc_role=doc_role))
+            _add_tree_rows(await _fetch_kf_by_refs(tenant_id, _COLS, allow))
         if scope_folders:
             from app.services.knowledge_files import fetch_rows_by_folders
             _add_tree_rows(await fetch_rows_by_folders(
-                tenant_id, _COLS, scope_folders, doc_role=doc_role, limit=_TREE_FETCH_LIMIT,
+                tenant_id, _COLS, scope_folders, limit=_TREE_FETCH_LIMIT,
             ))
         if not allow and not scope_folders:
             q = (
@@ -332,8 +323,6 @@ async def folders_tree(
                 .select(_COLS)
                 .eq("tenant_id", tenant_id)
             )
-            if doc_role:
-                q = q.eq("doc_role", doc_role)
             base = (await asyncio.to_thread(q.limit(_TREE_FETCH_LIMIT).execute)).data or []
             # 채팅 첨부(folder_path="")가 스코프 없는 전체 트리의 루트에 뜨지 않게 제외.
             from app.services.knowledge_files import _is_chat_attachment_ref
@@ -376,7 +365,7 @@ async def folders_tree(
         if par is not None:
             children.setdefault(par, set()).add(fp)
 
-    cards = await _fetch_folder_cards(tenant_id, doc_role)
+    cards = await _fetch_folder_cards(tenant_id)
 
     # 시작 루트 결정
     norm_roots = [_norm(r) for r in (roots or []) if _norm(r)]
@@ -415,8 +404,8 @@ async def folders_tree(
 
     tree = [_node(fp, depth - 1) for fp in start]
     logger.info(
-        "[/folders/tree] tenant=%s roots=%d doc_role=%s files=%d folders=%d start=%d depth=%d",
-        tenant_id, len(norm_roots), doc_role, len(rows), len(all_folders), len(start), depth,
+        "[/folders/tree] tenant=%s roots=%d files=%d folders=%d start=%d depth=%d",
+        tenant_id, len(norm_roots), len(rows), len(all_folders), len(start), depth,
     )
     return {"tree": tree, "truncated": truncated, "readiness": overall}
 
@@ -429,19 +418,16 @@ async def folders_tree(
 async def folder_card(
     tenant_id: str,
     folder_path: str,
-    doc_role: Optional[str] = Query(default=None),
 ):
     """단일 폴더의 카드를 반환. 카드가 아직 없으면 ``card=null`` (graceful)."""
     if not tenant_id or not folder_path:
         raise HTTPException(status_code=400, detail="tenant_id, folder_path required")
     fp = _norm(folder_path)
-    role = (doc_role or "content").strip().lower() or "content"
     try:
         resp = await asyncio.to_thread(
             supabase.table("knowledge_folder_cards")
             .select("card, built_at")
             .eq("tenant_id", tenant_id)
-            .eq("doc_role", role)
             .eq("folder_path", fp)
             .limit(1)
             .execute
@@ -474,7 +460,7 @@ _MAX_CHUNK_TOP_K = 2000
 # query 모드에서 랭킹 후보로 훑을 직속 문서 수 상한 (source_ref 한 컬럼만 읽음).
 _MAX_DIRECT_SCAN = 20_000
 
-_DOC_COLS = "source_ref, file_name, folder_path, path, doc_card, doc_role, mime_type, has_text, index_status"
+_DOC_COLS = "source_ref, file_name, folder_path, path, doc_card, mime_type, has_text, index_status"
 # 관리 화면용 — 식별자·업로더·크기까지. 에이전트 경로(include_refs=false)에는 내려가지 않는다.
 _DOC_COLS_ADMIN = (
     _DOC_COLS + ", source_type, size_bytes, modified_time, indexed_at, index_error, "
@@ -487,7 +473,7 @@ def _empty_open(fp: str) -> Dict[str, Any]:
     return {
         "folder_path": fp, "subfolders": [], "docs": [],
         "n_docs_direct": 0, "n_subfolders_total": 0,
-        "overflow": False, "query": "", "role_counts": {}, "card": None,
+        "overflow": False, "query": "", "card": None,
     }
 
 
@@ -496,7 +482,6 @@ async def _direct_docs_query(
     fp: str,
     *,
     cols: str,
-    doc_role: Optional[str],
     allow: List[str],
     scope_folders: List[str],
     limit: int,
@@ -506,7 +491,7 @@ async def _direct_docs_query(
         # _fetch_kf_by_refs 의 limit 은 IN 배치(150개)마다 걸리므로 합계는 limit 을 넘을 수 있다.
         # 여기서 최종 절단해 두 모드의 반환 크기 계약을 같게 맞춘다.
         rows = await _fetch_kf_by_refs(
-            tenant_id, cols, allow, doc_role=doc_role, folder_eq=fp, limit=limit,
+            tenant_id, cols, allow, folder_eq=fp, limit=limit,
         )
         return rows[:limit]
     q = (
@@ -515,8 +500,6 @@ async def _direct_docs_query(
         .eq("tenant_id", tenant_id)
         .eq("folder_path", fp)
     )
-    if doc_role:
-        q = q.eq("doc_role", doc_role)
     return (await asyncio.to_thread(q.limit(limit).execute)).data or []
 
 
@@ -524,14 +507,13 @@ async def _count_direct_docs(
     tenant_id: str,
     fp: str,
     *,
-    doc_role: Optional[str],
     allow: List[str],
     scope_folders: List[str],
 ) -> int:
     """직속 문서 정확 개수. 행을 끌어오지 않고 count 만 (임계 초과 시에만 호출)."""
     if allow and not scope_folders:
         rows = await _fetch_kf_by_refs(
-            tenant_id, "source_ref", allow, doc_role=doc_role, folder_eq=fp,
+            tenant_id, "source_ref", allow, folder_eq=fp,
         )
         return len(rows)
     try:
@@ -541,8 +523,6 @@ async def _count_direct_docs(
             .eq("tenant_id", tenant_id)
             .eq("folder_path", fp)
         )
-        if doc_role:
-            q = q.eq("doc_role", doc_role)
         r = await asyncio.to_thread(q.limit(1).execute)
         return int(getattr(r, "count", 0) or 0)
     except Exception as e:
@@ -592,33 +572,12 @@ async def _rank_direct_refs(
     return ordered[:limit]
 
 
-async def _direct_role_counts(
-    tenant_id: str,
-    fp: str,
-    *,
-    doc_role: Optional[str],
-    allow: List[str],
-    scope_folders: List[str],
-) -> Dict[str, int]:
-    """직속 문서의 doc_role 분포. 힌트용이라 doc_role 한 컬럼만 읽는다(abstract 제외)."""
-    rows = await _direct_docs_query(
-        tenant_id, fp, cols="doc_role", doc_role=doc_role,
-        allow=allow, scope_folders=scope_folders, limit=_MAX_DIRECT_SCAN,
-    )
-    out: Dict[str, int] = {}
-    for r in rows:
-        role = (r.get("doc_role") or "content").strip() or "content"
-        out[role] = out.get(role, 0) + 1
-    return out
-
-
 @router.get("/folders/open")
 async def folders_open(
     tenant_id: str,
     folder_path: str,
     file_ids: Optional[List[str]] = Query(default=None),
     folder_paths: Optional[List[str]] = Query(default=None),
-    doc_role: Optional[str] = Query(default=None),
     query: Optional[str] = Query(default=None),
     limit: int = Query(default=_OPEN_QUERY_LIMIT, ge=1, le=500),
     list_threshold: int = Query(default=_OPEN_LIST_THRESHOLD, ge=1, le=2000),
@@ -633,7 +592,6 @@ async def folders_open(
     Args:
         tenant_id: 필수.
         folder_path: 펼칠 폴더 경로.
-        doc_role: 옵션.
         query: 이 폴더 안에서 찾는 내용. 임계 초과 시 이걸로 문서를 추린다.
         limit: query 모드에서 남길 문서 수.
         list_threshold: 이 수를 넘으면 나열 대신 query 모드.
@@ -642,9 +600,9 @@ async def folders_open(
 
     Returns:
         ``{"folder_path", "subfolders", "docs", "n_docs_direct", "n_subfolders_total",
-           "overflow", "query", "role_counts", "card"}``
+           "overflow", "query", "card"}``
         subfolders = {folder_path, name, n_docs_total, card}
-        docs = {file_name, folder_path, path, abstract, doc_role, n_pages, mime_type,
+        docs = {file_name, folder_path, path, abstract, n_pages, mime_type,
                 card: {title, doc_type, summary, distinguishers, answers_questions, state}}
     """
     if not tenant_id or not folder_path:
@@ -670,10 +628,9 @@ async def folders_open(
     #
     #   ★ 크기 가드: 먼저 threshold+1 개만 읽는다. 임계 이하면 그 행이 곧 전체라 추가 쿼리가
     #     없고, 초과면 무거운 doc_card 를 2000행씩 끌어오는 일 자체가 일어나지 않는다.
-    role_counts: Dict[str, int] = {}
     try:
         probe_rows = await _direct_docs_query(
-            tenant_id, fp, cols=doc_cols, doc_role=doc_role,
+            tenant_id, fp, cols=doc_cols,
             allow=allow, scope_folders=scope_folders, limit=list_threshold + 1,
         )
         overflow = len(probe_rows) > list_threshold
@@ -682,19 +639,15 @@ async def folders_open(
             n_docs_direct = len(probe_rows)
         else:
             n_docs_direct = await _count_direct_docs(
-                tenant_id, fp, doc_role=doc_role, allow=allow, scope_folders=scope_folders,
+                tenant_id, fp, allow=allow, scope_folders=scope_folders,
             )
             if not q:
-                # 목록을 줄 수 없는 상태 — 대신 좁힐 단서(역할분포)를 준다.
+                # 목록을 줄 수 없는 상태 — 개수만 주고 목록은 비운다(검색어로 좁히게).
                 direct_rows = []
-                role_counts = await _direct_role_counts(
-                    tenant_id, fp, doc_role=doc_role,
-                    allow=allow, scope_folders=scope_folders,
-                )
             else:
                 # 랭킹 후보는 source_ref 한 컬럼만(가벼움) → 상위 limit 개만 전체 컬럼으로 재조회.
                 ref_rows = await _direct_docs_query(
-                    tenant_id, fp, cols="source_ref", doc_role=doc_role,
+                    tenant_id, fp, cols="source_ref",
                     allow=allow, scope_folders=scope_folders, limit=_MAX_DIRECT_SCAN,
                 )
                 candidates = [str(r.get("source_ref")) for r in ref_rows if r.get("source_ref")]
@@ -702,7 +655,7 @@ async def folders_open(
                 by_ref = {
                     str(r.get("source_ref")): r
                     for r in await _fetch_kf_by_refs(
-                        tenant_id, doc_cols, top_refs, doc_role=doc_role, folder_eq=fp,
+                        tenant_id, doc_cols, top_refs, folder_eq=fp,
                     )
                     if r.get("source_ref")
                 }
@@ -715,7 +668,7 @@ async def folders_open(
     try:
         if allow and not scope_folders:
             desc_rows = await _fetch_kf_by_refs(
-                tenant_id, "folder_path", allow, doc_role=doc_role, folder_like=f"{fp}/%",
+                tenant_id, "folder_path", allow, folder_like=f"{fp}/%",
             )
         else:
             cq = (
@@ -724,8 +677,6 @@ async def folders_open(
                 .eq("tenant_id", tenant_id)
                 .like("folder_path", f"{fp}/%")
             )
-            if doc_role:
-                cq = cq.eq("doc_role", doc_role)
             desc_rows = (await asyncio.to_thread(cq.limit(_TREE_FETCH_LIMIT).execute)).data or []
     except Exception as e:
         logger.exception("[/folders/open] descendant query failed: %s", e)
@@ -743,7 +694,7 @@ async def folders_open(
         child_fp = prefix + first_seg
         subfolder_total[child_fp] = subfolder_total.get(child_fp, 0) + 1
 
-    cards = await _fetch_folder_cards(tenant_id, doc_role)
+    cards = await _fetch_folder_cards(tenant_id)
 
     # 하위폴더는 문서 수 많은 순으로 상한만큼 — 수백 개짜리 폴더에서 하위폴더 줄이 폭주하지 않게.
     n_subfolders_total = len(subfolder_total)
@@ -770,7 +721,6 @@ async def folders_open(
             "folder_path": _norm(r.get("folder_path")),
             "path": r.get("path") or compose_path(r.get("folder_path"), r.get("file_name")),
             "abstract": brief["summary"],
-            "doc_role": r.get("doc_role") or "content",
             "n_pages": r.get("page_count") or _n_pages_of(r),
             "mime_type": r.get("mime_type"),
             "card": brief,
@@ -805,6 +755,5 @@ async def folders_open(
         "n_subfolders_total": n_subfolders_total,
         "overflow": overflow,
         "query": q,
-        "role_counts": role_counts,
         "card": _card_brief(cards.get(fp)),
     }

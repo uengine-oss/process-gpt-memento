@@ -4,11 +4,10 @@
 폴더당 LLM 1회라 문서 수와 무관하게 비용 bounded.
 
 사용:
-    python -m scripts.build_folder_cards <tenant_id> [doc_role]
+    python -m scripts.build_folder_cards <tenant_id>
 
 예:
     python -m scripts.build_folder_cards acme
-    python -m scripts.build_folder_cards acme content
 """
 from __future__ import annotations
 
@@ -19,13 +18,12 @@ from app.services.folder_cards import backfill_tenant
 
 
 async def _main() -> int:
-    if len(sys.argv) < 2:
-        print("usage: python -m scripts.build_folder_cards <tenant_id> [doc_role]")
+    if len(sys.argv) != 2:
+        print("usage: python -m scripts.build_folder_cards <tenant_id>")
         return 2
     tenant_id = sys.argv[1]
-    doc_role = sys.argv[2] if len(sys.argv) > 2 else None
-    print(f"[build_folder_cards] tenant={tenant_id} doc_role={doc_role or '(all)'} 시작...")
-    result = await backfill_tenant(tenant_id, doc_role)
+    print(f"[build_folder_cards] tenant={tenant_id} 시작...")
+    result = await backfill_tenant(tenant_id)
     print(f"[build_folder_cards] 완료: {result}")
     return 0
 

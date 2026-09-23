@@ -4,7 +4,7 @@
 값에는 빈 칸(특히 약어)이 있을 수 있고, 영문 필드 안에 콤마가 들어올 수도 있다.
 
 흐름:
-    upload(doc_role='glossary') → knowledge_admin 이 이 모듈의 parse → replace_file_terms 호출.
+    계정 설정의 용어집 관리 화면에서 업로드된 고정형 CSV 를 parse → replace_file_terms 로 저장.
     (구조화 파싱 성공 시 기존 LLM glossary_compact 추출은 건너뜀)
 
 저장 위치: public.glossary_terms (sql/glossary_terms.sql). file_id(=storage_path) 단위 replace.

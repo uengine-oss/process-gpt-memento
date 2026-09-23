@@ -115,7 +115,7 @@ _ctrl = _Ctrl()
 _started = False
 # 큐/처리 중인 ref 중복 방지 (재시작 복구·좀비 sweeper 가 활성 작업을 다시 넣지 않게)
 _pending_refs: Set[str] = set()
-# 폴더 요약 카드 재생성 대상 — (tenant, folder_path, doc_role). 파일 인덱싱 완료 시 그 폴더를 표시.
+# 폴더 요약 카드 재생성 대상 — (tenant, folder_path). 파일 인덱싱 완료 시 그 폴더를 표시.
 # 테넌트 인덱싱이 정착되면 sweeper 가 *그 폴더들만* rebuild_folders 로 재생성(테넌트 전체 스캔 X).
 # 실제 rebuild 는 LLM(폴더당 1회)이라 오래 걸리므로 sweeper 를 막지 않게 *백그라운드 태스크*로 실행.
 _dirty_folders: Set[tuple] = set()
@@ -139,7 +139,7 @@ def _get_queue() -> "asyncio.Queue":
 
 
 def enqueue_index_job(
-    tenant_id: str, source_ref: str, file_name: str, doc_role: Optional[str],
+    tenant_id: str, source_ref: str, file_name: str,
     folder_path: str = "", *, attempt: int = 0,
 ) -> bool:
     """인덱싱 작업 적재(논블로킹). 이미 큐/처리 중이면 skip. 큐가 가득 차면 False
@@ -151,7 +151,7 @@ def enqueue_index_job(
         return True
     job = {
         "tenant_id": tenant_id, "source_ref": source_ref,
-        "file_name": file_name or "", "doc_role": doc_role or "content",
+        "file_name": file_name or "",
         "folder_path": folder_path or "", "attempt": attempt, "key": key,
     }
     try:
@@ -205,7 +205,6 @@ async def _run_job(job: Dict[str, Any]) -> str:
                 storage_path=source_ref,
                 file_content=content,
                 file_name=job["file_name"],
-                doc_role=job["doc_role"],
                 public_url=None,
             ),
             timeout=_JOB_TIMEOUT,
@@ -229,7 +228,7 @@ async def _requeue_after(job: Dict[str, Any], delay: float) -> None:
     await asyncio.sleep(delay)
     _pending_refs.discard(job["key"])           # enqueue 가 다시 추가
     enqueue_index_job(
-        job["tenant_id"], job["source_ref"], job["file_name"], job["doc_role"],
+        job["tenant_id"], job["source_ref"], job["file_name"],
         job.get("folder_path", ""), attempt=job["attempt"] + 1,
     )
 
@@ -250,7 +249,7 @@ async def _worker(idx: int) -> None:
                 # 인덱싱 완료 → 그 파일이 속한 폴더를 카드 재생성 대상으로 표시(루트 '' 는 폴더카드 없음)
                 _fp = (job.get("folder_path") or "").strip().strip("/")
                 if _fp:
-                    _dirty_folders.add((job["tenant_id"], _fp, job.get("doc_role") or "content"))
+                    _dirty_folders.add((job["tenant_id"], _fp))
             # 'permanent' → AIMD 중립(상향/페널티 없음): 영구 실패로 동시성을 올리거나 서킷을 건드리지 않음
             _pending_refs.discard(job["key"])
         except _Transient as t:
@@ -303,7 +302,7 @@ async def _recover_stuck(initial: bool = False) -> int:
     try:
         q = (
             supabase.table("knowledge_files")
-            .select("tenant_id, source_ref, file_name, doc_role, folder_path, index_status, updated_at")
+            .select("tenant_id, source_ref, file_name, folder_path, index_status, updated_at")
             .eq("source_type", "upload")
             .in_("index_status", [INDEX_STATUS_PENDING, INDEX_STATUS_PROCESSING])
         )
@@ -321,7 +320,7 @@ async def _recover_stuck(initial: bool = False) -> int:
         # 재시작 갭 보정: 진행 중이던 폴더를 카드 재생성 대상으로 seed
         #  → 그 테넌트가 정착되면 sweeper 가 그 폴더 카드를 재생성(재시작 직전 완료분도 반영).
         if initial and _fp:
-            _dirty_folders.add((r["tenant_id"], _fp, r.get("doc_role") or "content"))
+            _dirty_folders.add((r["tenant_id"], _fp))
         if not initial and r.get("index_status") == INDEX_STATUS_PROCESSING:
             # 좀비 판정: updated_at 이 LEASE 보다 오래됐을 때만(진행 중인 건 건드리지 않음).
             # 활성 작업은 _pending_refs 에 있어 enqueue 가 어차피 skip 하지만, 불필요한 시도도 줄인다.
@@ -330,7 +329,7 @@ async def _recover_stuck(initial: bool = False) -> int:
                 continue
         # 이미 큐/처리 중(_pending_refs)인 건 dedup-skip 되므로 *새로 적재된 것만* 카운트(로그 정확도).
         was_new = f"{r['tenant_id']}::{ref}" not in _pending_refs
-        if enqueue_index_job(r["tenant_id"], ref, r.get("file_name") or "", r.get("doc_role"), _fp) and was_new:
+        if enqueue_index_job(r["tenant_id"], ref, r.get("file_name") or "", _fp) and was_new:
             n += 1
     if n:
         logger.info("[ingest] recovered/re-enqueued %d job(s) (initial=%s)", n, initial)
@@ -351,21 +350,17 @@ async def _tenant_has_active(tenant_id: str) -> bool:
         return True   # 불확실하면 아직 활성으로 간주(다음 tick 재시도)
 
 
-async def _do_rebuild_cards(tenant: str, folders_by_role: Dict[str, list]) -> None:
+async def _do_rebuild_cards(tenant: str, paths: list) -> None:
     """실제 폴더 카드 재생성 — *백그라운드 태스크*로 실행(폴더당 LLM 이라 오래 걸림, sweeper 안 막음)."""
     try:
         from app.services.folder_cards import rebuild_folders
-        total = 0
-        for role, paths in folders_by_role.items():
-            if paths:
-                await rebuild_folders(tenant, paths, role)   # 지정 폴더 + 조상만, bottom-up, signature-skip
-                total += len(paths)
-        logger.info("[ingest] folder cards reconciled: tenant=%s folders=%d", tenant, total)
+        if paths:
+            await rebuild_folders(tenant, paths)   # 지정 폴더 + 조상만, bottom-up, signature-skip
+        logger.info("[ingest] folder cards reconciled: tenant=%s folders=%d", tenant, len(paths))
     except Exception as e:
         logger.warning("[ingest] folder card rebuild failed (%s): %s", tenant, e)
-        for role, paths in folders_by_role.items():   # 실패분 재적재 → 다음 tick 재시도
-            for fp in paths:
-                _dirty_folders.add((tenant, fp, role))
+        for fp in paths:   # 실패분 재적재 → 다음 tick 재시도
+            _dirty_folders.add((tenant, fp))
     finally:
         _rebuild_in_progress.discard(tenant)
 
@@ -379,20 +374,17 @@ async def _rebuild_settled_folder_cards() -> None:
     """
     if not _dirty_folders:
         return
-    tenants = {t for (t, _fp, _r) in _dirty_folders}
+    tenants = {t for (t, _fp) in _dirty_folders}
     for tenant in tenants:
         if tenant in _rebuild_in_progress:
             continue
         if await _tenant_has_active(tenant):
             continue   # 아직 인덱싱 중 → 정착 후 다음 tick 에
-        items = [(fp, role) for (t, fp, role) in _dirty_folders if t == tenant]
-        for fp, role in items:
-            _dirty_folders.discard((tenant, fp, role))
-        by_role: Dict[str, list] = {}
-        for fp, role in items:
-            by_role.setdefault(role or "content", []).append(fp)
+        paths = [fp for (t, fp) in _dirty_folders if t == tenant]
+        for fp in paths:
+            _dirty_folders.discard((tenant, fp))
         _rebuild_in_progress.add(tenant)
-        _spawn(_do_rebuild_cards(tenant, by_role))   # 논블로킹
+        _spawn(_do_rebuild_cards(tenant, paths))   # 논블로킹
 
 
 async def _sweeper_loop() -> None:

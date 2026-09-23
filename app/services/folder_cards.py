@@ -22,7 +22,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.supabase_client import supabase
-from app.services.knowledge_files import normalize_doc_role
 from app.services.llm_output import parse_json_object
 
 logger = logging.getLogger(__name__)
@@ -157,19 +156,18 @@ def _candidate_entities(file_names: List[str], abstracts: List[str]) -> List[str
 # DB 조회
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _direct_files(tenant_id: str, folder_path: str, doc_role: str) -> List[Dict[str, Any]]:
+async def _direct_files(tenant_id: str, folder_path: str) -> List[Dict[str, Any]]:
     try:
         resp = await asyncio.to_thread(
             supabase.table("knowledge_files")
             .select("source_ref, file_name, doc_card, mime_type, modified_time")
             .eq("tenant_id", tenant_id)
-            .eq("doc_role", doc_role)
             .eq("folder_path", folder_path)
             .execute
         )
         return resp.data or []
     except Exception as e:
-        logger.warning("[folder_cards] direct_files failed (%s/%s): %s", folder_path, doc_role, e)
+        logger.warning("[folder_cards] direct_files failed (%s): %s", folder_path, e)
         return []
 
 
@@ -236,14 +234,13 @@ def _card_signals(rows: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
     }
 
 
-async def _descendant_folder_paths(tenant_id: str, folder_path: str, doc_role: str) -> List[str]:
+async def _descendant_folder_paths(tenant_id: str, folder_path: str) -> List[str]:
     """folder_path 하위(직접 아님 포함)의 distinct folder_path 들."""
     try:
         resp = await asyncio.to_thread(
             supabase.table("knowledge_files")
             .select("folder_path")
             .eq("tenant_id", tenant_id)
-            .eq("doc_role", doc_role)
             .like("folder_path", f"{folder_path}/%")
             .limit(_FETCH_LIMIT)
             .execute
@@ -254,23 +251,22 @@ async def _descendant_folder_paths(tenant_id: str, folder_path: str, doc_role: s
         return []
 
 
-async def _direct_child_folders(tenant_id: str, folder_path: str, doc_role: str) -> List[str]:
+async def _direct_child_folders(tenant_id: str, folder_path: str) -> List[str]:
     prefix = folder_path + "/"
     seen: set[str] = set()
-    for dp in await _descendant_folder_paths(tenant_id, folder_path, doc_role):
+    for dp in await _descendant_folder_paths(tenant_id, folder_path):
         if dp.startswith(prefix):
             seg = dp[len(prefix):].split("/", 1)[0]
             seen.add(prefix + seg)
     return sorted(seen)
 
 
-async def _get_card_row(tenant_id: str, folder_path: str, doc_role: str) -> Optional[Dict[str, Any]]:
+async def _get_card_row(tenant_id: str, folder_path: str) -> Optional[Dict[str, Any]]:
     try:
         resp = await asyncio.to_thread(
             supabase.table("knowledge_folder_cards")
             .select("folder_path, card, signature")
             .eq("tenant_id", tenant_id)
-            .eq("doc_role", doc_role)
             .eq("folder_path", folder_path)
             .limit(1)
             .execute
@@ -282,14 +278,13 @@ async def _get_card_row(tenant_id: str, folder_path: str, doc_role: str) -> Opti
         return None
 
 
-async def _all_folders_for_tenant(tenant_id: str, doc_role: str) -> List[str]:
+async def _all_folders_for_tenant(tenant_id: str) -> List[str]:
     """knowledge_files folder_path 들에서 파생한 *모든 폴더(조상 포함)* 집합."""
     try:
         resp = await asyncio.to_thread(
             supabase.table("knowledge_files")
             .select("folder_path")
             .eq("tenant_id", tenant_id)
-            .eq("doc_role", doc_role)
             .limit(_FETCH_LIMIT)
             .execute
         )
@@ -340,7 +335,7 @@ _FOLDER_JSON_SHAPE = """\
 {"summary": "이 폴더가 무엇을 담는지 2~4문장. 첫 문장은 이 폴더를 형제 폴더와 구별하는 사실(사업명·발주처·연도·단계)로 시작",
  "topics": ["핵심 토픽 5~8개"],
  "reading_guide": ["<어떤 질문이나 목적이면> → <먼저 열 문서 파일명 또는 하위 폴더명>. 3~6줄"],
- "start_with": ["전체 맥락을 가장 빨리 잡게 해 주는 문서 파일명 1~3개(위 목록에 있는 이름 그대로)"]}
+ "start_with": ["전체 맥락을 가장 빨리 잡게 해 주는 시작 지점 1~3개. 위 목록의 문서 파일명 또는 하위 폴더명을 그대로 쓸 것(없는 이름은 버려진다)"]}
 """
 
 
@@ -450,6 +445,28 @@ def _resolve_generation_model() -> str:
         return ""
 
 
+def _resolve_start_with(
+    raw: List[str], file_names: List[str], child_folders: List[str]
+) -> List[str]:
+    """LLM 이 고른 시작 지점을 *실제로 존재하는* 이름으로만 남긴다.
+
+    없는 이름이 남으면 화면은 죽은 칩을, 에이전트는 열 수 없는 경로를 받는다.
+    직속 문서가 없는 상위 폴더에서는 하위 폴더가 올바른 시작 지점이므로 같이 허용하고,
+    소비자가 문서와 구분할 수 있게 ``이름/`` 형태로 통일한다.
+    """
+    files = {n: n for n in file_names if n}
+    folders = {_leaf(p): _leaf(p) + "/" for p in child_folders if _leaf(p)}
+    out: List[str] = []
+    for item in raw or []:
+        name = str(item or "").strip().strip("/")
+        if not name:
+            continue
+        resolved = files.get(name) or folders.get(name)
+        if resolved and resolved not in out:
+            out.append(resolved)
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 카드 빌드 + 증분 + 백필
 # ─────────────────────────────────────────────────────────────────────────────
@@ -457,7 +474,6 @@ def _resolve_generation_model() -> str:
 async def build_folder_card(
     tenant_id: str,
     folder_path: str,
-    doc_role: str = "content",
     *,
     force: bool = False,
 ) -> Dict[str, Any]:
@@ -466,23 +482,22 @@ async def build_folder_card(
     signature 동일하고 force=False 면 LLM 호출·쓰기 모두 skip (멱등·저비용).
     """
     fp = _norm(folder_path)
-    role = normalize_doc_role(doc_role)
     if not tenant_id or not fp:
         return {"folder_path": fp, "changed": False, "skipped": True, "signature": ""}
 
-    direct = await _direct_files(tenant_id, fp, role)
-    child_folders = await _direct_child_folders(tenant_id, fp, role)
+    direct = await _direct_files(tenant_id, fp)
+    child_folders = await _direct_child_folders(tenant_id, fp)
 
     # 빈 폴더(직속 문서 0 + 하위폴더 0) — 삭제됐거나 비워진 폴더. 카드 행 제거 후 종료.
     if not direct and not child_folders:
-        await _delete_card_row(tenant_id, fp, role)
+        await _delete_card_row(tenant_id, fp)
         return {"folder_path": fp, "changed": True, "skipped": False, "deleted": True, "signature": ""}
 
     # 자식 폴더의 기존 카드(요약 + signature) 수집 — bottom-up 이므로 이미 빌드돼 있어야 정확.
     child_sigs: List[Tuple[str, str]] = []
     child_cards: List[Tuple[str, Dict[str, Any]]] = []
     for cfp in child_folders:
-        row = await _get_card_row(tenant_id, cfp, role)
+        row = await _get_card_row(tenant_id, cfp)
         csig = (row or {}).get("signature") or ""
         ccard = (row or {}).get("card") if isinstance((row or {}).get("card"), dict) else {}
         child_sigs.append((cfp, csig))
@@ -491,7 +506,7 @@ async def build_folder_card(
     card_rows = await _doc_card_rows(tenant_id, direct)
     signature = _compute_signature(direct, card_rows, child_sigs)
 
-    existing = await _get_card_row(tenant_id, fp, role)
+    existing = await _get_card_row(tenant_id, fp)
     if existing and existing.get("signature") == signature and not force:
         return {"folder_path": fp, "changed": False, "skipped": True, "signature": signature}
 
@@ -504,7 +519,7 @@ async def build_folder_card(
     years = _extract_years(file_names, modified_times)
 
     # 하위 전체 문서 수 = 직접(folder_path==fp) + 하위(folder_path like fp/%).
-    n_docs_total = len(direct) + await _count_descendant_files(tenant_id, fp, role)
+    n_docs_total = len(direct) + await _count_descendant_files(tenant_id, fp)
 
     # LLM 요약 (1회)
     generated = await _generate_summary(_leaf(fp) or fp, briefs, child_cards)
@@ -515,7 +530,7 @@ async def build_folder_card(
         "summary": generated["summary"],
         "topics": signals["topics"] or generated["topics"],
         "reading_guide": generated["reading_guide"],
-        "start_with": generated["start_with"],
+        "start_with": _resolve_start_with(generated["start_with"], file_names, child_folders),
         "answers_questions": signals["answers_questions"],
         "doc_types": _doc_types(file_names),
         "date_range": _date_range(years),
@@ -543,13 +558,12 @@ async def build_folder_card(
             .upsert(
                 {
                     "tenant_id": tenant_id,
-                    "doc_role": role,
                     "folder_path": fp,
                     "card": card,
                     "signature": signature,
                     "built_at": card["built_at"],
                 },
-                on_conflict="tenant_id,doc_role,folder_path",
+                on_conflict="tenant_id,folder_path",
             )
             .execute
         )
@@ -559,20 +573,19 @@ async def build_folder_card(
                 "error": str(e)}
 
     logger.info(
-        "[folder_cards] built %s (role=%s) direct=%d total=%d subfolders=%d topics=%d guide=%d",
-        fp, role, len(direct), n_docs_total, len(child_folders), len(card["topics"]),
+        "[folder_cards] built %s direct=%d total=%d subfolders=%d topics=%d guide=%d",
+        fp, len(direct), n_docs_total, len(child_folders), len(card["topics"]),
         len(card["reading_guide"]),
     )
     return {"folder_path": fp, "changed": True, "skipped": False, "signature": signature}
 
 
-async def _count_descendant_files(tenant_id: str, folder_path: str, doc_role: str) -> int:
+async def _count_descendant_files(tenant_id: str, folder_path: str) -> int:
     try:
         resp = await asyncio.to_thread(
             supabase.table("knowledge_files")
             .select("source_ref", count="exact")
             .eq("tenant_id", tenant_id)
-            .eq("doc_role", doc_role)
             .like("folder_path", f"{folder_path}/%")
             .limit(1)
             .execute
@@ -582,21 +595,16 @@ async def _count_descendant_files(tenant_id: str, folder_path: str, doc_role: st
         return 0
 
 
-async def rebuild_card_with_propagation(
-    tenant_id: str,
-    folder_path: str,
-    doc_role: str = "content",
-) -> int:
+async def rebuild_card_with_propagation(tenant_id: str, folder_path: str) -> int:
     """폴더 카드 빌드 후, 카드가 *바뀌면* 부모로 올라가며 재빌드. 안 바뀌면 중단.
 
     경로 깊이만큼만(보통 ~7) 도므로 증분 비용 bounded. 반환: 빌드된 폴더 수.
     """
     fp = _norm(folder_path)
-    role = normalize_doc_role(doc_role)
     built = 0
     cur: Optional[str] = fp
     while cur:
-        res = await build_folder_card(tenant_id, cur, role)
+        res = await build_folder_card(tenant_id, cur)
         built += 1
         if res.get("skipped") and not res.get("changed"):
             # 이 폴더 카드가 안 바뀜 → 상위도 안 바뀜 → 중단.
@@ -605,14 +613,13 @@ async def rebuild_card_with_propagation(
     return built
 
 
-async def _delete_card_row(tenant_id: str, folder_path: str, doc_role: str) -> None:
+async def _delete_card_row(tenant_id: str, folder_path: str) -> None:
     """단일 폴더 카드 행 삭제 (정확히 그 folder_path)."""
     try:
         await asyncio.to_thread(
             supabase.table("knowledge_folder_cards")
             .delete()
             .eq("tenant_id", tenant_id)
-            .eq("doc_role", doc_role)
             .eq("folder_path", folder_path)
             .execute
         )
@@ -620,12 +627,10 @@ async def _delete_card_row(tenant_id: str, folder_path: str, doc_role: str) -> N
         logger.debug("[folder_cards] delete card row failed (%s): %s", folder_path, e)
 
 
-async def delete_folder_cards(
-    tenant_id: str, folder_path: str, doc_role: Optional[str] = None
-) -> int:
+async def delete_folder_cards(tenant_id: str, folder_path: str) -> int:
     """폴더 + 그 하위(subtree)의 카드 행을 모두 삭제. 폴더 삭제 시 호출.
 
-    doc_role 미지정이면 모든 role. 반환: 삭제 시도한 그룹 수(대략).
+    반환: 삭제 시도한 그룹 수(대략).
     """
     fp = _norm(folder_path)
     if not tenant_id or not fp:
@@ -643,25 +648,20 @@ async def delete_folder_cards(
                 .delete()
                 .eq("tenant_id", tenant_id)
             )
-            if doc_role:
-                base = base.eq("doc_role", normalize_doc_role(doc_role))
             await asyncio.to_thread(q(base).execute)
             n += 1
         except Exception as e:
             logger.warning("[folder_cards] delete_folder_cards failed (%s): %s", fp, e)
-    logger.info("[folder_cards] deleted cards under %s (role=%s)", fp, doc_role or "(all)")
+    logger.info("[folder_cards] deleted cards under %s", fp)
     return n
 
 
-async def rebuild_folders(
-    tenant_id: str, folder_paths: List[str], doc_role: str = "content"
-) -> Dict[str, Any]:
+async def rebuild_folders(tenant_id: str, folder_paths: List[str]) -> Dict[str, Any]:
     """주어진 폴더들 + 그 *조상 전부* 를 bottom-up(잎부터)으로 1회씩 재생성.
 
     업로드/파일삭제 배치 후 *영향받은 폴더만* 갱신하는 경로 (full backfill 대비 저렴, storm 없음).
     각 폴더는 signature-skip 으로 실제 바뀐 것만 LLM 호출. 같은 폴더는 한 번만 빌드(dedupe).
     """
-    role = normalize_doc_role(doc_role)
     affected: set[str] = set()
     for raw in folder_paths or []:
         fp = _norm(raw)
@@ -676,7 +676,7 @@ async def rebuild_folders(
     ordered = sorted(affected, key=lambda p: p.count("/"), reverse=True)
     built = skipped = deleted = 0
     for fp in ordered:
-        res = await build_folder_card(tenant_id, fp, role)
+        res = await build_folder_card(tenant_id, fp)
         if res.get("deleted"):
             deleted += 1
         elif res.get("changed"):
@@ -684,50 +684,26 @@ async def rebuild_folders(
         else:
             skipped += 1
     logger.info(
-        "[folder_cards] rebuild_folders role=%s affected=%d built=%d skipped=%d deleted=%d",
-        role, len(affected), built, skipped, deleted,
+        "[folder_cards] rebuild_folders affected=%d built=%d skipped=%d deleted=%d",
+        len(affected), built, skipped, deleted,
     )
     return {"built": built, "skipped": skipped, "deleted": deleted}
 
 
-async def backfill_tenant(tenant_id: str, doc_role: Optional[str] = None) -> Dict[str, Any]:
-    """tenant 의 모든 폴더 카드를 bottom-up(잎부터)으로 1회 빌드. signature 동일이면 skip.
-
-    doc_role 미지정 시 knowledge_files 에 등장한 모든 doc_role 에 대해 수행.
-    """
-    roles: List[str]
-    if doc_role:
-        roles = [normalize_doc_role(doc_role)]
-    else:
-        roles = await _distinct_doc_roles(tenant_id)
-
+async def backfill_tenant(tenant_id: str) -> Dict[str, Any]:
+    """tenant 의 모든 폴더 카드를 bottom-up(잎부터)으로 1회 빌드. signature 동일이면 skip."""
+    folders = await _all_folders_for_tenant(tenant_id)
+    # 깊은(잎) 폴더부터 → 부모가 자식 카드를 집계할 때 이미 존재.
+    folders.sort(key=lambda p: p.count("/"), reverse=True)
     total_built = 0
     total_skipped = 0
-    for role in roles:
-        folders = await _all_folders_for_tenant(tenant_id, role)
-        # 깊은(잎) 폴더부터 → 부모가 자식 카드를 집계할 때 이미 존재.
-        folders.sort(key=lambda p: p.count("/"), reverse=True)
-        for fp in folders:
-            res = await build_folder_card(tenant_id, fp, role)
-            if res.get("changed"):
-                total_built += 1
-            else:
-                total_skipped += 1
-        logger.info("[folder_cards] backfill role=%s folders=%d", role, len(folders))
-
-    return {"tenant_id": tenant_id, "roles": roles, "built": total_built, "skipped": total_skipped}
+    for fp in folders:
+        res = await build_folder_card(tenant_id, fp)
+        if res.get("changed"):
+            total_built += 1
+        else:
+            total_skipped += 1
+    logger.info("[folder_cards] backfill folders=%d", len(folders))
+    return {"tenant_id": tenant_id, "built": total_built, "skipped": total_skipped}
 
 
-async def _distinct_doc_roles(tenant_id: str) -> List[str]:
-    try:
-        resp = await asyncio.to_thread(
-            supabase.table("knowledge_files")
-            .select("doc_role")
-            .eq("tenant_id", tenant_id)
-            .limit(_FETCH_LIMIT)
-            .execute
-        )
-        roles = {normalize_doc_role(r.get("doc_role")) for r in (resp.data or [])}
-        return sorted(roles) or ["content"]
-    except Exception:
-        return ["content"]

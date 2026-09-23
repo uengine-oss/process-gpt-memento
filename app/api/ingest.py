@@ -209,7 +209,6 @@ async def process_session_file(request: ProcessSessionFileRequest):
                 file_name=original_filename,
                 folder_path="",
                 initial_status=INDEX_STATUS_INDEXED,
-                doc_role=doc_role,
             )
         except Exception as exc:
             print(f"[process-session-file] knowledge_files 등록 실패 (계속): {exc}")
@@ -537,7 +536,6 @@ async def save_to_storage(
                 file_name=file_name,
                 folder_path="",
                 initial_status=INDEX_STATUS_INDEXED,
-                doc_role="content",
             )
         except Exception as exc:  # noqa: BLE001 — 등록 실패가 업로드를 막지 않게
             print(f"[save-to-storage] knowledge_files 등록 실패 (계속): {exc}")

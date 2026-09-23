@@ -9,22 +9,28 @@
 -- 에서 파생된 폴더 전부*라 의미가 다르다. card 는 결정론 필드(수/날짜/종류/엔티티) + LLM
 -- 요약(summary/topics)을 합친 JSONB. signature 로 증분 재생성 판정.
 --
--- Supabase SQL 에디터에서 1회 실행. 이 테이블이 없어도 /folders/* 는 card=null 로 동작(Stage 1).
+-- 키는 (tenant_id, folder_path) 다. 지도에는 자료 분류(doc_role)가 없다 — 올라온 모든 문서가
+-- 같은 길을 가고 폴더 하나에 카드 하나다. 예전 스키마는 PK 에 doc_role 이 있어 한 폴더에
+-- 분류 수만큼 카드가 생겼고, 조회는 folder_path 로만 키를 잡아 서로 덮어썼다.
+--
+-- Supabase SQL 에디터에서 1회 실행. 이 테이블이 없어도 /folders/* 는 card=null 로 동작.
 
-CREATE TABLE IF NOT EXISTS public.knowledge_folder_cards (
+-- 주의: 기존 카드를 버리고 새로 만든다(카드는 파생 데이터라 재생성 가능 — 폴더당 LLM 1회).
+DROP TABLE IF EXISTS public.knowledge_folder_cards;
+
+CREATE TABLE public.knowledge_folder_cards (
     tenant_id   text        NOT NULL,
-    doc_role    text        NOT NULL DEFAULT 'content',
     folder_path text        NOT NULL,
     card        jsonb       NOT NULL DEFAULT '{}'::jsonb,
     signature   text,
     built_at    timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (tenant_id, doc_role, folder_path)
+    PRIMARY KEY (tenant_id, folder_path)
 );
 
 -- tenant 단위 조회(트리/오픈) 가속.
-CREATE INDEX IF NOT EXISTS idx_kfc_tenant
-    ON public.knowledge_folder_cards (tenant_id, doc_role);
+CREATE INDEX idx_kfc_tenant
+    ON public.knowledge_folder_cards (tenant_id);
 
 -- 하위 폴더 prefix 조회용(증분 전파 시 자식 카드 모으기).
-CREATE INDEX IF NOT EXISTS idx_kfc_tenant_path
-    ON public.knowledge_folder_cards (tenant_id, doc_role, folder_path text_pattern_ops);
+CREATE INDEX idx_kfc_tenant_path
+    ON public.knowledge_folder_cards (tenant_id, folder_path text_pattern_ops);

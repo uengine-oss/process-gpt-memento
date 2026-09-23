@@ -468,7 +468,7 @@ async def load_neighbors(tenant_id: str, file_id: str) -> CardContext:
     try:
         me = await asyncio.to_thread(
             supabase.table("knowledge_files")
-            .select("folder_path, doc_role")
+            .select("folder_path")
             .eq("tenant_id", tenant_id)
             .eq("source_ref", file_id)
             .limit(1)
@@ -485,7 +485,6 @@ async def load_neighbors(tenant_id: str, file_id: str) -> CardContext:
             .select("source_ref, file_name")
             .eq("tenant_id", tenant_id)
             .eq("folder_path", folder_path)
-            .eq("doc_role", rows[0].get("doc_role") or "content")
             .neq("source_ref", file_id)
             .order("file_name")
             .limit(MAX_NEIGHBORS)

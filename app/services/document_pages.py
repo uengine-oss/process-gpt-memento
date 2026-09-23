@@ -278,8 +278,8 @@ async def post_load_hook(
     인제스트 성공의 기준이다. 카드는 백그라운드로 돌고, 실패해도 페이지는 남는다.
 
     Args:
-        skip_abstract: True 면 카드 생성을 생략 (페이지 저장만). 용어사전·양식 등
-            카드가 의미 없는 doc_role 에서 사용.
+        skip_abstract: True 면 카드 생성을 생략 (페이지 저장만). 지도에 올리지 않는
+            채팅 첨부 인제스트에서 사용.
     """
     if not tenant_id or not file_id or not page_docs:
         return 0
