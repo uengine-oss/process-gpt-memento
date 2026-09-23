@@ -236,13 +236,69 @@ def _table_to_markdown(table_el, rels: Dict[str, str]) -> Tuple[str, List[List[D
 # 본문 블록 단위
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_blocks(document_xml: bytes, rels: Dict[str, str]) -> List[Dict[str, Any]]:
+_HEADING_NAME = re.compile(r"^(?:heading|제목)\s*(\d)$", re.IGNORECASE)
+
+
+def heading_styles(styles_xml: bytes) -> Dict[str, int]:
+    """styles.xml → {styleId: 1-based 헤딩 수준}. outlineLvl 또는 기본 제목 스타일 이름, basedOn 상속."""
+    root = etree.fromstring(styles_xml)
+    own: Dict[str, Optional[int]] = {}
+    based_on: Dict[str, str] = {}
+    for style in root.iter(W + "style"):
+        sid = style.get(W + "styleId") or ""
+        level: Optional[int] = None
+        outline = style.find(f"{W}pPr/{W}outlineLvl")
+        name = style.find(W + "name")
+        if outline is not None and (outline.get(W + "val") or "").isdigit():
+            value = int(outline.get(W + "val"))
+            level = value + 1 if value < 9 else None  # 9 = 본문 수준
+        elif name is not None:
+            match = _HEADING_NAME.match((name.get(W + "val") or "").strip())
+            if match:
+                level = int(match.group(1))
+        own[sid] = level
+        parent = style.find(W + "basedOn")
+        if parent is not None:
+            based_on[sid] = parent.get(W + "val") or ""
+    levels: Dict[str, int] = {}
+    for sid in own:
+        current, hops = sid, 0
+        while current and own.get(current) is None and hops < 10:
+            current, hops = based_on.get(current, ""), hops + 1
+        if current and own.get(current):
+            levels[sid] = own[current]
+    return levels
+
+
+def _heading_level(p, heading_style_levels: Dict[str, int]) -> Optional[int]:
+    outline = p.find(f"{W}pPr/{W}outlineLvl")
+    if outline is not None and (outline.get(W + "val") or "").isdigit():
+        value = int(outline.get(W + "val"))
+        return value + 1 if value < 9 else None
+    style = p.find(f"{W}pPr/{W}pStyle")
+    return heading_style_levels.get(style.get(W + "val") or "") if style is not None else None
+
+
+def _body_children(container):
+    """본문 순서의 p/tbl — 콘텐츠 컨트롤(sdt, 목차 등) 안쪽까지 편다."""
+    for child in container:
+        if _ln(child) == "sdt":
+            content = child.find(W + "sdtContent")
+            if content is not None:
+                yield from _body_children(content)
+        else:
+            yield child
+
+
+def parse_blocks(
+    document_xml: bytes, rels: Dict[str, str], heading_style_levels: Optional[Dict[str, int]] = None
+) -> List[Dict[str, Any]]:
     root = etree.fromstring(document_xml)
     body = root.find(W + "body")
     blocks: List[Dict[str, Any]] = []
     para_idx = 0
     table_idx = 0
-    for child in body:
+    for child in _body_children(body):
         ln = _ln(child)
         if ln == "p":
             text = _paragraph_text(child)
@@ -253,6 +309,7 @@ def parse_blocks(document_xml: bytes, rels: Dict[str, str]) -> List[Dict[str, An
                 "type": "paragraph",
                 "index": para_idx,
                 "text": text,
+                "heading_level": _heading_level(child, heading_style_levels or {}),
                 "comments": comments,
                 "placeholders": placeholders,
                 "images": images,
@@ -422,7 +479,8 @@ def parse(path: str, out_dir: Optional[Path] = None, describe: bool = False) -> 
         if "word/comments.xml" in names:
             comments_meta = parse_comments_xml(z.read("word/comments.xml"))
 
-        blocks = parse_blocks(document_xml, rels)
+        levels = heading_styles(z.read("word/styles.xml")) if "word/styles.xml" in names else {}
+        blocks = parse_blocks(document_xml, rels, levels)
 
         # 이미지 추출 + (옵션) 설명
         if out_dir is None:

@@ -16,7 +16,7 @@ import io
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def _local_tag(elem) -> str:
@@ -183,8 +183,30 @@ def _mime_from_name(name: str) -> str:
     }.get(ext, "application/octet-stream")
 
 
-def _walk(elem, tokens: List[Tuple[str, str]]) -> None:
-    """섹션 XML 을 문서 순서대로 순회 → [('text'|'table'|'image', value)] 누적.
+def _outline_levels(z: zipfile.ZipFile) -> Dict[str, int]:
+    """header.xml 의 개요 수준 문단 모양 → {paraPr id: 1-based 헤딩 수준}."""
+    try:
+        root = ET.fromstring(z.read("Contents/header.xml"))
+    except (KeyError, ET.ParseError):
+        return {}
+    levels: Dict[str, int] = {}
+    for para_pr in root.iter():
+        if _local_tag(para_pr) != "paraPr":
+            continue
+        for heading in para_pr:
+            if _local_tag(heading) == "heading" and heading.get("type") == "OUTLINE":
+                try:
+                    levels[para_pr.get("id", "")] = int(heading.get("level", "0")) + 1
+                except ValueError:
+                    pass
+    return levels
+
+
+Token = Tuple[str, str, Optional[int]]
+
+
+def _walk(elem, tokens: List[Token], outline: Dict[str, int]) -> None:
+    """섹션 XML 을 문서 순서대로 순회 → [('text'|'table'|'image', value, heading_level)] 누적.
 
     image value 는 binaryItemIDRef. 표를 포함한 문단은 표 위치 보존을 위해 자식 재귀.
     """
@@ -193,7 +215,7 @@ def _walk(elem, tokens: List[Tuple[str, str]]) -> None:
     if lt == "tbl":
         md = _parse_table_to_markdown(elem)
         if md:
-            tokens.append(("table", md))
+            tokens.append(("table", md, None))
         return
 
     if lt == "p":
@@ -203,32 +225,33 @@ def _walk(elem, tokens: List[Tuple[str, str]]) -> None:
         if has_tbl:
             # 표 포함 문단: 표 위치 보존 위해 자식 재귀
             for child in elem:
-                _walk(child, tokens)
+                _walk(child, tokens, outline)
         else:
             text = _collect_text(elem)
             if text.strip():
-                tokens.append(("text", text))
+                tokens.append(("text", text, outline.get(elem.get("paraPrIDRef", ""))))
         # 이미지는 표 유무와 무관하게 문단에서 수집(문단 처리 뒤 삽입).
         # HWPX 는 이미지가 표와 같은 문단에 묶이는 경우가 흔하다.
         for sub in elem.iter():
             if _local_tag(sub) == "img":
                 ref = sub.get("binaryItemIDRef")
                 if ref:
-                    tokens.append(("image", ref))
+                    tokens.append(("image", ref, None))
         return
 
     for child in elem:
-        _walk(child, tokens)
+        _walk(child, tokens, outline)
 
 
-def parse(path: str, describe: bool = True) -> str:
-    """HWPX → 텍스트(+표 마크다운 + 이미지 VLM 설명 inline).
+def parse_blocks(path: str, describe: bool = True) -> List[Dict[str, Any]]:
+    """HWPX → 문서 순서의 블록 목록 [{kind, text, heading_level}].
 
-    describe=True 면 이미지를 공용 vision 헬퍼로 설명해 ``[그림: ...]`` 로 삽입한다.
+    kind 는 paragraph | table | image. describe=True 면 이미지를 공용 vision 헬퍼로 설명한다.
     LLM 미설정/실패 시 해당 이미지는 조용히 생략(fail-open).
     """
     with zipfile.ZipFile(path, "r") as z:
         manifest = _load_manifest(z)
+        outline = _outline_levels(z)
         section_files = sorted(
             n for n in z.namelist()
             if n.startswith("Contents/section") and n.endswith(".xml")
@@ -236,23 +259,19 @@ def parse(path: str, describe: bool = True) -> str:
         if not section_files:
             raise ValueError("HWPX: section*.xml 을 찾지 못함")
 
-        section_tokens: List[List[Tuple[str, str]]] = []
+        tokens: List[Token] = []
         for sec in section_files:
-            root = ET.fromstring(z.read(sec))
-            toks: List[Tuple[str, str]] = []
-            _walk(root, toks)
-            section_tokens.append(toks)
+            _walk(ET.fromstring(z.read(sec)), tokens, outline)
 
         # 이미지 ref 수집(dedup) → 추출 → VLM 병렬 설명
         desc_map: Dict[str, str] = {}
         if describe:
             ordered_refs: List[str] = []
             seen = set()
-            for toks in section_tokens:
-                for kind, val in toks:
-                    if kind == "image" and val not in seen:
-                        seen.add(val)
-                        ordered_refs.append(val)
+            for kind, val, _level in tokens:
+                if kind == "image" and val not in seen:
+                    seen.add(val)
+                    ordered_refs.append(val)
             images: Dict[str, Tuple[bytes, str]] = {}
             for ref in ordered_refs:
                 loaded = _load_image(z, manifest, ref)
@@ -276,18 +295,21 @@ def parse(path: str, describe: bool = True) -> str:
                 ]
                 desc_map = vision.run_parallel(tasks)
 
-        # 최종 문자열 조립(문서 순서 보존)
-        section_strs: List[str] = []
-        for toks in section_tokens:
-            parts: List[str] = []
-            for kind, val in toks:
-                if kind in ("text", "table"):
-                    parts.append(val)
-                elif kind == "image":
-                    desc = (desc_map.get(val) or "").strip()
-                    if desc:
-                        parts.append(f"[그림: {desc}]")
-            if parts:
-                section_strs.append("\n\n".join(parts))
+    blocks: List[Dict[str, Any]] = []
+    for kind, val, level in tokens:
+        if kind == "image":
+            desc = (desc_map.get(val) or "").strip()
+            if desc:
+                blocks.append({"kind": "image", "text": f"[그림: {desc}]", "heading_level": None})
+        else:
+            blocks.append({
+                "kind": "paragraph" if kind == "text" else "table",
+                "text": val,
+                "heading_level": level,
+            })
+    return blocks
 
-        return "\n\n".join(section_strs)
+
+def parse(path: str, describe: bool = True) -> str:
+    """HWPX → 텍스트(+표 마크다운 + 이미지 VLM 설명 inline)."""
+    return "\n\n".join(block["text"] for block in parse_blocks(path, describe=describe))

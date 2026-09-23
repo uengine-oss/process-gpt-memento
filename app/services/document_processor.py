@@ -17,6 +17,7 @@ from openai import OpenAI
 
 from app.plugins.chunkers import get_chunker
 from app.plugins.parsers import get_pdf_parser
+from app.services.document_blocks import BLOCKS_KEY
 from langchain_community.document_loaders import (
     UnstructuredWordDocumentLoader,
     UnstructuredPowerPointLoader,
@@ -74,33 +75,51 @@ def _load_xlsx_documents(data: bytes, file_name: str) -> List[Document]:
     return docs
 
 
-def _extract_text_from_hwp_or_hwpx(file_path: str, file_extension: str) -> Tuple[Optional[str], Optional[str]]:
+def _docx_blocks(parsed: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """docx_structured 블록 → document_blocks 입력. 그림 설명은 문단 뒤 별도 블록."""
+    blocks: List[Dict[str, Any]] = []
+    for b in parsed:
+        if b["type"] == "table":
+            blocks.append({"kind": "table", "text": b["markdown"], "heading_level": None})
+            continue
+        blocks.append({"kind": "paragraph", "text": b["text"], "heading_level": b.get("heading_level")})
+        for img in b.get("images") or []:
+            if img.get("description"):
+                blocks.append({"kind": "image", "text": f"[그림: {img['description']}]", "heading_level": None})
+    return blocks
+
+
+def _extract_text_from_hwp_or_hwpx(
+    file_path: str, file_extension: str
+) -> Tuple[Optional[str], Optional[str], Optional[List[Dict[str, Any]]]]:
     """
     Extract text from HWP or HWPX file.
-      - .hwpx → app 측 구조화 파서(hwpx_structured): 텍스트 + 표(마크다운) + 이미지(VLM 설명) inline.
-      - .hwp  → vendored extract_hwp(HWP 5.0/OLE). 미설치 시 설치 안내.
-    Returns (text, error_message); error_message is None on success.
+      - .hwpx → app 측 구조화 파서(hwpx_structured): 블록(문단·표·그림 설명) + 개요 수준 헤딩.
+      - .hwp  → vendored extract_hwp(HWP 5.0/OLE). 미설치 시 설치 안내. 블록 구조 없음.
+    Returns (text, error_message, blocks); error_message is None on success.
     PyPI extract-hwp 0.1.0 ships no module (packaging bug); .hwp 는 Git 설치 또는 vendor 사용.
     """
     if file_extension == ".hwpx":
         try:
-            from app.plugins.parsers.hwpx_structured import parse as parse_hwpx
-            text = parse_hwpx(file_path, describe=True)
-            return (text, None)
+            from app.plugins.parsers.hwpx_structured import parse_blocks
+            blocks = parse_blocks(file_path, describe=True)
+            return ("\n\n".join(b["text"] for b in blocks), None, blocks)
         except Exception as e:
-            return (None, str(e))
+            return (None, str(e), None)
 
     if file_extension == ".hwp":
         try:
             from extract_hwp import extract_text_from_hwp
-            return extract_text_from_hwp(file_path)
+            text, error = extract_text_from_hwp(file_path)
+            return (text, error, None)
         except ModuleNotFoundError:
             return (
                 None,
                 "HWP 파일 처리를 위해 extract-hwp를 GitHub에서 설치해 주세요: uv pip install \"extract-hwp @ git+https://github.com/thlee/extract-hwp.git\" (또는 vendor 폴더에 소스 추가)",
+                None,
             )
 
-    return (None, f"Unsupported extension: {file_extension}")
+    return (None, f"Unsupported extension: {file_extension}", None)
 
 
 class DocumentProcessor:
@@ -188,7 +207,8 @@ class DocumentProcessor:
                         if cell.text.strip():
                             parts.append(cell.text)
             flat_text = "\n\n".join(parts)
-        return [Document(page_content=flat_text)]
+            return [Document(page_content=flat_text)]
+        return [Document(page_content=flat_text, metadata={BLOCKS_KEY: _docx_blocks(result["blocks"])})]
 
     async def load_document(self, file_content: bytes, file_name: str) -> Optional[List[Document]]:
         """Async: Load a document from memory (BytesIO object)."""
@@ -290,7 +310,7 @@ class DocumentProcessor:
                     tmp_path = tmp.name
                 converted_pdf_path = None
                 try:
-                    text, error = await asyncio.to_thread(
+                    text, error, hwp_blocks = await asyncio.to_thread(
                         _extract_text_from_hwp_or_hwpx, tmp_path, file_extension
                     )
                     if error is not None:
@@ -315,7 +335,8 @@ class DocumentProcessor:
                             print(f"[fallback] unexpected conversion error for {file_name}: {conv_err}")
                             return None
                     else:
-                        documents = [Document(page_content=text or "")]
+                        meta = {BLOCKS_KEY: hwp_blocks} if hwp_blocks else {}
+                        documents = [Document(page_content=text or "", metadata=meta)]
                 finally:
                     if converted_pdf_path and os.path.exists(converted_pdf_path):
                         await asyncio.to_thread(os.unlink, converted_pdf_path)
@@ -410,6 +431,8 @@ class DocumentProcessor:
             
             # Split documents into chunks (strategy pluggable via CHUNKER_STRATEGY)
             chunks = await self.chunker.split(documents)
+            for chunk in chunks:
+                chunk.metadata.pop(BLOCKS_KEY, None)  # 블록 목록은 document_blocks 로만 간다
 
             # Add chunk information to metadata
             for i, chunk in enumerate(chunks):

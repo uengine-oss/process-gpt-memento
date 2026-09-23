@@ -4,6 +4,9 @@
 """
 from typing import Dict, Optional, Type
 
+# 파서 출력이 바뀌면 올린다. knowledge_files.parser_version 으로 재인덱싱 대상을 고른다.
+PARSER_VERSION = "2026-09-23.blocks"
+
 from . import config
 from .base import BaseParser
 from .pymupdf_parser import PyMuPDFParser

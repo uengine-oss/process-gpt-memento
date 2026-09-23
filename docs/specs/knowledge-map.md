@@ -14,6 +14,7 @@
 | 층 | 저장소 | 만드는 곳 | 읽는 곳 |
 |---|---|---|---|
 | 원문 페이지 | `document_pages` | `document_pages.save_pages` | codex 미러 `text/`, `/document/page`, `/document/grep` |
+| 블록 | `document_blocks` | `document_blocks.save_blocks` | (아직 읽는 곳 없음) |
 | 문서 카드 | `knowledge_doc_cards` | `doc_cards.build_card` (백그라운드) | `CATALOG.tsv`, `/catalog`, `/folders/open` |
 | 폴더 카드 | `knowledge_folder_cards` | `folder_cards.build_folder_card` (bottom-up) | `TREE.md`, `/folders/tree`, `/folders/open` |
 | 검색 힌트 | 벡터 인덱스 + `documents` | `rag_chain.process_and_store_documents` | `/search`, `/documents/full-text` |
@@ -24,6 +25,8 @@
 2. 인제스트 워커(`ingest_queue`)가 한 파일씩 `_index_uploaded_file` 을 돈다.
 3. 형식별 파서가 페이지 단위 `Document` 목록을 만든다.
 4. **페이지가 한 쪽이라도 저장되면 `indexed`** 다. 페이지가 있으면 에이전트가 읽을 수 있다.
+   이어서 블록을 저장하고 `knowledge_files.parser_version` 을 기록한다. 블록 저장 실패는
+   `indexed` 를 되돌리지 않는다.
 5. 문서 카드는 페이지 저장 뒤 백그라운드로 만든다. 실패해도 `indexed` 를 되돌리지 않는다.
 6. 벡터 인덱스는 그 뒤의 보조 단계다. 실패하면 `index_error` 에 `hints: ...` 로만 남는다.
 7. 테넌트의 인덱싱이 멈추면(`pending`/`processing` 0) 바뀐 폴더와 조상의 폴더 카드를 다시 만든다.
@@ -42,6 +45,20 @@
 
 DOCX·HWPX·HWP는 흐르는 문서라 파일에 쪽 정보가 없다. 렌더러로 계산한 쪽은 사용자가
 보는 쪽과 다르므로 쪽 번호로 인용하지 않는다([근거](../DESIGN_NOTES.md#흐르는-문서의-쪽-번호)).
+
+### 블록
+
+블록은 인용 앵커다. `document_blocks(tenant_id, file_id, block_index, kind, text,
+heading_level, page_number, bbox)`.
+
+- `kind`: `paragraph` | `table` | `image`(그림 설명).
+- DOCX·HWPX는 파서의 구조를 그대로 쓴다. `page_number` 는 `null` 이다.
+  `heading_level` 은 파일에 명시된 헤딩만 — DOCX 제목 스타일·`outlineLvl`(basedOn 상속),
+  HWPX 개요 수준 문단 모양. 번호 패턴으로 추측하지 않는다. DOCX 콘텐츠 컨트롤(`sdt`) 안도 읽는다.
+- 그 밖의 형식은 쪽 본문을 빈 줄로 나누고 쪽 번호를 단다. PDF는 `blocks_json` offset으로 `bbox` 를 붙인다.
+  HWP(`extract_hwp`)·TXT는 쪽이 없어 `page_number` 가 `null` 이다.
+- 2,000자를 넘는 블록은 줄 경계에서 나눈다. 표는 행 경계에서 나누고 머리행을 반복한다. 헤딩은 나누지 않는다.
+- 파서 출력이 바뀌면 `app/plugins/parsers.PARSER_VERSION` 을 올린다.
 
 ## 상태
 
@@ -99,5 +116,5 @@ DOCX·HWPX·HWP는 흐르는 문서라 파일에 쪽 정보가 없다. 렌더러
 ## 스키마 전제
 
 지도 API는 `sql/knowledge_doc_cards.sql`, `sql/knowledge_folder_cards.sql`, `sql/kb_mirror.sql`
-을 전제로 한다. `/folders/tree`·`/folders/open` 이 `knowledge_files.has_text`/`page_count` 를
+을 전제로 한다. 블록 저장은 `sql/document_blocks.sql` 을 전제로 한다(없으면 경고만 남기고 인제스트는 계속). `/folders/tree`·`/folders/open` 이 `knowledge_files.has_text`/`page_count` 를
 읽고, codex 미러가 `kb_page_text` RPC로 전문을 배치로 가져간다.

@@ -265,6 +265,21 @@ async def schedule_card_build(
     asyncio.create_task(_run())
 
 
+async def _record_parser_version(tenant_id: str, file_id: str) -> None:
+    from app.plugins.parsers import PARSER_VERSION
+
+    try:
+        await asyncio.to_thread(
+            supabase.table("knowledge_files")
+            .update({"parser_version": PARSER_VERSION})
+            .eq("tenant_id", tenant_id)
+            .eq("source_ref", file_id)
+            .execute
+        )
+    except Exception as e:  # noqa: BLE001 - 컬럼이 없는 환경에서도 인제스트는 계속
+        logger.warning("[document_pages] parser_version not recorded (%s/%s): %s", tenant_id, file_id, e)
+
+
 async def post_load_hook(
     tenant_id: Optional[str],
     file_id: Optional[str],
@@ -287,6 +302,10 @@ async def post_load_hook(
     try:
         saved = await save_pages(tenant_id, file_id, page_docs)
         if saved and not skip_abstract:
+            from app.services.document_blocks import build_blocks, save_blocks
+
+            await save_blocks(tenant_id, file_id, build_blocks(page_docs))
+            await _record_parser_version(tenant_id, file_id)
             await schedule_card_build(tenant_id, file_id, page_docs)
         return saved
     except Exception as e:
