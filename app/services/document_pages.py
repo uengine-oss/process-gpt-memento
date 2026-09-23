@@ -223,6 +223,9 @@ async def build_and_store_card(
         )
         if reused["file_id"] != file_id:
             await doc_sections.copy_sections(tenant_id, reused["file_id"], file_id)
+        from app.services.section_search import reindex_file
+
+        await reindex_file(tenant_id, file_id, file_name)
         return
 
     # 블록은 인제스트가 이미 저장했다. 블록 이전에 들어온 문서는 페이지에서 만들어 둔다.
@@ -235,6 +238,9 @@ async def build_and_store_card(
         card = await doc_cards.build_card(file_name=file_name, blocks=blocks, context=context)
         sections = await doc_sections.finalize(card.sections, blocks, file_name, doc_cards._ask)
     await doc_sections.save_sections(tenant_id, file_id, sections)
+    from app.services.section_search import index_sections
+
+    await index_sections(tenant_id, file_id, file_name, sections, blocks)
     # 모든 조각이 실패했으면 카드가 아니라 실패다. done 으로 묻으면 재시도 대상에서 빠진다.
     every_window_failed = (
         card.coverage.windows_read > 0

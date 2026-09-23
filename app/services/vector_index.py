@@ -84,10 +84,10 @@ class ChromaIndex:
     # SQLite 백엔드라 동시 쓰기가 "database is locked" 를 유발한다.
     requires_write_lock = True
 
-    def __init__(self) -> None:
+    def __init__(self, collection_name: Optional[str] = None) -> None:
         from pathlib import Path
 
-        self.collection_name = config.chroma_collection_name().strip()
+        self.collection_name = (collection_name or config.chroma_collection_name()).strip()
 
         server_host = config.chroma_server_host()
         if server_host:
@@ -192,10 +192,10 @@ class QdrantIndex:
     # Qdrant 는 동시 쓰기를 자체 처리한다 — 상위 직렬화 락이 불필요(처리량 손해만 남음).
     requires_write_lock = False
 
-    def __init__(self) -> None:
+    def __init__(self, collection_name: Optional[str] = None) -> None:
         from qdrant_client import QdrantClient
 
-        self.collection_name = config.qdrant_collection_name().strip()
+        self.collection_name = (collection_name or config.qdrant_collection_name()).strip()
         self.url = config.qdrant_url()
         self.on_disk = config.qdrant_on_disk()
         self.quantization = config.qdrant_quantization()
@@ -472,10 +472,11 @@ def _parse_clause(clause: Dict[str, Any]):
 # ──────────────────────────────── factory ────────────────────────────────
 
 
-def make_vector_index() -> VectorIndex:
+def make_vector_index(collection_name: Optional[str] = None) -> VectorIndex:
+    """collection_name 을 주면 같은 백엔드의 다른 컬렉션(예: 섹션 인덱스)을 연다."""
     backend = config.vector_backend()
     if backend == "qdrant":
-        return QdrantIndex()
+        return QdrantIndex(collection_name)
     if backend == "chroma":
-        return ChromaIndex()
+        return ChromaIndex(collection_name)
     raise ValueError(f"Unknown VECTOR_BACKEND: {backend!r} (chroma | qdrant)")

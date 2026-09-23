@@ -18,6 +18,7 @@ from app.api.navigator import router as navigator_router
 from app.api.parse_preview import router as parse_preview_router
 from app.api.query import router as query_router
 from app.api.retrieve import router as retrieve_router
+from app.api.sections import router as sections_router
 from app.api.summary import router as summary_router
 from app.core.logging_setup import attach_to_uvicorn_loggers
 from app.core.memory_monitor import log_memory_snapshot, memory_log_loop
@@ -66,6 +67,7 @@ app.include_router(knowledge_admin_router)
 app.include_router(navigator_router)
 app.include_router(parse_preview_router)
 app.include_router(folders_router)
+app.include_router(sections_router)
 app.include_router(summary_router)
 
 

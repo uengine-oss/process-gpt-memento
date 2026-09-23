@@ -403,6 +403,9 @@ async def delete_entry(
         result["pages_deleted"] = True
     except Exception as e:
         logger.warning("[knowledge_files] delete document_pages failed: %s", e)
+    from app.services.section_search import forget_files
+
+    await forget_files(tenant_id, [source_ref])
 
     # 5. processed_files 삭제 (재인덱싱 가능하도록)
     try:
@@ -594,6 +597,9 @@ async def clear_index_artifacts(tenant_id: str, source_ref: str) -> None:
         )
     except Exception as e:
         logger.warning("[knowledge_files] clear: document_pages failed: %s", e)
+    from app.services.section_search import forget_files
+
+    await forget_files(tenant_id, [source_ref])
 
     # 5. processed_files (file_id 실제 컬럼) — 재인덱싱 가능하도록
     try:
@@ -752,6 +758,9 @@ async def delete_entries_bulk(
         result["pages_deleted"] = True
     except Exception as e:
         logger.warning("[knowledge_files] bulk delete document_pages failed: %s", e)
+    from app.services.section_search import forget_files
+
+    await forget_files(tenant_id, refs)
 
     # 5. processed_files 삭제 (file_id IN refs — 실제 컬럼)
     try:

@@ -15,7 +15,8 @@
 |---|---|---|---|
 | 원문 페이지 | `document_pages` | `document_pages.save_pages` | codex 미러 `text/`, `/document/page`, `/document/grep` |
 | 블록 | `document_blocks` | `document_blocks.save_blocks` | 카드·섹션 생성 |
-| 섹션 | `document_sections` | `doc_sections.finalize` (카드와 같은 LLM 통과) | (아직 읽는 곳 없음) |
+| 섹션 | `document_sections` | `doc_sections.finalize` (카드와 같은 LLM 통과) | `/sections/search`, `/document/outline`, `/document/section` |
+| 섹션 벡터 | 벡터 백엔드의 `kb_sections` 컬렉션 | `section_search.index_sections` | `/sections/search` |
 | 문서 카드 | `knowledge_doc_cards` | `doc_cards.build_card` (백그라운드) | `CATALOG.tsv`, `/catalog`, `/folders/open` |
 | 폴더 카드 | `knowledge_folder_cards` | `folder_cards.build_folder_card` (bottom-up) | `TREE.md`, `/folders/tree`, `/folders/open` |
 | 검색 힌트 | 벡터 인덱스 + `documents` | `rag_chain.process_and_store_documents` | `/search`, `/documents/full-text` |
@@ -111,6 +112,26 @@ end_block, title, summary, chars, source)`.
 | `GET /catalog` | 선택 범위의 문서 카드 목록 |
 | `GET /document/grep` · `/document/page` · `/document/raw` | 본문 검색 · 페이지 읽기 · 원본 바이트 |
 | `GET /search` | 벡터 top-k. `file_ids` / `folder_paths` 로 범위 제한 |
+
+### 섹션 API
+
+| API | 용도 |
+|---|---|
+| `GET /sections/search` | 섹션 순위. `query` + `file_ids`/`folder_paths`(둘 다 비면 테넌트 전체), `top_k` ≤ 100 |
+| `GET /document/outline` | 문서의 섹션 목차. `file_id` 또는 `path`. 섹션이 없으면 `ready=false` |
+| `GET /document/section` | 섹션(`section_index`) 또는 블록 범위(`start_block`~`end_block`) 본문. 블록마다 `[bN]` 앵커, 20,000자에서 자르고 `truncated` 로 알린다 |
+
+### 섹션 검색
+
+- 키워드: `kb_section_keyword_search` RPC. 질문을 2자 이상 토큰으로 나누고 끝의 한국어 조사를 뗀 형태도
+  넣는다(최대 12개). 블록 본문 부분 일치(pg_trgm)를 섹션으로 모아 용어별 tf·df 로 BM25 모양 점수를 매기고,
+  섹션 제목·요약에 걸리면 한 번 더 센다.
+- 벡터: 섹션마다 `파일명 › 제목\n요약\n본문` 앞 4,000자(`KB_SECTION_EMBED_CHARS`)를 임베딩해
+  `kb_sections` 컬렉션(`KB_SECTION_COLLECTION`)에 둔다. 청크 힌트 컬렉션과 섞지 않는다.
+- 두 순위를 RRF(k=60)로 합친다. 한쪽이 실패하면 다른 쪽 결과만으로 답하고 `errors` 에 남긴다.
+- 결과 항목: `file_id` `file_name` `path` `section_index` `title` `summary` `start_block` `end_block`
+  `chars` `pages`(쪽 있는 문서만 `[처음, 끝]`) `score` `ranks` `matched_terms` `snippet`.
+- 파일 삭제·재인덱싱은 블록·섹션·섹션 벡터를 함께 지운다(`section_search.forget_files`).
 
 선택 범위는 `file_ids` 또는 `folder_paths` 로 받는다. 폴더째 선택을 수천 개 `file_id` 로
 풀어 보내지 않는다.
