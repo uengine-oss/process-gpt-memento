@@ -472,7 +472,6 @@ async def save_to_storage(
                 mime_type=file.content_type,
                 size_bytes=len(file_content),
                 initial_status=INDEX_STATUS_INDEXED,
-                doc_role="content",
             )
 
         image_extensions = [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"]
