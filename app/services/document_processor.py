@@ -66,7 +66,8 @@ def _load_xlsx_documents(data: bytes, file_name: str) -> List[Document]:
                 continue
             docs.append(Document(
                 page_content=f"[시트: {ws.title}]\n" + "\n".join(lines),
-                metadata={"source": file_name, "page": idx, "sheet_name": ws.title},
+                # page 는 PDF 파서와 같은 0-based — 저장 단계가 +1 한다.
+                metadata={"source": file_name, "page": idx - 1, "sheet_name": ws.title},
             ))
     finally:
         wb.close()
