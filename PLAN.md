@@ -1,0 +1,49 @@
+# Plan: 블록·섹션 지식베이스 (`kb-blocks` 브랜치)
+
+이 브랜치의 작업 계획. 구현이 계획에서 벗어나면 같은 커밋에서 이 파일을 고친다.
+머지할 때 계약은 `docs/specs/`, 근거는 `docs/DESIGN_NOTES.md` 로 옮기고 이 파일은 지운다.
+
+## 목표
+
+흐르는 문서(DOCX·HWPX)가 "문서 전체 = 1쪽"으로 저장돼 위치 인용·검색·카드가 문서 단위로
+뭉개지는 문제를 없앤다. 근거: [DESIGN_NOTES — 흐르는 문서의 쪽 번호](docs/DESIGN_NOTES.md#흐르는-문서의-쪽-번호),
+[섹션](docs/DESIGN_NOTES.md#섹션).
+
+- **블록** = 인용 앵커. 문단·표(행 묶음)·그림 설명. 모든 형식에 항상 있다.
+- **섹션** = 탐색 단위. 명시적 헤딩이 있으면 쓰고, 없으면 카드 LLM이 고른다.
+- 쪽 번호는 PDF·PPTX·XLSX(시트)만. 흐르는 문서는 `null`.
+
+## 단계
+
+### 1. 블록 저장 + 파서 버전 ✅
+- `sql/document_blocks.sql`: `document_blocks(tenant_id, file_id, block_index, kind, text,
+  heading_level, page_number, bbox)`, `knowledge_files.parser_version`.
+- 파서가 블록을 `Document.metadata["_blocks"]` 로 내보낸다(청크 메타데이터에서는 걸러낸다).
+  DOCX(`docx_structured` 블록 + 스타일 헤딩), HWPX(토큰 + 개요 수준 헤딩),
+  PDF(`blocks_json` offset/bbox). 나머지는 빈 줄·크기 경계로 나눈다.
+- `document_pages` 는 그대로 둔다(codex 미러가 읽는다). 블록 저장 실패는 인제스트를 막지 않는다.
+- 완료 조건: 형식별 단위 테스트, 로컬 코퍼스 재인덱싱 후 원문 대비 블록 텍스트 보존율 ≥ 99%.
+- 결과(2026-09-23, 로컬 고유 파일 295건, 비전 끔): 형식별 99.0~100.8%, 99% 미만 2건(98.7%, 98.9%).
+  실제 인제스트 경로로 6건(HWPX·DOCX·PDF·XLSX·PPTX) 저장 확인. 전체 재인덱싱은 아직.
+
+### 2. 섹션 분할 검증 ← 지금
+- 성격이 다른 문서 10~20건(회의록·공문·매뉴얼·표 위주)으로 명시적 헤딩 + LLM 분할 결과를 뽑아 본다.
+- 완료 조건: 사람이 보고 목차로 쓸 만하다고 판단.
+
+### 3. 섹션 + 카드를 한 번의 LLM 통과로
+- 카드 창 호출이 섹션 시작·제목·요약을 함께 돌려준다. `document_sections` 저장.
+- 문서 카드는 섹션 카드의 롤업. 카드·섹션 백필.
+
+### 4. 섹션 단위 인덱스와 API
+- 섹션 본문 + 섹션 카드를 키워드·벡터로 색인. `search` 가 섹션·블록 범위를 돌려준다.
+- `read(file, section | 블록 범위)`, 문서별 OUTLINE.
+
+### 5. codex 연결과 벤치마크
+- 미러에 OUTLINE, 서버 후보 생성, Jev 재순위·인용 검증, 인용 = 섹션 경로 + 발췌.
+- Jev on/off 시간·토큰·정확도 비교.
+
+## 위험
+
+- 기존 515건 재인덱싱 필요(페이지·카드·벡터 전부).
+- 배포 환경에 SQL 선적용 필요(`main` push = 배포).
+- codex 가 `document_pages` 형식에 묶여 있다 — 4단계 전까지 형식을 바꾸지 않는다.
