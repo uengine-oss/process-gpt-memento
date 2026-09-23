@@ -119,6 +119,7 @@ end_block, title, summary, chars, source)`.
 |---|---|
 | `GET /sections/search` | 섹션 순위. `query` + `file_ids`/`folder_paths`(둘 다 비면 테넌트 전체), `top_k` ≤ 100 |
 | `GET /document/outline` | 문서의 섹션 목차. `file_id` 또는 `path`. 섹션이 없으면 `ready=false` |
+| `GET /documents/outlines` | 선택 범위(`file_ids`/`folder_paths`) 전체의 목차를 `{file_id: [섹션]}` 으로. 섹션 없는 파일은 빠진다 |
 | `GET /document/section` | 섹션(`section_index`) 또는 블록 범위(`start_block`~`end_block`) 본문. 블록마다 `[bN]` 앵커, 20,000자에서 자르고 `truncated` 로 알린다 |
 
 ### 섹션 검색

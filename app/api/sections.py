@@ -113,6 +113,33 @@ async def document_outline(
     return {"file_id": ref, "ready": bool(rows), "sections": rows}
 
 
+@router.get("/documents/outlines")
+async def documents_outlines(
+    tenant_id: str,
+    file_ids: Optional[List[str]] = Query(default=None),
+    folder_paths: Optional[List[str]] = Query(default=None),
+):
+    """선택 범위 전체의 섹션 목차를 파일별로 한 번에. 미러를 만들 때 쓴다."""
+    scope = await _scope(tenant_id, [f for f in (file_ids or []) if f], [p for p in (folder_paths or []) if p])
+    outlines: Dict[str, List[Dict[str, Any]]] = {}
+    for start in range(0, len(scope), 100):
+        offset = 0
+        while True:
+            result = await asyncio.to_thread(
+                supabase.table("document_sections")
+                .select("file_id, section_index, start_block, end_block, title, summary, chars, source")
+                .eq("tenant_id", tenant_id).in_("file_id", scope[start:start + 100])
+                .order("file_id").order("section_index").range(offset, offset + 999).execute
+            )
+            rows = result.data or []
+            for row in rows:
+                outlines.setdefault(row.pop("file_id"), []).append(row)
+            if len(rows) < 1000:
+                break
+            offset += 1000
+    return {"outlines": outlines}
+
+
 @router.get("/document/section")
 async def document_section(
     tenant_id: str,
