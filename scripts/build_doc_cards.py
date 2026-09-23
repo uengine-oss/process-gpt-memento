@@ -22,8 +22,11 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
+from langchain.schema import Document
+
 from app.core.supabase_client import supabase
 from app.services import doc_cards
+from app.services.document_pages import build_and_store_card
 
 
 def _page_marker_text(rows: List[Dict[str, Any]]) -> str:
@@ -65,7 +68,7 @@ async def _files(tenant_id: str, folder: Optional[str]) -> List[Dict[str, Any]]:
 
 
 async def _existing_cards(tenant_id: str) -> Dict[str, Dict[str, Any]]:
-    rows = await _rows("knowledge_doc_cards", {"tenant_id": tenant_id}, "file_id, card, status")
+    rows = await _rows("knowledge_doc_cards", {"tenant_id": tenant_id}, "file_id, card, status, signature")
     return {str(row["file_id"]): row for row in rows if row.get("file_id")}
 
 
@@ -75,6 +78,8 @@ def _needs_card(row: Optional[Dict[str, Any]]) -> bool:
         return True
     if str(row.get("status") or "") != "done":
         return True
+    if not str(row.get("signature") or "").startswith(f"v{doc_cards.CARD_VERSION}:"):
+        return True  # 섹션 없는 옛 카드
     card = row.get("card") if isinstance(row.get("card"), dict) else {}
     return not (card.get("summary") or card.get("answers_questions") or card.get("topics"))
 
@@ -85,28 +90,18 @@ async def _build_one(item: Dict[str, Any], tenant_id: str, dry_run: bool) -> str
     pages = await _rows(
         "document_pages", {"tenant_id": tenant_id, "file_id": file_id}, "page_number, content"
     )
-    text = _page_marker_text(pages)
-    if not text.strip():
+    if not _page_marker_text(pages).strip():
         return "no-text"
     if dry_run:
         return "would-build"
-
-    async with doc_cards.card_gate():
-        card = await doc_cards.build_card(file_name=file_name, text=text)
-    failed = (
-        card.coverage.windows_read > 0
-        and card.coverage.windows_failed >= card.coverage.windows_read
-    )
-    await doc_cards.save_card(
-        tenant_id=tenant_id, file_id=file_id, card=card.as_dict(),
-        signature=doc_cards.card_signature(text=text, model=""),
-        content_hash=doc_cards.content_sha256(text),
-        status="failed" if failed else "done",
-    )
-    await doc_cards.save_text_stats(
-        tenant_id=tenant_id, file_id=file_id, text=text, page_count=len(pages)
-    )
-    return "failed" if failed else "done"
+    page_docs = [
+        Document(page_content=row.get("content") or "", metadata={"page_number": row.get("page_number")})
+        for row in sorted(pages, key=lambda row: int(row.get("page_number") or 0))
+    ]
+    # 인제스트와 같은 경로 — 카드와 섹션을 함께 만든다.
+    await build_and_store_card(tenant_id, file_id, file_name, page_docs)
+    rows = await _rows("knowledge_doc_cards", {"tenant_id": tenant_id, "file_id": file_id}, "status")
+    return str((rows[0] if rows else {}).get("status") or "missing")
 
 
 async def _main() -> int:

@@ -209,20 +209,32 @@ async def build_and_store_card(
         )
         return
 
+    from app.services import doc_sections
+    from app.services.document_blocks import build_blocks, save_blocks
+
     content_hash = doc_cards.content_sha256(text)
     reused = await doc_cards.load_existing_card(tenant_id, content_hash)
     if reused:
         logger.info("[document_pages] 같은 내용의 카드 재사용 file_id=%s", file_id)
         await doc_cards.save_card(
-            tenant_id=tenant_id, file_id=file_id, card=reused,
+            tenant_id=tenant_id, file_id=file_id, card=reused["card"],
             signature=doc_cards.card_signature(text=text, model=_resolve_generation_model()),
             content_hash=content_hash,
         )
+        if reused["file_id"] != file_id:
+            await doc_sections.copy_sections(tenant_id, reused["file_id"], file_id)
         return
 
+    # 블록은 인제스트가 이미 저장했다. 블록 이전에 들어온 문서는 페이지에서 만들어 둔다.
+    blocks = await doc_sections.load_blocks(tenant_id, file_id)
+    if not blocks:
+        blocks = build_blocks(page_docs)
+        await save_blocks(tenant_id, file_id, blocks)
     context = await doc_cards.load_neighbors(tenant_id, file_id)
     async with doc_cards.card_gate():
-        card = await doc_cards.build_card(file_name=file_name, text=text, context=context)
+        card = await doc_cards.build_card(file_name=file_name, blocks=blocks, context=context)
+        sections = await doc_sections.finalize(card.sections, blocks, file_name, doc_cards._ask)
+    await doc_sections.save_sections(tenant_id, file_id, sections)
     # 모든 조각이 실패했으면 카드가 아니라 실패다. done 으로 묻으면 재시도 대상에서 빠진다.
     every_window_failed = (
         card.coverage.windows_read > 0

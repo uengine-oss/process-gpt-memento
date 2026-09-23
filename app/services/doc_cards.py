@@ -1,9 +1,9 @@
-"""문서 카드 — 문서 전체를 슬라이딩 윈도우로 읽어 만드는 리트리벌 표면.
+"""문서 카드 — 문서 전체를 블록 창으로 읽어 만드는 리트리벌 표면과 섹션 시작.
 
 기존 abstract 는 앞 3쪽 + 뒤 1쪽만 보고 한 줄을 만들었다. 300쪽 문서에서 그 한 줄은
 "무엇에 대한 문서인가"만 답하고, 에이전트가 정작 알아야 할 "이 문서를 열어야 하는가"는
-답하지 못한다. 여기서는 텍스트를 *길이로* 잘라 순서대로 읽으며 카드를 갱신한다.
-목차·헤딩·페이지 구조를 가정하지 않으므로 스캔 PDF·엑셀·메일 뭉치도 같은 경로를 탄다.
+답하지 못한다. 여기서는 블록(document_blocks)을 *길이로* 묶어 순서대로 읽으며 카드를
+갱신하고, 같은 호출에서 섹션이 시작되는 블록을 받는다(doc_sections 가 정리).
 
 카드는 ``knowledge_doc_cards`` 에 저장한다. 그 테이블이 아직 없으면 요약만
 ``knowledge_files.doc_card`` 에 남겨 기존 화면이 계속 동작한다.
@@ -49,7 +49,9 @@ MAX_DISTINGUISHERS = 6
 MAX_NEIGHBORS = 12
 LABEL_MAX_CHARS = 60
 QUESTION_MAX_CHARS = 160
-CARD_VERSION = 3
+CARD_VERSION = 4
+MAX_SECTION_TITLE_CHARS = 120
+MAX_SECTION_SUMMARY_CHARS = 300
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,7 @@ class Window:
     start: int
     end: int
     text: str
+    block_ids: Tuple[int, ...] = ()
 
 
 @dataclass
@@ -114,6 +117,8 @@ class DocumentCard:
     answers_questions: List[str] = field(default_factory=list)
     distinguishers: List[str] = field(default_factory=list)
     coverage: Coverage = field(default_factory=Coverage)
+    # 창마다 LLM 이 고른 섹션 시작 — [{"start": block_index, "title", "summary"}]. 카드 JSON 에는 넣지 않는다.
+    sections: List[Dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -155,6 +160,38 @@ def make_windows(text: str, size: int = WINDOW_CHARS, slack: int = WINDOW_SLACK)
     ]
 
 
+def render_block(block: Dict[str, Any]) -> str:
+    """창 본문의 블록 한 줄 — [b12] 는 섹션 시작을 가리킬 앵커, [H1] 은 파일에 적힌 헤딩 표시."""
+    heading = f"[H{block['heading_level']}] " if block.get("heading_level") else ""
+    return f"[b{block['block_index']}] {heading}{block['text']}"
+
+
+def make_block_windows(blocks: Sequence[Dict[str, Any]], size: int = WINDOW_CHARS) -> List[Window]:
+    """블록 경계에서 창을 자른다. 블록은 이미 2,000자 이하라 창 하나를 넘지 않는다."""
+    groups: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    length = 0
+    for block in blocks:
+        cost = len(block["text"]) + 12
+        if current and length + cost > size:
+            groups.append(current)
+            current, length = [], 0
+        current.append(block)
+        length += cost
+    if current:
+        groups.append(current)
+    windows: List[Window] = []
+    offset = 0
+    for index, group in enumerate(groups):
+        text = "\n".join(render_block(block) for block in group)
+        windows.append(Window(
+            index=index, total=len(groups), start=offset, end=offset + len(text), text=text,
+            block_ids=tuple(block["block_index"] for block in group),
+        ))
+        offset += len(text) + 1
+    return windows
+
+
 def evenly_spaced(windows: Sequence[Window], limit: int) -> List[Window]:
     """예산을 넘으면 앞부분만 읽지 말고 문서 전체에 고르게 흩어 읽는다."""
     if limit <= 0 or len(windows) <= limit:
@@ -190,9 +227,31 @@ def parse_card_json(raw: str) -> Optional[Dict[str, Any]]:
     return parse_json_object(raw)
 
 
-def merge_window(card: DocumentCard, payload: Dict[str, Any]) -> bool:
+def _window_sections(payload: Dict[str, Any], window: Window) -> List[Dict[str, Any]]:
+    """모델이 고른 섹션 시작 중 이 창 안의 블록을 가리키는 것만 받는다."""
+    allowed = set(window.block_ids)
+    out: List[Dict[str, Any]] = []
+    raw = payload.get("sections")
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        start = str(item.get("start") or "").strip().lstrip("bB")
+        title = " ".join(str(item.get("title") or "").split())
+        if not start.isdigit() or int(start) not in allowed or not title:
+            continue
+        out.append({
+            "start": int(start),
+            "title": title[:MAX_SECTION_TITLE_CHARS],
+            "summary": " ".join(str(item.get("summary") or "").split())[:MAX_SECTION_SUMMARY_CHARS],
+        })
+    return out
+
+
+def merge_window(card: DocumentCard, payload: Dict[str, Any], window: Optional[Window] = None) -> bool:
     """윈도우 결과를 카드에 합친다. 사실은 누적, 요약은 교체. 새 사실이 있었는지 반환."""
     contributed = False
+    if window is not None and window.block_ids:
+        card.sections.extend(_window_sections(payload, window))
     title = str(payload.get("title") or "").strip()
     if title and not card.title:
         card.title = title[:200]
@@ -248,7 +307,16 @@ _JSON_SHAPE = """\
  "topics": ["이 문서가 다루는 대상 — 사업명·기관·주제"],
  "entities": ["기관·사람·제품·코드 등 고유명사"],
  "keywords": ["문서가 실제로 쓰는 어휘(동의어 브리지용)"],
- "answers_questions": ["이 문서가 답할 수 있는 질문 — 파일을 열지 말지 판단하는 사람을 위해"]}
+ "answers_questions": ["이 문서가 답할 수 있는 질문 — 파일을 열지 말지 판단하는 사람을 위해"],
+ "sections": [{"start": "b12", "title": "섹션 제목", "summary": "이 섹션이 담은 내용 한 문장"}]}
+"""
+
+_SECTION_RULES = """\
+- sections 는 이 조각에서 **새 섹션이 시작되는 블록**이다. 사람이 목차로 훑을 수 있게 나눈다.
+- 문서 종류에 맞는 단위로 나눈다(계약서면 조항, 회의록이면 안건, 보고서·계획서면 항목, 번호 체계가 있으면 그 번호).
+- [H1]·[H2] 표시는 파일에 헤딩 서식이 붙어 있다는 뜻일 뿐이다. 본문 문장에 붙어 있기도 하니 내용으로 판단한다.
+- 한두 줄짜리 섹션을 만들지 않는다. 조각 첫 블록이 앞 섹션의 연속이면 시작점으로 넣지 않는다.
+- title 은 문서에 쓰인 말을 그대로 쓰고, 없으면 내용을 짧은 명사구로 요약한다.
 """
 
 
@@ -268,6 +336,7 @@ def build_first_prompt(file_name: str, window: Window, context: Optional[CardCon
         f"규칙:\n{_CORE_RULES}"
         "- answers_questions 는 요약이 아니라 *검색 표면* 이다. 이 문서에만 있는 정보를 묻는 질문을 적어라.\n"
         "- distinguishers 는 같은 폴더의 다른 문서(위 목록)와 헷갈리지 않게 해 주는 사실만 담는다.\n"
+        f"{_SECTION_RULES if window.block_ids else ''}"
         "- JSON 객체만 출력한다. 코드펜스·설명 금지.\n\n"
         f"[자료]\n{window.text}\n\n[JSON]"
     )
@@ -276,6 +345,12 @@ def build_first_prompt(file_name: str, window: Window, context: Optional[CardCon
 def build_update_prompt(
     file_name: str, window: Window, card: DocumentCard, context: Optional[CardContext] = None
 ) -> str:
+    sections_shape = ""
+    sections_rules = ""
+    if window.block_ids:
+        previous = card.sections[-1]["title"] if card.sections else "(없음)"
+        sections_shape = ',\n "sections": [{"start": "b12", "title": "섹션 제목", "summary": "한 문장"}]'
+        sections_rules = f"- 직전 섹션 제목: {previous}\n{_SECTION_RULES}"
     current = json.dumps(
         {
             "title": card.title,
@@ -298,10 +373,12 @@ def build_update_prompt(
         "출력 JSON:\n"
         '{"summary": "이 조각까지 반영한 전체 요약 3~4문장(기존 요약에 덧붙이지 말고 새로 쓴다)",\n'
         ' "new_distinguishers": [], "new_topics": [], "new_entities": [], "new_keywords": [], "new_questions": [],\n'
-        ' "title": "카드의 제목이 틀렸을 때만", "doc_type": "카드의 종류가 틀렸을 때만"}\n\n'
+        ' "title": "카드의 제목이 틀렸을 때만", "doc_type": "카드의 종류가 틀렸을 때만"'
+        f"{sections_shape}}}\n\n"
         f"규칙:\n{_CORE_RULES}"
         "- new_* 는 카드에 아직 없는 것만 담는다. 이미 있는 항목을 반복하지 마라.\n"
         "- 이 조각이 참고문헌·상용구뿐이면 new_* 를 모두 비운다.\n"
+        f"{sections_rules}"
         "- JSON 객체만 출력한다.\n\n"
         f"[자료]\n{window.text}\n\n[JSON]"
     )
@@ -324,15 +401,15 @@ async def _ask(prompt: str) -> Optional[Dict[str, Any]]:
 async def build_card(
     *,
     file_name: str,
-    text: str,
+    blocks: Sequence[Dict[str, Any]],
     context: Optional[CardContext] = None,
     max_windows: int = MAX_WINDOWS,
     ask=_ask,
 ) -> DocumentCard:
-    """문서 전문을 읽어 카드를 만든다. 예산을 넘으면 고르게 건너뛰고 그 사실을 남긴다."""
-    windows = make_windows(text)
+    """블록을 창으로 묶어 읽으며 카드와 섹션 시작을 함께 만든다. 예산을 넘으면 고르게 건너뛰고 그 사실을 남긴다."""
+    windows = make_block_windows(blocks)
     card = DocumentCard()
-    card.coverage.chars_total = len(text or "")
+    card.coverage.chars_total = sum(len(block["text"]) for block in blocks)
     card.coverage.windows_total = len(windows)
     if not windows:
         return card
@@ -354,7 +431,7 @@ async def build_card(
         if payload is None:
             card.coverage.windows_failed += 1
             continue
-        if merge_window(card, payload):
+        if merge_window(card, payload, window):
             card.coverage.windows_contributed += 1
     if not card.title:
         card.title = file_name
@@ -371,16 +448,17 @@ def content_sha256(text: str) -> str:
 
 
 async def load_existing_card(tenant_id: str, content_hash: str) -> Optional[Dict[str, Any]]:
-    """같은 내용의 문서가 이미 카드가 있으면 재사용한다(중복 업로드 대비)."""
+    """같은 내용의 문서가 이미 카드가 있으면 재사용한다(중복 업로드 대비). {card, file_id}."""
     from app.core.supabase_client import supabase
 
     try:
         result = await asyncio.to_thread(
             supabase.table("knowledge_doc_cards")
-            .select("card, signature")
+            .select("card, signature, file_id")
             .eq("tenant_id", tenant_id)
             .eq("content_sha256", content_hash)
             .eq("status", "done")
+            .like("signature", f"v{CARD_VERSION}:%")
             .limit(1)
             .execute
         )
@@ -388,10 +466,9 @@ async def load_existing_card(tenant_id: str, content_hash: str) -> Optional[Dict
         logger.info("[doc_cards] 기존 카드 조회 불가: %s", exc)
         return None
     rows = getattr(result, "data", None) or []
-    if not rows:
+    if not rows or not isinstance(rows[0].get("card"), dict):
         return None
-    card = rows[0].get("card")
-    return card if isinstance(card, dict) else None
+    return {"card": rows[0]["card"], "file_id": rows[0].get("file_id") or ""}
 
 
 async def save_card(
@@ -526,7 +603,9 @@ __all__ = [
     "evenly_spaced",
     "load_existing_card",
     "load_neighbors",
+    "make_block_windows",
     "make_windows",
+    "render_block",
     "merge_window",
     "parse_card_json",
     "save_card",

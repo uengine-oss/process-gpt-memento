@@ -14,7 +14,8 @@
 | 층 | 저장소 | 만드는 곳 | 읽는 곳 |
 |---|---|---|---|
 | 원문 페이지 | `document_pages` | `document_pages.save_pages` | codex 미러 `text/`, `/document/page`, `/document/grep` |
-| 블록 | `document_blocks` | `document_blocks.save_blocks` | (아직 읽는 곳 없음) |
+| 블록 | `document_blocks` | `document_blocks.save_blocks` | 카드·섹션 생성 |
+| 섹션 | `document_sections` | `doc_sections.finalize` (카드와 같은 LLM 통과) | (아직 읽는 곳 없음) |
 | 문서 카드 | `knowledge_doc_cards` | `doc_cards.build_card` (백그라운드) | `CATALOG.tsv`, `/catalog`, `/folders/open` |
 | 폴더 카드 | `knowledge_folder_cards` | `folder_cards.build_folder_card` (bottom-up) | `TREE.md`, `/folders/tree`, `/folders/open` |
 | 검색 힌트 | 벡터 인덱스 + `documents` | `rag_chain.process_and_store_documents` | `/search`, `/documents/full-text` |
@@ -75,13 +76,26 @@ heading_level, page_number, bbox)`.
 
 **문서 카드**는 "이 문서를 열어야 하는가"를 답한다.
 
-- 전문을 12,000자 창(`KB_CARD_WINDOW_CHARS`)으로 나눠 순서대로 읽으며 갱신한다.
+- 블록을 12,000자 창(`KB_CARD_WINDOW_CHARS`)으로 묶어 순서대로 읽으며 갱신한다. 창은 블록 경계에서
+  자르고 블록마다 `[b12]` 앵커와 명시적 헤딩 표시 `[H1]` 을 붙인다. 블록이 없는 옛 문서는 페이지에서
+  블록을 만들어 저장한 뒤 읽는다.
   창이 16개(`KB_CARD_MAX_WINDOWS`)를 넘으면 문서 전체에 고르게 골라 읽고 `coverage` 에 남긴다.
+- 서명은 `v{CARD_VERSION}:{모델}:{본문 해시}`. 같은 내용의 문서는 같은 버전의 카드만 재사용하고 섹션도 복사한다.
 - 같은 폴더의 다른 문서 제목(최대 12)을 함께 보여 준다. summary 첫 문장과 `distinguishers` 는
   옆 문서와 구별되는 사실(사업명·발주처·상대방·연도·차수·버전)이다.
 - 필드: `title` `summary` `doc_type` `distinguishers` `topics` `entities` `keywords`
   `language` `answers_questions` `coverage`.
 - 같은 내용(`content_sha256`)이면 카드를 재사용한다.
+
+**섹션**은 블록 위의 목차다. `document_sections(tenant_id, file_id, section_index, start_block,
+end_block, title, summary, chars, source)`.
+
+- 카드와 같은 창 호출이 "이 창에서 새 섹션이 시작되는 블록"과 제목·한 문장 요약을 함께 돌려준다.
+  창 밖 블록을 가리키는 답은 버린다. `[H1]` 은 판단 근거일 뿐 그대로 섹션이 되지 않는다.
+- 섹션은 문서 전체를 빈틈없이 덮는다. 첫 섹션이 block 0 이 아니면 `(앞부분)` 을 넣고, 같은 제목이
+  연달아 나오면 하나로 친다.
+- `KB_SECTION_MAX_CHARS`(8,000자)를 넘는 섹션은 LLM 으로 한 번 더 나누고(`상위 › 하위`),
+  못 나누면 블록 경계에서 크기로 자른다(`source=split`, 제목 `(계속 n: 첫 내용)`).
 
 **폴더 카드**는 자식 문서 카드와 하위 폴더 카드를 bottom-up 으로 모아 폴더당 LLM 1회로 만든다.
 필드: `summary` `topics` `reading_guide` `start_with` `answers_questions` + 결정론 필드
@@ -116,5 +130,6 @@ heading_level, page_number, bbox)`.
 ## 스키마 전제
 
 지도 API는 `sql/knowledge_doc_cards.sql`, `sql/knowledge_folder_cards.sql`, `sql/kb_mirror.sql`
-을 전제로 한다. 블록 저장은 `sql/document_blocks.sql` 을 전제로 한다(없으면 경고만 남기고 인제스트는 계속). `/folders/tree`·`/folders/open` 이 `knowledge_files.has_text`/`page_count` 를
+을 전제로 한다. 블록 저장은 `sql/document_blocks.sql`, 섹션 저장은 `sql/document_sections.sql` 을 전제로 한다
+(없으면 경고만 남기고 인제스트·카드는 계속). `/folders/tree`·`/folders/open` 이 `knowledge_files.has_text`/`page_count` 를
 읽고, codex 미러가 `kb_page_text` RPC로 전문을 배치로 가져간다.
