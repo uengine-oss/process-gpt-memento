@@ -23,7 +23,7 @@ from app.core.supabase_client import supabase
 
 # 공개 버킷. 첨부·이미지·폴더 원본이 쓴다.
 PUBLIC_BUCKET = "files"
-# 산출물 전용 비공개 버킷. 공개 정책 없이 만들어 둬야 한다(docs/artifact-bucket.md).
+# 산출물 전용 비공개 버킷. 공개 정책 없이 만들어 둬야 한다(docs/specs/artifact-bucket.md).
 ARTIFACT_BUCKET = os.getenv("ARTIFACT_BUCKET", "artifacts")
 # 이 접두사로 시작하는 키는 비공개 버킷에 있다.
 ARTIFACT_PREFIX = "artifacts/"
