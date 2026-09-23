@@ -13,14 +13,27 @@ def _local_tag(elem) -> str:
     return t
 
 
+_SPACING_TAGS = {'tab', 'lineBreak', 'fwSpace', 'nbSpace'}
+
+
+def _t_text(node) -> str:
+    """<t> 하나의 전체 텍스트 — <tab/> 등 인라인 요소 뒤의 tail 까지"""
+    parts = [node.text or '']
+    for child in node:
+        if _local_tag(child) in _SPACING_TAGS:
+            parts.append(' ')
+        parts.append(child.tail or '')
+    return "".join(parts)
+
+
 def _collect_text(elem) -> str:
     """엘리먼트 하위의 모든 <t> 텍스트를 합쳐 반환 (표 내부 제외)"""
     parts = []
     for node in elem.iter():
         if _local_tag(node) == 'tbl':
             continue
-        if _local_tag(node) == 't' and node.text:
-            parts.append(node.text)
+        if _local_tag(node) == 't':
+            parts.append(_t_text(node))
     return "".join(parts)
 
 
@@ -58,8 +71,8 @@ def _parse_table_to_markdown(tbl_elem) -> str:
 
             text_parts = []
             for sub in tc.iter():
-                if _local_tag(sub) == 't' and sub.text:
-                    text_parts.append(sub.text)
+                if _local_tag(sub) == 't':
+                    text_parts.append(_t_text(sub))
             text = " ".join("".join(text_parts).split())
             cells.append((row, col, col_span, row_span, text))
 
