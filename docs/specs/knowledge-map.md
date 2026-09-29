@@ -163,7 +163,7 @@ LibreOffice 로 PDF를 만들고 `RENDITION_CACHE_DIR`(기본 `.cache/renditions
 
 | 호출처 | 엔드포인트 |
 |---|---|
-| codex | `/catalog` `/folders/tree` `/folders/open` `/document/grep` `/document/page` `/document/raw` `/documents/full-text` `/search` `/glossary/terms` `/summarize` `/process-session-file`, RPC `kb_page_text` |
+| codex | `/catalog` `/folders/tree` `/folders/open` `/document/grep` `/document/page` `/document/raw` `/documents/full-text` `/search` `/glossary/terms` `/summarize` `/process-session-file` `/sections/search` `/documents/outlines` `/document/outline` `/document/section` `/document/locate`(인용 게이트), RPC `kb_page_text` |
 | vue3 | `/knowledge/*`, `/folders/card`, `/documents/list`, `/artifact-url`, `/save-to-storage`, `/save-to-drive`, `/process`, `/process/drive/status`, `/parse/stored`, `/auth/google/*`, `/document/blocks` `/document/page-image` `/document/locate`(인용 뷰어) |
 | agent-sdk | `/retrieve` |
 | office-mcp | `/documents/chunks-metadata` `/retrieve-by-indices` `/preview/pdf-highlight` |
