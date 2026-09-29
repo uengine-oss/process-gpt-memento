@@ -153,7 +153,7 @@ LibreOffice 로 PDF를 만들고 `RENDITION_CACHE_DIR`(기본 `.cache/renditions
 인제스트가 블록을 저장한 직후 변환을 백그라운드로 미리 돌린다(`RENDITION_PREWARM`, 기본 켬, 동시 1개
 `RENDITION_PREWARM_CONCURRENCY`). 변환본 PDF와 블록 배치는 로컬 캐시와 함께 비공개 버킷
 `artifacts/renditions/` 에도 둬서 파드가 바뀌어도 다시 그리지 않는다. 배치 키에는 블록 내용 해시가 들어가
-재인덱싱으로 블록이 바뀌면 배치만 다시 한다. 미리 변환이 실패했으면 첫 열람 때 변환한다(HWPX 수십 초).
+재인덱싱으로 블록이 바뀌면 배치만 다시 한다. 미리 변환이 실패했으면 첫 열람 때 변환한다(HWPX 수십 초). 미리 변환이 생기기 전에 올라온 문서는 `python -m scripts.prewarm_renditions <tenant> [--folder]` 로 채운다(있으면 건너뜀).
 변환본 쪽 번호는 보기용이며 인용 앵커가 아니다. 컨테이너에는 rhwp 와 한글 글꼴(fonts-nanum, fonts-noto-cjk)이 있어야 한다(Dockerfile).
 
 ## 호출처
