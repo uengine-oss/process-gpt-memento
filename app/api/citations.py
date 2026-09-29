@@ -174,23 +174,38 @@ async def document_page_image(
     })
 
 
+# 비교에서 뺀다: 공백, PDF 추출이 남긴 제어·폭 없는 문자, 표 셀 안 줄바꿈(<br>) 같은 태그, 마크다운 강조.
+_NOISE = re.compile(r"<[^<>]{1,20}>|\*\*|__|[\s\x00-\x1f\x7f​-‍⁠﻿]+")
+
+
 def _squash(text: str) -> str:
-    return re.sub(r"\s+", "", text or "")
+    return _NOISE.sub("", text or "")
 
 
 # 발췌를 줄인 자리("...", "…"). 조각들이 순서대로 가까이 나오면 한 인용으로 본다.
 _ELLIPSIS = re.compile(r"\.{3,}|…+")
 _ELLIPSIS_GAP = 400
+# 다단 PDF 는 옆 단 낱말이 문장 사이에 끼어 추출된다. 정확히 없을 때만 낱말 사이 이만큼을 허용한다.
+_WORD_GAP = 40
 
 
-def _quote_pattern(quote: str) -> str:
-    pieces = [re.escape(p) for p in (_squash(x) for x in _ELLIPSIS.split(quote or "")) if p]
+def _quote_pattern(quote: str, loose: bool = False) -> str:
+    def piece(text: str) -> str:
+        words = [re.escape(_squash(w)) for w in text.split() if _squash(w)]
+        if loose and len(words) >= 3:
+            return f".{{0,{_WORD_GAP}}}?".join(words)
+        return "".join(words)
+
+    pieces = [p for p in (piece(x) for x in _ELLIPSIS.split(quote or "")) if p]
     return f".{{0,{_ELLIPSIS_GAP}}}?".join(pieces)
 
 
 @router.get("/document/locate")
 async def document_locate(tenant_id: str, quote: str, file_id: Optional[str] = None, path: Optional[str] = None):
-    """인용 문장이 걸친 블록 범위. 공백을 무시하고 맞추며, 여러 곳이면 모두 돌려준다."""
+    """인용 문장이 걸친 블록 범위. 공백·태그를 무시하고 맞추며, 여러 곳이면 모두 돌려준다.
+
+    정확히 맞는 곳이 없으면 낱말 사이에 짧은 끼어듦을 허용해 다시 찾고 `loose: true` 를 단다.
+    """
     needle = _quote_pattern(quote)
     if not needle:
         raise HTTPException(status_code=400, detail="quote required")
@@ -202,14 +217,24 @@ async def document_locate(tenant_id: str, quote: str, file_id: Optional[str] = N
         joined.append(s)
         owner.extend([i] * len(s))
     haystack = "".join(joined)
-    matches = []
-    for m in re.finditer(needle, haystack):
-        first, last = blocks[owner[m.start()]], blocks[owner[m.end() - 1]]
-        pages = sorted({b["page_number"] for b in blocks[owner[m.start()]:owner[m.end() - 1] + 1] if b.get("page_number")})
-        matches.append({
-            "start_block": first["block_index"],
-            "end_block": last["block_index"],
-            "pages": pages or None,
-            "section": _section_of(sections, first["block_index"]),
-        })
+
+    def find(pattern: str, loose: bool) -> List[Dict[str, Any]]:
+        found = []
+        for m in re.finditer(pattern, haystack):
+            first, last = blocks[owner[m.start()]], blocks[owner[m.end() - 1]]
+            pages = sorted({b["page_number"] for b in blocks[owner[m.start()]:owner[m.end() - 1] + 1] if b.get("page_number")})
+            found.append({
+                "start_block": first["block_index"],
+                "end_block": last["block_index"],
+                "pages": pages or None,
+                "section": _section_of(sections, first["block_index"]),
+                **({"loose": True} if loose else {}),
+            })
+        return found
+
+    matches = find(needle, False)
+    if not matches:
+        loose = _quote_pattern(quote, loose=True)
+        if loose != needle:
+            matches = find(loose, True)
     return {"file_id": ref, "quote": quote, "matches": matches}

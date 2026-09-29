@@ -145,7 +145,7 @@ end_block, title, summary, chars, source)`.
 |---|---|
 | `GET /document/blocks` | 문서 전체 블록과 섹션. 블록마다 칠할 자리 `rects`(`[{page, bbox}]`). PDF는 원본 쪽(`page_basis=original`), 흐르는 문서는 변환본 쪽(`page_basis=rendition`). 렌더러가 없거나 `render=false` 면 `layout=flowing`, `rects` 없음 |
 | `GET /document/page-image` | PDF(흐르는 문서는 변환본) 한 쪽(`page`, 1부터)을 PNG로. `scale` 기본 1.5. bbox 는 PDF 포인트 단위라 이미지 픽셀 ÷ `scale` 로 맞춘다 |
-| `GET /document/locate` | 인용 문장(`quote`)이 걸친 블록 범위. 공백을 무시하고 맞추며, `...`·`…` 은 사이 400자 이내 생략으로 본다. 같은 문장이 여러 곳이면 모두 `matches` 로(항목마다 `section`) |
+| `GET /document/locate` | 인용 문장(`quote`)이 걸친 블록 범위. 공백을 무시하고 맞추며, `...`·`…` 은 사이 400자 이내 생략으로 본다. 제어 문자·태그·`**` 는 무시하고, 정확 일치가 없으면 낱말 사이 40자 끼어듦을 허용해 `loose: true` 로 돌려준다. 같은 문장이 여러 곳이면 모두 `matches` 로(항목마다 `section`) |
 
 변환본(`app/services/rendition.py`): HWPX 는 rhwp(`HWPX_RHWP` → PATH → codex 런타임 경로), DOCX·DOC·RTF·ODT 는
 LibreOffice 로 PDF를 만들고 `RENDITION_CACHE_DIR`(기본 `.cache/renditions`)에 원본 해시로 둔다. 블록은 변환본 글자 흐름

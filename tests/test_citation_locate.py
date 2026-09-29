@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""인용 문장 → 블록 범위: 공백 무시, 블록 경계를 넘는 문장, 말줄임으로 줄인 발췌."""
+"""인용 문장 → 블록 범위: 공백·태그 무시, 블록 경계를 넘는 문장, 말줄임, 다단 끼어듦."""
 import asyncio
 
 from app.api import citations
@@ -11,7 +11,7 @@ BLOCKS = [
 ]
 
 
-def _locate(monkeypatch, quote):
+def _matches(monkeypatch, quote):
     async def file_ref(tenant_id, file_id, path):
         return "f"
 
@@ -24,12 +24,44 @@ def _locate(monkeypatch, quote):
     monkeypatch.setattr(citations, "_file_ref", file_ref)
     monkeypatch.setattr(citations, "_all_blocks", blocks)
     monkeypatch.setattr(citations, "_sections", sections)
-    found = asyncio.run(citations.document_locate("t", quote, file_id="f"))
-    return [(m["start_block"], m["end_block"]) for m in found["matches"]]
+    return asyncio.run(citations.document_locate("t", quote, file_id="f"))["matches"]
+
+
+def _locate(monkeypatch, quote):
+    return [(m["start_block"], m["end_block"]) for m in _matches(monkeypatch, quote)]
 
 
 def test_quote_across_blocks(monkeypatch):
     assert _locate(monkeypatch, "그 기간 중에 지급된 임금은") == [(6, 7)]
+
+
+def test_table_cell_breaks_and_bold_are_ignored(monkeypatch):
+    BLOCKS.append({"block_index": 8, "text": "| **고위험** | 궤양성 대장염<br>•크론성 대장염 |", "page_number": 2})
+    try:
+        assert _locate(monkeypatch, "궤양성 대장염 •크론성 대장염") == [(8, 8)]
+    finally:
+        BLOCKS.pop()
+
+
+def test_control_characters_from_pdf_extraction_are_ignored(monkeypatch):
+    # 2015 유행성각결막염 PDF: 낱말 사이에 \x01 이 끼어 추출됐다. 느슨한 일치가 아니라 정확 일치여야 한다.
+    BLOCKS.append({"block_index": 8, "text": "2015년\x01 44주(15.10.25-10.31)에\x01 28.3명", "page_number": 3})
+    try:
+        found = _matches(monkeypatch, "2015년 44주(15.10.25-10.31)에 28.3명")
+        assert [(m["start_block"], m.get("loose")) for m in found] == [(8, None)]
+    finally:
+        BLOCKS.pop()
+
+
+def test_words_split_by_another_column_match_loosely(monkeypatch):
+    # 2024 앙골라개황 PDF: 옆 단의 "경제" 가 문장 사이에 끼어 추출됐다.
+    BLOCKS.append({"block_index": 8, "text": "건설 사업을 위한 1억 1천만 경제 달러 규모 차관 계약을 체결", "page_number": 2})
+    try:
+        found = _matches(monkeypatch, "1억 1천만 달러 규모 차관 계약")
+        assert [(m["start_block"], m.get("loose")) for m in found] == [(8, True)]
+        assert _locate(monkeypatch, "1천만 달러") == []  # 두 낱말은 느슨하게 찾지 않는다
+    finally:
+        BLOCKS.pop()
 
 
 def test_ellipsis_joins_pieces_in_order(monkeypatch):
