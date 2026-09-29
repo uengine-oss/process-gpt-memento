@@ -53,6 +53,16 @@ def test_control_characters_from_pdf_extraction_are_ignored(monkeypatch):
         BLOCKS.pop()
 
 
+def test_punctuation_changes_do_not_matter_but_wording_does(monkeypatch):
+    # 2020 녹색금융 PDF: 원문 "참여기관) BH, UNEP FI 지원" 을 모델이 "참여기관: …" 로 옮겼다.
+    BLOCKS.append({"block_index": 8, "text": "참여기관) BH, UNEP FI 지원(임배용)", "page_number": 2})
+    try:
+        assert _locate(monkeypatch, "참여기관: BH, UNEP FI 지원") == [(8, 8)]
+        assert _locate(monkeypatch, "참여기관: BH, UNEP FI 후원") == []
+    finally:
+        BLOCKS.pop()
+
+
 def test_words_split_by_another_column_match_loosely(monkeypatch):
     # 2024 앙골라개황 PDF: 옆 단의 "경제" 가 문장 사이에 끼어 추출됐다.
     BLOCKS.append({"block_index": 8, "text": "건설 사업을 위한 1억 1천만 경제 달러 규모 차관 계약을 체결", "page_number": 2})

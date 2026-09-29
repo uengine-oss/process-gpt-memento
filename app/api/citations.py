@@ -174,12 +174,13 @@ async def document_page_image(
     })
 
 
-# 비교에서 뺀다: 공백, PDF 추출이 남긴 제어·폭 없는 문자, 표 셀 안 줄바꿈(<br>) 같은 태그, 마크다운 강조.
-_NOISE = re.compile(r"<[^<>]{1,20}>|\*\*|__|[\s\x00-\x1f\x7f​-‍⁠﻿]+")
+# 글자·숫자만 비교한다(변환본 정렬과 같은 기준). 공백·문장부호·PDF 추출이 남긴 제어 문자·마크다운 기호는
+# 모델이 옮기며 바꾸거나 빼기 쉽다. 표 셀 안 줄바꿈(<br>) 같은 태그는 글자째 먼저 지운다.
+_TAG = re.compile(r"<[^<>]{1,20}>")
 
 
 def _squash(text: str) -> str:
-    return _NOISE.sub("", text or "")
+    return "".join(c for c in _TAG.sub("", text or "") if c.isalnum())
 
 
 # 발췌를 줄인 자리("...", "…"). 조각들이 순서대로 가까이 나오면 한 인용으로 본다.
@@ -202,7 +203,7 @@ def _quote_pattern(quote: str, loose: bool = False) -> str:
 
 @router.get("/document/locate")
 async def document_locate(tenant_id: str, quote: str, file_id: Optional[str] = None, path: Optional[str] = None):
-    """인용 문장이 걸친 블록 범위. 공백·태그를 무시하고 맞추며, 여러 곳이면 모두 돌려준다.
+    """인용 문장이 걸친 블록 범위. 글자·숫자만 비교해 맞추며, 여러 곳이면 모두 돌려준다.
 
     정확히 맞는 곳이 없으면 낱말 사이에 짧은 끼어듦을 허용해 다시 찾고 `loose: true` 를 단다.
     """
