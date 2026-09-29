@@ -33,6 +33,12 @@
       },
       "max_tokens_field": "max_completion_tokens"
     },
+    "gpt-6": {
+      "locked": {
+        "temperature": 1
+      },
+      "max_tokens_field": "max_completion_tokens"
+    },
     "o1": {
       "locked": {
         "temperature": 1
