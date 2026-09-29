@@ -221,9 +221,16 @@ async def document_locate(tenant_id: str, quote: str, file_id: Optional[str] = N
 
     def find(pattern: str, loose: bool) -> List[Dict[str, Any]]:
         found = []
-        for m in re.finditer(pattern, haystack):
-            first, last = blocks[owner[m.start()]], blocks[owner[m.end() - 1]]
-            pages = sorted({b["page_number"] for b in blocks[owner[m.start()]:owner[m.end() - 1] + 1] if b.get("page_number")})
+        rx = re.compile(pattern)
+        pos = 0
+        while (m := rx.search(haystack, pos)):
+            start, end = m.start(), m.end()
+            # 사이 허용이 있는 패턴은 첫 낱말이 앞에 한 번 더 나오면 거기서 시작해 버린다. 같은 끝 안의 가장 늦은 시작을 쓴다.
+            while (tighter := rx.search(haystack, start + 1)) and tighter.end() <= end:
+                start, end = tighter.start(), tighter.end()
+            pos = end
+            first, last = blocks[owner[start]], blocks[owner[end - 1]]
+            pages = sorted({b["page_number"] for b in blocks[owner[start]:owner[end - 1] + 1] if b.get("page_number")})
             found.append({
                 "start_block": first["block_index"],
                 "end_block": last["block_index"],

@@ -74,6 +74,20 @@ def test_words_split_by_another_column_match_loosely(monkeypatch):
         BLOCKS.pop()
 
 
+def test_loose_match_takes_the_tightest_span(monkeypatch):
+    # 알기 쉬운 대장암 PDF: 첫 낱말이 앞 블록에 한 번 더 나와 범위가 불필요하게 넓어졌다.
+    BLOCKS.extend([
+        {"block_index": 8, "text": "분변잠혈검사(대변검사)", "page_number": 2},
+        {"block_index": 9, "text": "※ 분변잠혈검사 결과 양성인 경우,", "page_number": 2},
+        {"block_index": 10, "text": "감소시키는 검진 효과가 확인되었습니다.", "page_number": 2},
+        {"block_index": 11, "text": "대장내시경 검사를 추가적으로 받을 수 있습니다.", "page_number": 2},
+    ])
+    try:
+        assert _locate(monkeypatch, "분변잠혈검사 결과 양성인 경우, 대장내시경 검사를 추가적으로") == [(9, 11)]
+    finally:
+        del BLOCKS[-4:]
+
+
 def test_ellipsis_joins_pieces_in_order(monkeypatch):
     assert _locate(monkeypatch, "그 기간과 그 기간 중에 지급된 임금은 ... 각각 뺀다") == [(6, 7)]
     assert _locate(monkeypatch, "각각 뺀다 … 그 기간과") == []
