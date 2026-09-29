@@ -137,6 +137,25 @@ end_block, title, summary, chars, source)`.
 선택 범위는 `file_ids` 또는 `folder_paths` 로 받는다. 폴더째 선택을 수천 개 `file_id` 로
 풀어 보내지 않는다.
 
+### 인용 뷰어 API
+
+인용 앵커는 `file_id` + `start_block`~`end_block` 이다. 쪽·bbox 는 그 블록에 붙은 속성이다.
+
+| API | 용도 |
+|---|---|
+| `GET /document/blocks` | 문서 전체 블록과 섹션. 블록마다 칠할 자리 `rects`(`[{page, bbox}]`). PDF는 원본 쪽(`page_basis=original`), 흐르는 문서는 변환본 쪽(`page_basis=rendition`). 렌더러가 없거나 `render=false` 면 `layout=flowing`, `rects` 없음 |
+| `GET /document/page-image` | PDF(흐르는 문서는 변환본) 한 쪽(`page`, 1부터)을 PNG로. `scale` 기본 1.5. bbox 는 PDF 포인트 단위라 이미지 픽셀 ÷ `scale` 로 맞춘다 |
+| `GET /document/locate` | 인용 문장(`quote`)이 걸친 블록 범위. 공백을 무시하고 맞추며, `...`·`…` 은 사이 400자 이내 생략으로 본다. 같은 문장이 여러 곳이면 모두 `matches` 로(항목마다 `section`) |
+
+변환본(`app/services/rendition.py`): HWPX 는 rhwp(`HWPX_RHWP` → PATH → codex 런타임 경로), DOCX·DOC·RTF·ODT 는
+LibreOffice 로 PDF를 만들고 `RENDITION_CACHE_DIR`(기본 `.cache/renditions`)에 원본 해시로 둔다. 블록은 변환본 글자 흐름
+(글자·숫자만)에 맞춘다 — 한 번만 나오는 블록 중 순서가 맞는 것을 고정점으로 잡고, 나머지는 고정점 사이에서만 찾는다.
+인제스트가 블록을 저장한 직후 변환을 백그라운드로 미리 돌린다(`RENDITION_PREWARM`, 기본 켬, 동시 1개
+`RENDITION_PREWARM_CONCURRENCY`). 변환본 PDF와 블록 배치는 로컬 캐시와 함께 비공개 버킷
+`artifacts/renditions/` 에도 둬서 파드가 바뀌어도 다시 그리지 않는다. 배치 키에는 블록 내용 해시가 들어가
+재인덱싱으로 블록이 바뀌면 배치만 다시 한다. 미리 변환이 실패했으면 첫 열람 때 변환한다(HWPX 수십 초).
+변환본 쪽 번호는 보기용이며 인용 앵커가 아니다. 컨테이너에는 rhwp 와 한글 글꼴(fonts-nanum, fonts-noto-cjk)이 있어야 한다(Dockerfile).
+
 ## 호출처
 
 엔드포인트를 지우거나 응답 모양을 바꾸기 전에 여기서 호출처를 확인한다. 대부분 실패하면
@@ -145,7 +164,7 @@ end_block, title, summary, chars, source)`.
 | 호출처 | 엔드포인트 |
 |---|---|
 | codex | `/catalog` `/folders/tree` `/folders/open` `/document/grep` `/document/page` `/document/raw` `/documents/full-text` `/search` `/glossary/terms` `/summarize` `/process-session-file`, RPC `kb_page_text` |
-| vue3 | `/knowledge/*`, `/folders/card`, `/documents/list`, `/artifact-url`, `/save-to-storage`, `/save-to-drive`, `/process`, `/process/drive/status`, `/parse/stored`, `/auth/google/*` |
+| vue3 | `/knowledge/*`, `/folders/card`, `/documents/list`, `/artifact-url`, `/save-to-storage`, `/save-to-drive`, `/process`, `/process/drive/status`, `/parse/stored`, `/auth/google/*`, `/document/blocks` `/document/page-image` `/document/locate`(인용 뷰어) |
 | agent-sdk | `/retrieve` |
 | office-mcp | `/documents/chunks-metadata` `/retrieve-by-indices` `/preview/pdf-highlight` |
 

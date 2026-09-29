@@ -325,6 +325,9 @@ async def post_load_hook(
             await save_blocks(tenant_id, file_id, build_blocks(page_docs))
             await _record_parser_version(tenant_id, file_id)
             await schedule_card_build(tenant_id, file_id, page_docs)
+            from app.services.rendition import schedule_prewarm
+
+            schedule_prewarm(tenant_id, file_id, file_id)
         return saved
     except Exception as e:
         logger.warning(

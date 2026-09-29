@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
+from app.api.citations import router as citations_router
 from app.api.debug import router as debug_router
 from app.api.folders import router as folders_router
 from app.api.ingest import router as ingest_router
@@ -68,6 +69,7 @@ app.include_router(navigator_router)
 app.include_router(parse_preview_router)
 app.include_router(folders_router)
 app.include_router(sections_router)
+app.include_router(citations_router)
 app.include_router(summary_router)
 
 
