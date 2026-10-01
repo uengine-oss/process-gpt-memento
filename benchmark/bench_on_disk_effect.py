@@ -103,9 +103,7 @@ def mem_mb(name: str) -> Dict[str, float]:
 def make_index(v: Dict[str, Any]):
     os.environ["QDRANT_HOST"] = "127.0.0.1"
     os.environ["QDRANT_PORT"] = str(v["port"])
-    os.environ["QDRANT_COLLECTION_NAME"] = "documents"
     os.environ["QDRANT_ON_DISK"] = "true" if v["on_disk"] else "false"
-    os.environ["QDRANT_QUANTIZATION"] = "int8"
     import importlib
 
     from app.core import config

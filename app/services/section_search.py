@@ -7,15 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
-SECTION_COLLECTION = os.getenv("KB_SECTION_COLLECTION", "kb_sections")
+SECTION_COLLECTION = "kb_sections"
 # 임베딩 입력 상한 — 섹션 앞부분(제목·요약·본문 시작)이 검색 표면이다.
-EMBED_CHARS = int(os.getenv("KB_SECTION_EMBED_CHARS", "4000"))
+EMBED_CHARS = 4000
 RRF_K = 60
 _JOSA = ("에서는", "으로는", "에서", "으로", "에게", "까지", "부터", "은", "는", "이", "가", "을", "를",
          "의", "에", "로", "와", "과", "도", "만")

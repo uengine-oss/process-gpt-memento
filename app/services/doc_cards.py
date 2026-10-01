@@ -14,7 +14,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -27,7 +26,7 @@ logger = logging.getLogger(__name__)
 # 동시 호출을 받아 전부 타임아웃한다(300건 업로드에서 실제로 그렇게 됐다). 카드는 급하지
 # 않으므로 몇 개씩만 돌린다. 다만 서버가 배칭을 잘해서 동시 3보다 6이 건당 26초→11초로
 # 빨랐다 — 무제한과 직렬 사이의 값이다.
-CARD_CONCURRENCY = max(1, int(os.getenv("KB_CARD_CONCURRENCY", "6")))
+CARD_CONCURRENCY = 6
 _card_gate: "asyncio.Semaphore | None" = None
 
 
@@ -40,9 +39,9 @@ def card_gate() -> "asyncio.Semaphore":
 
 # 사내 GPU 서버는 6,000자와 12,000자 프롬프트의 지연이 거의 같다(28.0초 vs 29.8초).
 # 창을 키우면 같은 문서를 절반의 호출로 읽는다.
-WINDOW_CHARS = int(os.getenv("KB_CARD_WINDOW_CHARS", "12000"))
+WINDOW_CHARS = 12000
 WINDOW_SLACK = 400
-MAX_WINDOWS = int(os.getenv("KB_CARD_MAX_WINDOWS", "16"))
+MAX_WINDOWS = 16
 MAX_LABELS = 12
 MAX_QUESTIONS = 10
 MAX_DISTINGUISHERS = 6

@@ -55,11 +55,11 @@ def _bool_env(name: str, default: bool) -> bool:
 _INGEST_ENABLED = _bool_env("MEMENTO_INGEST_ENABLED", True)
 _BASE_CONCURRENCY = max(1, _int_env("MEMENTO_INGEST_CONCURRENCY", 4))
 _MAX_CONCURRENCY = max(_BASE_CONCURRENCY, _int_env("MEMENTO_INGEST_MAX_CONCURRENCY", 12))
-_MAX_RETRIES = max(0, _int_env("MEMENTO_INGEST_MAX_RETRIES", 3))
-_QUEUE_MAX = max(100, _int_env("MEMENTO_INGEST_QUEUE_MAX", 20000))
-_LEASE_SEC = max(120, _int_env("MEMENTO_INGEST_LEASE_SEC", 1800))       # 좀비 processing 재적재 기준
+_MAX_RETRIES = 3
+_QUEUE_MAX = 20000
+_LEASE_SEC = 1800                                                       # 좀비 processing 재적재 기준
 _JOB_TIMEOUT = max(60, _int_env("MEMENTO_INGEST_JOB_TIMEOUT", 900))     # 파일 1건 인덱싱 최대 시간(초). 초과 시 강제 종료→재시도
-_SWEEP_INTERVAL = max(5, _int_env("MEMENTO_INGEST_SWEEP_SEC", 20))      # 복구/폴더카드 정합화 주기(초). 짧을수록 카드 재생성이 빠름(질의 가벼움)
+_SWEEP_INTERVAL = 20                                                    # 복구/폴더카드 정합화 주기(초). 짧을수록 카드 재생성이 빠름(질의 가벼움)
 _BACKOFF_BASE = 2.0
 _BACKOFF_CAP = 60.0
 _COOLDOWN_SEC = 5.0

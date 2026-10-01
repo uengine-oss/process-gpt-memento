@@ -34,15 +34,13 @@ def test_apply_replaces_only_accepted_tables():
     assert out[1][1].startswith("| 구분 | 전국 |") and out[2][1] == entries[2][1] and out[0] == entries[0]
 
 
-def test_table_role_overrides_model_and_provider(monkeypatch):
+def test_table_role_overrides_only_the_model(monkeypatch):
     monkeypatch.setenv("MEMENTO_LLM_PROVIDER", "openai")
-    monkeypatch.setenv("OPENAI_LLM_MODEL", "main-model")
-    monkeypatch.delenv("MEMENTO_TABLE_LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("MEMENTO_LLM_MODEL", "main-model")
     monkeypatch.setenv("MEMENTO_TABLE_LLM_MODEL", "table-model")
-    assert core_config.resolve_llm_config()["model"] == "main-model"
-    assert core_config.resolve_llm_config(role="table")["model"] == "table-model"
-    monkeypatch.setenv("MEMENTO_TABLE_LLM_PROVIDER", "openrouter")
-    assert core_config.resolve_llm_config(role="table")["provider"] == "openrouter"
+    main, table = core_config.resolve_llm_config(), core_config.resolve_llm_config(role="table")
+    assert (main["model"], table["model"]) == ("main-model", "table-model")
+    assert table["base_url"] == main["base_url"]
 
 
 def test_parser_version_names_the_table_model_only_when_on(monkeypatch):
@@ -50,6 +48,5 @@ def test_parser_version_names_the_table_model_only_when_on(monkeypatch):
     assert parsers.parser_version() == parsers.PARSER_VERSION
     monkeypatch.setattr(config, "TABLE_LLM", True)
     monkeypatch.setenv("MEMENTO_LLM_PROVIDER", "openai")
-    monkeypatch.delenv("MEMENTO_TABLE_LLM_PROVIDER", raising=False)
     monkeypatch.setenv("MEMENTO_TABLE_LLM_MODEL", "table-model")
     assert parsers.parser_version() == f"{parsers.PARSER_VERSION}+table-llm:table-model"

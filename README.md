@@ -42,8 +42,9 @@ FastAPI 기반 멀티테넌트 지식베이스 서비스입니다.
 
 3. **환경 변수**: `cp .env.example .env` 후 채운다. 필수는 `SUPABASE_URL`·`SUPABASE_KEY` 와 LLM·임베딩 프로바이더 하나씩.
    전체 목록·기본값·뜻은 [docs/specs/configuration.md](docs/specs/configuration.md). 키는 커밋하지 않는다.
-   - 사내망 모델(vLLM 등): `MEMENTO_LLM_PROVIDER=custom` + `CUSTOM_LLM_BASE_URL`(·`_API_KEY`·`_MODEL`)
-   - litellm 프록시: `MEMENTO_LLM_PROVIDER=openai` + `OPENAI_LLM_BASE_URL`(프록시 주소)·`OPENAI_API_KEY`·`OPENAI_LLM_MODEL`
+   - 주소·키·모델은 프로바이더와 상관없이 `MEMENTO_LLM_BASE_URL`·`_API_KEY`·`_MODEL`(임베딩은 `MEMENTO_EMBEDDING_*`)
+   - 사내망 모델(vLLM 등): `MEMENTO_LLM_PROVIDER=custom` + `MEMENTO_LLM_BASE_URL`
+   - litellm 프록시: `MEMENTO_LLM_PROVIDER=openai` + `MEMENTO_LLM_BASE_URL`(프록시 주소)·`MEMENTO_LLM_API_KEY`·`MEMENTO_LLM_MODEL`
    - PDF 표 LLM 파싱은 기본 끔(`MEMENTO_TABLE_LLM`). 켤 때는 configuration.md 의 "PDF 표 LLM 파싱"을 먼저 읽는다.
 
 4. **Supabase 마이그레이션**: `sql/` 의 SQL 을 SQL 에디터에서 한 번씩 실행한다(배포 환경에는 push 전에).
@@ -160,14 +161,15 @@ curl "http://localhost:8005/search?query=계약금액&tenant_id=localhost&top_k=
 
 참고:
 - 더 이상 `match_documents` RPC는 필수 전제 조건이 아닙니다.
-- `documents.embedding` 컬럼이 남아 있어도 되지만, `SUPABASE_WRITE_EMBEDDING=false`일 때는 null 허용 또는 비활성화 상태여야 합니다.
-- 컬럼 제약을 바로 바꾸기 어렵다면 `SUPABASE_DUMMY_EMBEDDING_DIMENSIONS`를 기존 vector 차원(예: `1536`)으로 맞춰 레거시 컬럼만 유지할 수 있습니다.
+- 벡터는 Chroma/Qdrant 에만 쓴다. `documents.embedding` 컬럼이 남아 있으면 1536차원 빈 벡터로 채운다
+  (`config.SUPABASE_DUMMY_EMBEDDING_DIMENSIONS`).
 
 ## 문제 해결
 
 - LLM·임베딩 초기화 실패: 시작 로그의 "Provider configuration" 에서 프로바이더·주소·모델을 확인한다. 키 이름은 프로바이더마다
   다르다(configuration.md).
-- `documents` insert가 `embedding` 없이 실패하면 DB에서 `embedding` 컬럼이 여전히 non-null/vector 제약을 요구하는지 확인하세요. 즉시 우회가 필요하면 `SUPABASE_DUMMY_EMBEDDING_DIMENSIONS`를 기존 차원으로 맞추세요.
+- `documents` insert가 `embedding` 없이 실패하면 DB에서 `embedding` 컬럼의 차원이 1536 인지 확인하세요(다르면 `config.SUPABASE_DUMMY_EMBEDDING_DIMENSIONS`).
+- 시작 로그에 "예전 이름이다" 경고가 나오면 `.env` 의 그 이름을 configuration.md "예전 이름" 표의 새 이름으로 바꾸세요.
 - HWP·HWPX 보기용 PDF 가 안 나오면 `rhwp` 가 PATH 에 있는지(또는 `HWPX_RHWP`) 확인한다.
 - Drive 인증 오류 시 `/auth/google/url`로 OAuth URL을 먼저 발급하세요.
 - 이미지 분석 실패 시 Supabase Storage 공개 URL 접근 가능 여부를 확인하세요.

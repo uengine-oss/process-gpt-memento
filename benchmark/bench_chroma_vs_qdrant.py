@@ -141,10 +141,12 @@ def qdrant_index():
 
     os.environ["QDRANT_PORT"] = str(QDRANT_PORT)
     os.environ["QDRANT_HOST"] = "127.0.0.1"
-    os.environ["QDRANT_COLLECTION_NAME"] = COLLECTION
     os.environ["VECTOR_BACKEND"] = "qdrant"
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from app.core import config
     from app.services.vector_index import QdrantIndex
+
+    config.QDRANT_COLLECTION_NAME = COLLECTION  # 컬렉션 이름은 상수다 — 벤치는 운영 컬렉션과 다른 이름에 쓴다
 
     idx = QdrantIndex()
     idx.ensure_collection(vector_size=DIM)

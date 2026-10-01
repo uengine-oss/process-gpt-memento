@@ -20,7 +20,6 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, List, Optional, Tuple
 
-from app.core.config import resolve_llm_config
 from app.services.llm_output import strip_wrapping_fence
 
 
@@ -79,12 +78,6 @@ def pdf_vision_enabled() -> bool:
     return PDF_VISION_ENABLED
 
 
-def _disable_thinking() -> bool:
-    return (os.getenv("CUSTOM_LLM_DISABLE_THINKING", "") or "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
-
-
 def _vlm_call(image_bytes: bytes, prompt: str, mime_type: str, max_tokens: int, role: Optional[str] = None) -> str:
     """이미지 한 장을 VLM 에 묻는다. 실패 시 빈 문자열."""
     from app.services.llm import chat_completion
@@ -99,16 +92,11 @@ def _vlm_call(image_bytes: bytes, prompt: str, mime_type: str, max_tokens: int, 
             ],
         }
     ]
-    extra = {}
-    if resolve_llm_config(role=role).get("provider") == "custom" and _disable_thinking():
-        extra["chat_template_kwargs"] = {"enable_thinking": False}
-
     text = chat_completion(
         messages=messages,
         temperature=0.0,
         max_tokens=max_tokens,
         timeout=VISION_TIMEOUT_SEC,
-        extra_payload=extra,
         log_prefix="vision",
         role=role,
     )

@@ -8,14 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
 # 검색·재순위 단위로 쓰기에 너무 큰 섹션은 다시 나눈다(표 하나짜리 붙임이 48,842자였다).
-SECTION_MAX_CHARS = int(os.getenv("KB_SECTION_MAX_CHARS", "8000"))
+SECTION_MAX_CHARS = 8000
 PREVIEW_CHARS = 200
 FRONT_TITLE = "(앞부분)"
 

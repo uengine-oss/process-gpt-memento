@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -255,7 +254,7 @@ def verify(sample_size: int) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Chroma → Qdrant 임베딩 이관")
-    parser.add_argument("--batch-size", type=int, default=int(os.getenv("MIGRATE_BATCH_SIZE", "500")))
+    parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument("--sample-size", type=int, default=50, help="검증 표본 수")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE_PATH)
     parser.add_argument("--restart", action="store_true", help="체크포인트 무시하고 처음부터")

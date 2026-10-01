@@ -27,7 +27,7 @@ def _int_env(name: str, default: int) -> int:
 # (2) 개별 이미지 실패는 transient 면 백오프 재시도, 최종 실패는 스킵하되 로그로 표면화한다.
 # (여러 파일이 동시에 인덱싱돼도 비전 서버로 나가는 총 동시요청은 _VISION_MAX_INFLIGHT 이하)
 _VISION_MAX_INFLIGHT = _int_env("MEMENTO_VISION_MAX_INFLIGHT", 8)   # 전역 총 동시 호출 상한
-_VISION_RETRIES = _int_env("MEMENTO_VISION_MAX_RETRIES", 2)         # 개별 이미지 transient 재시도
+_VISION_RETRIES = 2                                                 # 개별 이미지 transient 재시도
 _vision_sem: Optional["asyncio.Semaphore"] = None
 
 

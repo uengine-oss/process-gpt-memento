@@ -10,7 +10,7 @@ from langchain.schema import Document
 ROBO_GLOSSARY_API_BASE_URL = (
     os.getenv("ROBO_GLOSSARY_API_BASE_URL") or "http://127.0.0.1:5504/robo"
 ).rstrip("/")
-ROBO_GLOSSARY_TIMEOUT_SEC = float(os.getenv("ROBO_GLOSSARY_TIMEOUT_SEC", "5"))
+ROBO_GLOSSARY_TIMEOUT_SEC = 5.0
 
 
 async def retrieve_glossary_terms(query: str, tenant_id: str, top_k: int) -> List[Document]:

@@ -36,7 +36,6 @@ on conflict (id) do update set public = false;
 | 환경변수 | 기본값 | 뜻 |
 | --- | --- | --- |
 | `ARTIFACT_BUCKET` | `artifacts` | 산출물 전용 비공개 버킷 이름 |
-| `ARTIFACT_URL_TTL_SECONDS` | `3600` | 서명 주소의 수명(초) |
 
 한 시간은 한 번의 대화에서 보고 받기에 넉넉하고, 주소가 새어 나가도 오래 살지 않을 만큼
 짧다.

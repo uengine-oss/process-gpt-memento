@@ -91,35 +91,35 @@ def resolve_chat_params(
     return {"sampling": sampling, "extra_body": extra_body}
 
 
+# ── LLM·임베딩 프로바이더 ─────────────────────────────────────────────────────
+# 모두 OpenAI 호환 API 라 프로바이더는 기본 주소·모델과 특이사항(그림 지원 등)만 정한다. 주소·키·모델은 프로바이더와
+# 상관없이 MEMENTO_LLM_* / MEMENTO_EMBEDDING_* 한 벌로 준다. legacy_* 는 예전 이름 — 읽되 경고하고, 운영 배포를
+# 새 이름으로 옮긴 뒤 지운다(docs/specs/configuration.md "옛 이름").
+
 LLM_PROVIDERS: Dict[str, Dict[str, Any]] = {
     "openai": {
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-5.6-luna",
         "supports_vision": True,
-        "api_key_env": [
-            "OPENAI_LLM_API_KEY",
-            "LLM_API_KEY",
-            "LLM_PROXY_API_KEY",
-            "OPENAI_API_KEY",
-        ],
-        "base_url_env": ["OPENAI_LLM_BASE_URL", "LLM_BASE_URL", "LLM_PROXY_URL"],
-        "model_env": ["OPENAI_LLM_MODEL", "LLM_MODEL"],
+        "legacy_api_key": ["OPENAI_LLM_API_KEY", "LLM_API_KEY", "LLM_PROXY_API_KEY", "OPENAI_API_KEY"],
+        "legacy_base_url": ["OPENAI_LLM_BASE_URL", "LLM_BASE_URL", "LLM_PROXY_URL"],
+        "legacy_model": ["OPENAI_LLM_MODEL", "LLM_MODEL"],
     },
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
         "model": "openai/gpt-oss-120b",
         "supports_vision": False,
-        "api_key_env": ["OPENROUTER_API_KEY", "OPENROUTER_LLM_API_KEY"],
-        "base_url_env": ["OPENROUTER_LLM_BASE_URL", "OPENROUTER_BASE_URL"],
-        "model_env": ["OPENROUTER_LLM_MODEL"],
+        "legacy_api_key": ["OPENROUTER_API_KEY", "OPENROUTER_LLM_API_KEY"],
+        "legacy_base_url": ["OPENROUTER_LLM_BASE_URL", "OPENROUTER_BASE_URL"],
+        "legacy_model": ["OPENROUTER_LLM_MODEL"],
     },
     "custom": {
         "base_url": None,
         "model": "/models/openai/gpt-oss-120b",
         "supports_vision": False,
-        "api_key_env": ["CUSTOM_LLM_API_KEY"],
-        "base_url_env": ["CUSTOM_LLM_BASE_URL"],
-        "model_env": ["CUSTOM_LLM_MODEL"],
+        "legacy_api_key": ["CUSTOM_LLM_API_KEY"],
+        "legacy_base_url": ["CUSTOM_LLM_BASE_URL"],
+        "legacy_model": ["CUSTOM_LLM_MODEL"],
     },
 }
 
@@ -128,127 +128,109 @@ EMBEDDING_PROVIDERS: Dict[str, Dict[str, Any]] = {
     "openai": {
         "base_url": "https://api.openai.com/v1",
         "model": "text-embedding-3-small",
-        "api_key_env": [
-            "OPENAI_EMBEDDING_API_KEY",
-            "EMBEDDING_API_KEY",
-            "LLM_PROXY_API_KEY",
-            "OPENAI_API_KEY",
-        ],
-        "base_url_env": [
-            "OPENAI_EMBEDDING_BASE_URL",
-            "EMBEDDING_BASE_URL",
-            "LLM_PROXY_URL",
-        ],
-        "model_env": ["OPENAI_EMBEDDING_MODEL", "LLM_EMBEDDING_MODEL"],
+        "legacy_api_key": ["OPENAI_EMBEDDING_API_KEY", "EMBEDDING_API_KEY", "LLM_PROXY_API_KEY", "OPENAI_API_KEY"],
+        "legacy_base_url": ["OPENAI_EMBEDDING_BASE_URL", "EMBEDDING_BASE_URL", "LLM_PROXY_URL"],
+        "legacy_model": ["OPENAI_EMBEDDING_MODEL", "LLM_EMBEDDING_MODEL"],
         "client": "openai_compatible",
     },
     "openrouter": {
         "base_url": "https://openrouter.ai/api/v1",
         "model": "qwen/qwen3-embedding-4b",
-        "api_key_env": ["OPENROUTER_API_KEY", "OPENROUTER_EMBEDDING_API_KEY"],
-        "base_url_env": ["OPENROUTER_EMBEDDING_BASE_URL", "OPENROUTER_BASE_URL"],
-        "model_env": ["OPENROUTER_EMBEDDING_MODEL"],
+        "legacy_api_key": ["OPENROUTER_API_KEY", "OPENROUTER_EMBEDDING_API_KEY"],
+        "legacy_base_url": ["OPENROUTER_EMBEDDING_BASE_URL", "OPENROUTER_BASE_URL"],
+        "legacy_model": ["OPENROUTER_EMBEDDING_MODEL"],
         "client": "openai_compatible",
     },
     "custom": {
-        # 사내 GPU 임베딩 서버. bge-m3 (TEI) 가 nginx 30000/v1 로 OpenAI 호환 /v1/embeddings 제공.
-        # base_url 은 .../v1 까지 지정 (client 가 {base_url}/embeddings 호출).
-        # 구버전엔 K-Cloud /encode_text 서버(client=custom_encode_text)였으나 bge-m3 는
-        # OpenAI 호환이라 openai_compatible 로 변경.
+        # 사내 GPU 임베딩 서버(bge-m3, OpenAI 호환 /v1/embeddings). base_url 은 .../v1 까지.
         "base_url": None,
         "model": "BAAI/bge-m3",
-        "api_key_env": ["CUSTOM_EMBEDDING_API_KEY"],
-        "base_url_env": ["CUSTOM_EMBEDDING_BASE_URL"],
-        "model_env": ["CUSTOM_EMBEDDING_MODEL"],
+        "legacy_api_key": ["CUSTOM_EMBEDDING_API_KEY"],
+        "legacy_base_url": ["CUSTOM_EMBEDDING_BASE_URL"],
+        "legacy_model": ["CUSTOM_EMBEDDING_MODEL"],
         "client": "openai_compatible",
     },
     "self": {
         "base_url": None,
         "model": "Qwen/Qwen3-Embedding-0.6B",
-        "api_key_env": [],
-        "base_url_env": [],
-        "model_env": ["SELF_EMBEDDING_MODEL"],
-        "device_env": "SELF_EMBEDDING_DEVICE",
+        "legacy_model": ["SELF_EMBEDDING_MODEL"],
         "client": "self",
     },
 }
 
+#: 기본 LLM 과 다른 모델을 쓸 수 있는 역할. MEMENTO_<역할>_LLM_MODEL 로 덮는다(같은 주소·키, 없으면 기본 모델).
+LLM_ROLES = ("table",)
 
 EMBEDDING_TIMEOUT_SEC: float = 180.0
 CHROMA_PERSIST_DIRECTORY: str = "./chroma_db"
 CHROMA_COLLECTION_NAME: str = "documents"
 VECTOR_BACKEND: str = "chroma"
-QDRANT_COLLECTION_NAME: str = "documents"
+QDRANT_COLLECTION_NAME: str = "documents"  # Chroma 컬렉션명과 맞춰 이관 후에도 같은 이름으로 읽힌다
 QDRANT_VECTOR_SIZE: int = 1536
 QDRANT_ON_DISK: bool = True
-QDRANT_QUANTIZATION: str = "int8"
+QDRANT_QUANTIZATION: str = "int8"  # int8 | binary | none — 근거: benchmark/REPORT_chroma_to_qdrant.md
 QDRANT_SEARCH_OVERSAMPLING: float = 2.0
-QDRANT_HNSW_EF: int = 100
-SUPABASE_WRITE_EMBEDDING: bool = False
+QDRANT_HNSW_EF: int = 100  # Chroma ef_search=100 과 맞춰 리콜을 보존한다
+SUPABASE_WRITE_EMBEDDING: bool = False  # 벡터는 Chroma/Qdrant 에만. 옛 스키마의 embedding 컬럼은 빈 벡터로 채운다
 SUPABASE_DUMMY_EMBEDDING_DIMENSIONS: int = 1536
-OPENROUTER_HTTP_REFERER: Optional[str] = None
-OPENROUTER_APP_TITLE: Optional[str] = None
+OPENROUTER_HEADERS: Dict[str, str] = {}  # 필요하면 {"HTTP-Referer": ..., "X-Title": ...}
 MEMENTO_DRIVE_FOLDER_ID: str = "1jKXip_MCDJFO7sXrvqhGD_i45_7wdp-v"
 
+_warned_legacy: set = set()
 
-def _first_env(names: list[str]) -> str:
+
+def _legacy(names: list, new: str) -> str:
+    """예전 이름 중 처음 값이 있는 것. 쓰였으면 한 번 경고한다."""
     for n in names:
         v = os.getenv(n)
         if v is not None and v.strip() != "":
+            if n not in _warned_legacy:
+                _warned_legacy.add(n)
+                # 이 서비스 로그는 print 로 보인다(logging 설정이 없다)
+                print(f"[config] 경고: {n} 는 예전 이름이다 — {new} 로 바꾼다", flush=True)
             return v
     return ""
 
 
-#: 기본 LLM 과 다른 모델을 쓸 수 있는 역할. MEMENTO_<역할>_LLM_PROVIDER / _MODEL 로 덮는다(없으면 기본 LLM).
-LLM_ROLES = ("table",)
+def env_with_legacy(new: str, legacy: list, default: Any = None) -> Any:
+    """새 이름 → 예전 이름(경고) → 기본값."""
+    return _env(new) or _legacy(legacy, new) or default
 
 
-def _role_env(role: Optional[str], key: str) -> str:
-    if not role:
-        return ""
-    if role not in LLM_ROLES:
-        raise ValueError(f"Unknown LLM role: {role}")
-    return (os.getenv(f"MEMENTO_{role.upper()}_LLM_{key}") or "").strip()
-
-
-def get_llm_provider(role: Optional[str] = None) -> str:
-    return (_role_env(role, "PROVIDER") or os.getenv("MEMENTO_LLM_PROVIDER") or "openai").strip().lower()
+def get_llm_provider() -> str:
+    return (os.getenv("MEMENTO_LLM_PROVIDER") or "openai").strip().lower()
 
 
 def get_embedding_provider() -> str:
     return (os.getenv("MEMENTO_EMBEDDING_PROVIDER") or "openai").strip().lower()
 
 
-def _openrouter_headers() -> Dict[str, str]:
-    headers: Dict[str, str] = {}
-    referer = os.getenv("OPENROUTER_HTTP_REFERER") or OPENROUTER_HTTP_REFERER
-    title = os.getenv("OPENROUTER_APP_TITLE") or OPENROUTER_APP_TITLE
-    if referer:
-        headers["HTTP-Referer"] = referer
-    if title:
-        headers["X-Title"] = title
-    return headers
+def _resolve(prefix: str, provider: str, spec: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        "base_url": env_with_legacy(f"{prefix}_BASE_URL", spec.get("legacy_base_url", []), spec.get("base_url")),
+        "api_key": env_with_legacy(f"{prefix}_API_KEY", spec.get("legacy_api_key", []), ""),
+        "model": env_with_legacy(f"{prefix}_MODEL", spec.get("legacy_model", []), spec["model"]),
+    }
 
 
 def resolve_llm_config(model_override: Optional[str] = None, role: Optional[str] = None) -> Dict[str, Any]:
-    provider = get_llm_provider(role)
+    provider = get_llm_provider()
     if provider not in LLM_PROVIDERS:
         raise ValueError(f"Unknown MEMENTO_LLM_PROVIDER: {provider}")
+    if role and role not in LLM_ROLES:
+        raise ValueError(f"Unknown LLM role: {role}")
     spec = LLM_PROVIDERS[provider]
-
-    base_url = _first_env(spec["base_url_env"]) or spec["base_url"]
-    if provider == "custom" and not base_url:
-        raise ValueError("MEMENTO_LLM_PROVIDER=custom requires CUSTOM_LLM_BASE_URL")
-
-    model = model_override or _role_env(role, "MODEL") or _first_env(spec["model_env"]) or spec["model"]
-
+    v = _resolve("MEMENTO_LLM", provider, spec)
+    if provider == "custom" and not v["base_url"]:
+        raise ValueError("MEMENTO_LLM_PROVIDER=custom requires MEMENTO_LLM_BASE_URL")
+    role_model = _env(f"MEMENTO_{role.upper()}_LLM_MODEL", "") if role else ""
     return {
         "provider": provider,
-        "base_url": base_url,
-        "api_key": _first_env(spec["api_key_env"]),
-        "model": model,
+        "base_url": v["base_url"],
+        "api_key": v["api_key"],
+        "model": model_override or role_model or v["model"],
         "supports_vision": bool(spec.get("supports_vision", False)),
-        "extra_headers": _openrouter_headers() if provider == "openrouter" else {},
+        "extra_headers": dict(OPENROUTER_HEADERS) if provider == "openrouter" else {},
     }
 
 
@@ -264,26 +246,29 @@ def resolve_embedding_config(model_override: Optional[str] = None) -> Dict[str, 
     if provider not in EMBEDDING_PROVIDERS:
         raise ValueError(f"Unknown MEMENTO_EMBEDDING_PROVIDER: {provider}")
     spec = EMBEDDING_PROVIDERS[provider]
-
-    base_url = _first_env(spec.get("base_url_env") or []) or spec.get("base_url")
-    if provider == "custom" and not base_url:
-        raise ValueError("MEMENTO_EMBEDDING_PROVIDER=custom requires CUSTOM_EMBEDDING_BASE_URL")
-
+    v = _resolve("MEMENTO_EMBEDDING", provider, spec)
+    if provider == "custom" and not v["base_url"]:
+        raise ValueError("MEMENTO_EMBEDDING_PROVIDER=custom requires MEMENTO_EMBEDDING_BASE_URL")
     cfg: Dict[str, Any] = {
         "provider": provider,
-        "base_url": base_url,
-        "api_key": _first_env(spec.get("api_key_env") or []),
-        "model": model_override or _first_env(spec.get("model_env") or []) or spec["model"],
-        "timeout": float(os.getenv("EMBEDDING_TIMEOUT_SEC") or EMBEDDING_TIMEOUT_SEC),
+        "base_url": v["base_url"],
+        "api_key": v["api_key"],
+        "model": model_override or v["model"],
+        "timeout": EMBEDDING_TIMEOUT_SEC,
         "client": spec["client"],
-        "extra_headers": _openrouter_headers() if provider == "openrouter" else {},
+        "extra_headers": dict(OPENROUTER_HEADERS) if provider == "openrouter" else {},
     }
-
     if provider == "self":
-        device_env = spec.get("device_env", "SELF_EMBEDDING_DEVICE")
-        cfg["device"] = os.getenv(device_env, "cuda")
-
+        cfg["device"] = env_with_legacy("MEMENTO_EMBEDDING_DEVICE", ["SELF_EMBEDDING_DEVICE"], "cuda")
     return cfg
+
+
+def embedding_batch_size() -> int:
+    """한 번에 임베딩 서버로 보내는 청크 수. 서버 한도에 따라 배포마다 다르다."""
+    try:
+        return max(1, int(env_with_legacy("MEMENTO_EMBEDDING_BATCH_SIZE", ["EMBEDDING_BATCH_SIZE"], "8")))
+    except (TypeError, ValueError):
+        return 8
 
 
 def chroma_persist_directory() -> str:
@@ -291,7 +276,7 @@ def chroma_persist_directory() -> str:
 
 
 def chroma_collection_name() -> str:
-    return _env("CHROMA_COLLECTION_NAME", CHROMA_COLLECTION_NAME)
+    return CHROMA_COLLECTION_NAME
 
 
 def chroma_server_host() -> str:
@@ -338,12 +323,11 @@ def qdrant_api_key() -> Optional[str]:
 
 
 def qdrant_collection_name() -> str:
-    # 기본값을 Chroma 컬렉션명과 맞춰, 이관 후에도 같은 이름으로 읽힌다.
-    return _env("QDRANT_COLLECTION_NAME", QDRANT_COLLECTION_NAME)
+    return QDRANT_COLLECTION_NAME
 
 
 def qdrant_vector_size() -> int:
-    """컬렉션 생성 시에만 쓰인다. 기존 컬렉션이 있으면 그쪽 설정이 우선."""
+    """컬렉션 생성 시에만 쓰인다(임베딩 차원). 기존 컬렉션이 있으면 그쪽 설정이 우선."""
     try:
         return int(_env("QDRANT_VECTOR_SIZE", str(QDRANT_VECTOR_SIZE)))
     except (TypeError, ValueError):
@@ -351,7 +335,7 @@ def qdrant_vector_size() -> int:
 
 
 def qdrant_on_disk() -> bool:
-    """원본 벡터/HNSW/payload 를 디스크(mmap)에 둘지. 메모리 절감의 핵심 스위치."""
+    """원본 벡터/HNSW/payload 를 디스크(mmap)에 둘지. 스토리지가 NVMe 가 아니면 false 를 검토한다."""
     raw = _env("QDRANT_ON_DISK", "")
     if not raw.strip():
         return QDRANT_ON_DISK
@@ -359,49 +343,27 @@ def qdrant_on_disk() -> bool:
 
 
 def qdrant_quantization() -> str:
-    """``int8`` (기본) | ``binary`` | ``none``.
-
-    int8: 벡터당 1/4 크기, 정확도 손실 미미 — 기본값.
-    binary: 1/32 크기. 1536-dim 고차원에서만 쓸 만하고 oversampling 을 크게 줘야 한다.
-    none: 양자화 없음 — 원본이 그대로 RAM/디스크에서 쓰인다.
-    """
-    return (_env("QDRANT_QUANTIZATION", QDRANT_QUANTIZATION) or "int8").strip().lower()
+    return QDRANT_QUANTIZATION
 
 
 def qdrant_search_oversampling() -> float:
-    """양자화 검색 시 후보를 몇 배로 넓게 뽑아 원본으로 재채점할지."""
-    try:
-        return float(_env("QDRANT_SEARCH_OVERSAMPLING", str(QDRANT_SEARCH_OVERSAMPLING)))
-    except (TypeError, ValueError):
-        return QDRANT_SEARCH_OVERSAMPLING
+    return QDRANT_SEARCH_OVERSAMPLING
 
 
 def qdrant_hnsw_ef() -> int:
-    """검색 시 탐색 폭. Chroma 쪽 ef_search=100 과 맞춰 리콜을 보존한다."""
-    try:
-        return int(_env("QDRANT_HNSW_EF", str(QDRANT_HNSW_EF)))
-    except (TypeError, ValueError):
-        return QDRANT_HNSW_EF
+    return QDRANT_HNSW_EF
 
 
 def supabase_write_embedding() -> bool:
-    raw = os.getenv("SUPABASE_WRITE_EMBEDDING")
-    if raw is None or raw.strip() == "":
-        return SUPABASE_WRITE_EMBEDDING
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return SUPABASE_WRITE_EMBEDDING
 
 
 def supabase_dummy_embedding_dimensions() -> int:
-    raw = os.getenv("SUPABASE_DUMMY_EMBEDDING_DIMENSIONS")
-    if raw is None or raw.strip() == "":
-        return SUPABASE_DUMMY_EMBEDDING_DIMENSIONS
-    try:
-        return int(raw)
-    except ValueError:
-        return SUPABASE_DUMMY_EMBEDDING_DIMENSIONS
+    return SUPABASE_DUMMY_EMBEDDING_DIMENSIONS
 
 
 def memento_drive_folder_id() -> str:
     return _env("MEMENTO_DRIVE_FOLDER_ID", MEMENTO_DRIVE_FOLDER_ID)
+
 
 

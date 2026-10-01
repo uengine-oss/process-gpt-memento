@@ -83,10 +83,10 @@ heading_level, page_number, bbox)`.
 
 **문서 카드**는 "이 문서를 열어야 하는가"를 답한다.
 
-- 블록을 12,000자 창(`KB_CARD_WINDOW_CHARS`)으로 묶어 순서대로 읽으며 갱신한다. 창은 블록 경계에서
+- 블록을 12,000자 창(`doc_cards.WINDOW_CHARS`)으로 묶어 순서대로 읽으며 갱신한다. 창은 블록 경계에서
   자르고 블록마다 `[b12]` 앵커와 명시적 헤딩 표시 `[H1]` 을 붙인다. 블록이 없는 옛 문서는 페이지에서
   블록을 만들어 저장한 뒤 읽는다.
-  창이 16개(`KB_CARD_MAX_WINDOWS`)를 넘으면 문서 전체에 고르게 골라 읽고 `coverage` 에 남긴다.
+  창이 16개(`doc_cards.MAX_WINDOWS`)를 넘으면 문서 전체에 고르게 골라 읽고 `coverage` 에 남긴다.
 - 서명은 `v{CARD_VERSION}:{모델}:{본문 해시}`. 같은 내용의 문서는 같은 버전의 카드만 재사용하고 섹션도 복사한다.
 - 같은 폴더의 다른 문서 제목(최대 12)을 함께 보여 준다. summary 첫 문장과 `distinguishers` 는
   옆 문서와 구별되는 사실(사업명·발주처·상대방·연도·차수·버전)이다.
@@ -101,7 +101,7 @@ end_block, title, summary, chars, source)`.
   창 밖 블록을 가리키는 답은 버린다. `[H1]` 은 판단 근거일 뿐 그대로 섹션이 되지 않는다.
 - 섹션은 문서 전체를 빈틈없이 덮는다. 첫 섹션이 block 0 이 아니면 `(앞부분)` 을 넣고, 같은 제목이
   연달아 나오면 하나로 친다.
-- `KB_SECTION_MAX_CHARS`(8,000자)를 넘는 섹션은 LLM 으로 한 번 더 나누고(`상위 › 하위`),
+- `doc_sections.SECTION_MAX_CHARS`(8,000자)를 넘는 섹션은 LLM 으로 한 번 더 나누고(`상위 › 하위`),
   못 나누면 블록 경계에서 크기로 자른다(`source=split`, 제목 `(계속 n: 첫 내용)`).
 
 **폴더 카드**는 자식 문서 카드와 하위 폴더 카드를 bottom-up 으로 모아 폴더당 LLM 1회로 만든다.
@@ -133,8 +133,8 @@ end_block, title, summary, chars, source)`.
 - 키워드: `kb_section_keyword_search` RPC. 질문을 2자 이상 토큰으로 나누고 끝의 한국어 조사를 뗀 형태도
   넣는다(최대 12개). 블록 본문 부분 일치(pg_trgm)를 섹션으로 모아 용어별 tf·df 로 BM25 모양 점수를 매기고,
   섹션 제목·요약에 걸리면 한 번 더 센다.
-- 벡터: 섹션마다 `파일명 › 제목\n요약\n본문` 앞 4,000자(`KB_SECTION_EMBED_CHARS`)를 임베딩해
-  `kb_sections` 컬렉션(`KB_SECTION_COLLECTION`)에 둔다. 청크 힌트 컬렉션과 섞지 않는다.
+- 벡터: 섹션마다 `파일명 › 제목\n요약\n본문` 앞 4,000자(`section_search.EMBED_CHARS`)를 임베딩해
+  `kb_sections` 컬렉션에 둔다. 청크 힌트 컬렉션과 섞지 않는다.
 - 두 순위를 RRF(k=60)로 합친다. 한쪽이 실패하면 다른 쪽 결과만으로 답하고 `errors` 에 남긴다.
 - 결과 항목: `file_id` `file_name` `path` `section_index` `title` `summary` `start_block` `end_block`
   `chars` `pages`(쪽 있는 문서만 `[처음, 끝]`) `score` `ranks` `matched_terms` `snippet`.
@@ -156,8 +156,8 @@ end_block, title, summary, chars, source)`.
 변환본(`app/services/rendition.py`): HWPX·HWP 는 rhwp(`HWPX_RHWP` → PATH → codex 런타임 경로), DOCX·DOC·RTF·ODT 는
 LibreOffice 로 PDF를 만들고 `RENDITION_CACHE_DIR`(기본 `.cache/renditions`)에 원본 해시로 둔다. 블록은 변환본 글자 흐름
 (글자·숫자만)에 맞춘다 — 한 번만 나오는 블록 중 순서가 맞는 것을 고정점으로 잡고, 나머지는 고정점 사이에서만 찾는다.
-인제스트가 블록을 저장한 직후 변환을 백그라운드로 미리 돌린다(`RENDITION_PREWARM`, 기본 켬, 동시 1개
-`RENDITION_PREWARM_CONCURRENCY`). 변환본 PDF와 블록 배치는 로컬 캐시와 함께 비공개 버킷
+인제스트가 블록을 저장한 직후 변환을 백그라운드로 미리 돌린다(`RENDITION_PREWARM`, 기본 켬, 한 번에
+하나씩). 변환본 PDF와 블록 배치는 로컬 캐시와 함께 비공개 버킷
 `artifacts/renditions/` 에도 둬서 파드가 바뀌어도 다시 그리지 않는다. 배치 키에는 블록 내용 해시가 들어가
 재인덱싱으로 블록이 바뀌면 배치만 다시 한다. 미리 변환이 실패했으면 첫 열람 때 변환한다(HWPX 수십 초). 미리 변환이 생기기 전에 올라온 문서는 `python -m scripts.prewarm_renditions <tenant> [--folder]` 로 채운다(있으면 건너뜀).
 변환본 쪽 번호는 보기용이며 인용 앵커가 아니다. rhwp 는 다단을 그리지 않고 쪽을 넘기는 표를 잘라, HWPX 변환본의 쪽 모양은 원본과 다를 수 있다. 컨테이너에는 rhwp 와 한글 글꼴(fonts-nanum, fonts-noto-cjk)이 있어야 한다(Dockerfile).

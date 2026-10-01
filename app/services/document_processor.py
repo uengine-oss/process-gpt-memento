@@ -211,7 +211,6 @@ class DocumentProcessor:
             documents = None
 
             # 텍스트 계열: 그대로 UTF-8 디코드하여 문서로 취급 (JSON/MD/코드 등)
-            # (Synap 원격 파서는 poc 에서 제거됨 — 로컬 파서만 사용한다)
             if file_extension in (
                 '.txt', '.json', '.md', '.markdown', '.yaml', '.yml',
                 '.xml', '.html', '.htm', '.csv', '.tsv', '.log', '.ini',

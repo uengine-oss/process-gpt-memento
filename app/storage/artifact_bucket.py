@@ -29,7 +29,7 @@ ARTIFACT_BUCKET = os.getenv("ARTIFACT_BUCKET", "artifacts")
 ARTIFACT_PREFIX = "artifacts/"
 
 # 서명 주소 기본 수명. 한 번의 대화에서 보고 받기에 넉넉하고, 유출돼도 오래 살지 않을 만큼 짧다.
-DEFAULT_TTL_SECONDS = int(os.getenv("ARTIFACT_URL_TTL_SECONDS", "3600"))
+DEFAULT_TTL_SECONDS = 3600
 
 
 def is_artifact_key(key: str) -> bool:

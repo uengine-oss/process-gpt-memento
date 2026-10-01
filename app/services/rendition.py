@@ -30,7 +30,7 @@ ALIGN_VERSION = "4"
 STORAGE_PREFIX = "artifacts/renditions/"
 PREWARM = os.getenv("RENDITION_PREWARM", "true").lower() not in {"0", "false", "no"}
 # 대량 인제스트 때 렌더러(rhwp·soffice)가 CPU 를 다 먹지 않게 한 번에 하나씩.
-_prewarm_gate = asyncio.Semaphore(int(os.getenv("RENDITION_PREWARM_CONCURRENCY", "1")))
+_prewarm_gate = asyncio.Semaphore(1)
 _background: set = set()
 CACHE_DIR = Path(os.getenv("RENDITION_CACHE_DIR") or PROJECT_ROOT / ".cache" / "renditions")
 RHWP_TIMEOUT = 300

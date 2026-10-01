@@ -184,10 +184,7 @@ class VectorStoreManager:
         """
         if not texts:
             return []
-        try:
-            target = max(1, int(os.getenv("EMBEDDING_BATCH_SIZE", "8")))
-        except ValueError:
-            target = 8
+        target = config.embedding_batch_size()
 
         embeddings: List[List[float]] = []
         total_batches = (len(texts) - 1) // target + 1
@@ -200,7 +197,7 @@ class VectorStoreManager:
     def _embed_batch_adaptive(self, batch: List[str], _attempt: int = 0) -> List[List[float]]:
         """배치 임베딩. 실패 유형별 대응:
         - rate/네트워크성(429/5xx/timeout/connection): *같은 배치*를 지수 백오프로 재시도
-          (배치를 쪼갠다고 429가 풀리지 않으므로). MEMENTO_EMBED_MAX_RETRIES(기본 3)회.
+          (배치를 쪼갠다고 429가 풀리지 않으므로). 3회.
         - 그 외(예: OOM/424/과대배치): 절반으로 쪼개 재귀 재시도 — 1까지 줄여도 실패면 raise.
         (이 메서드는 to_thread 워커 스레드에서 도므로 time.sleep 은 이벤트 루프를 막지 않음)
         """
@@ -215,10 +212,7 @@ class VectorStoreManager:
                 "429", "rate limit", "too many requests", "timeout", "timed out",
                 "502", "503", "504", "connection", "econnreset", "temporarily", "overload",
             ))
-            try:
-                _max = int(os.getenv("MEMENTO_EMBED_MAX_RETRIES", "3"))
-            except ValueError:
-                _max = 3
+            _max = 3
             # rate/네트워크성 → 같은 배치 백오프 재시도 (서버 과부하 대응)
             if transient and _attempt < _max:
                 delay = min(30.0, 1.5 * (2 ** _attempt))
@@ -283,8 +277,8 @@ class VectorStoreManager:
                         raise RuntimeError(
                             "Supabase documents insert failed without embedding and with "
                             f"a dummy {fallback_dimensions}-dimensional vector. "
-                            "Check the documents.embedding column constraint or override "
-                            "SUPABASE_DUMMY_EMBEDDING_DIMENSIONS."
+                            "Check the documents.embedding column constraint or "
+                            "config.SUPABASE_DUMMY_EMBEDDING_DIMENSIONS."
                         ) from fallback_exc
 
                 raise RuntimeError(
@@ -316,7 +310,7 @@ class VectorStoreManager:
                 raise RuntimeError(
                     "Supabase documents batch insert failed without embedding. "
                     "Relax the documents.embedding NOT NULL constraint or set "
-                    "SUPABASE_DUMMY_EMBEDDING_DIMENSIONS > 0."
+                    "config.SUPABASE_DUMMY_EMBEDDING_DIMENSIONS > 0."
                 ) from exc
             for p in payloads:
                 p["embedding"] = [0.0] * dims
