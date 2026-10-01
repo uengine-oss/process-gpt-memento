@@ -26,59 +26,38 @@ FastAPI 기반 멀티테넌트 지식베이스 서비스입니다.
 | [docs/specs/](docs/specs/) | 계약 — 인제스트·카드·지도 API·호출처, 산출물 버킷 |
 | [docs/DESIGN_NOTES.md](docs/DESIGN_NOTES.md) | 설계 근거와 실측 |
 
-**마이그레이션**(Supabase SQL 에디터에서 1회, 배포 전에): `sql/knowledge_doc_cards.sql`,
-`sql/knowledge_folder_cards.sql`, `sql/kb_mirror.sql`. 지도 API의 전제다.
+## 로컬 세팅
 
-## 환경 변수
+1. **Python 3.11+** 가상환경과 의존성
 
-`.env` 파일 예시:
+   ```bash
+   python -m venv .venv
+   .venv/Scripts/pip install -r requirements.txt      # Windows (POSIX: .venv/bin/pip)
+   ```
 
-```env
-# Supabase
-SUPABASE_URL=your_supabase_url
-SUPABASE_KEY=your_supabase_service_or_anon_key
+2. **외부 도구** (Docker 이미지에는 들어 있다 — `Dockerfile`)
+   - LibreOffice(`soffice`): DOC·PPTX 변환, DOCX 보기용 PDF
+   - [rhwp](https://github.com/edwardkim/rhwp) 0.8.4: HWP→HWPX 변환과 한글 문서 보기용 PDF. PATH 에 두거나 `HWPX_RHWP` 로 지정
+   - 한글 글꼴(나눔·Noto CJK): 보기용 PDF 렌더링
 
-# LLM Proxy (권장)
-LLM_PROXY_URL=http://litellm-proxy:4000
-LLM_PROXY_API_KEY=your_virtual_key
-LLM_MODEL=gpt-4o
-LLM_EMBEDDING_MODEL=text-embedding-3-small
-EMBEDDING_BASE_URL=
-EMBEDDING_TIMEOUT_SEC=60
-CHROMA_PERSIST_DIRECTORY=./chroma_db
-CHROMA_COLLECTION_NAME=documents
-SUPABASE_WRITE_EMBEDDING=false
-SUPABASE_DUMMY_EMBEDDING_DIMENSIONS=1536
+3. **환경 변수**: `cp .env.example .env` 후 채운다. 필수는 `SUPABASE_URL`·`SUPABASE_KEY` 와 LLM·임베딩 프로바이더 하나씩.
+   전체 목록·기본값·뜻은 [docs/specs/configuration.md](docs/specs/configuration.md). 키는 커밋하지 않는다.
+   - 사내망 모델(vLLM 등): `MEMENTO_LLM_PROVIDER=custom` + `CUSTOM_LLM_BASE_URL`(·`_API_KEY`·`_MODEL`)
+   - litellm 프록시: `MEMENTO_LLM_PROVIDER=openai` + `OPENAI_LLM_BASE_URL`(프록시 주소)·`OPENAI_API_KEY`·`OPENAI_LLM_MODEL`
+   - PDF 표 LLM 파싱은 기본 끔(`MEMENTO_TABLE_LLM`). 켤 때는 configuration.md 의 "PDF 표 LLM 파싱"을 먼저 읽는다.
 
-# Fallback/OpenAI (일부 모듈에서 여전히 사용)
-OPENAI_API_KEY=your_openai_api_key
+4. **Supabase 마이그레이션**: `sql/` 의 SQL 을 SQL 에디터에서 한 번씩 실행한다(배포 환경에는 push 전에).
+   `knowledge_doc_cards.sql`, `knowledge_folder_cards.sql`, `kb_mirror.sql`, `knowledge_files_path.sql`,
+   `document_blocks.sql`, `document_sections.sql`, `glossary_terms.sql`, `perf_knowledge_indexes.sql`.
 
-# Google Drive 처리 관련
-MEMENTO_DRIVE_FOLDER_ID=optional_extra_folder_id
-```
+5. **실행·테스트**
 
-참고:
-- `rag_chain.py`의 LLM 호출은 `llm.py:create_llm()`을 사용합니다.
-- 임베딩은 `llm.py:create_embeddings()`를 통해 `EMBEDDING_BASE_URL`이 있으면 이를 우선 사용하고, 없으면 `LLM_PROXY_URL`을 사용합니다. 모델은 `LLM_EMBEDDING_MODEL`을 사용합니다.
-- 임베딩 클라이언트는 OpenAI 호환 `/embeddings` 응답의 `data[].embedding` 또는 `embeddings` 형식을 모두 허용합니다.
-- 검색은 Chroma에서 수행한 뒤, hit metadata의 `document_row_id`로 Supabase `documents` 원문을 다시 조회합니다.
-- `SUPABASE_WRITE_EMBEDDING=false`가 기본값이며, 이 경우 Supabase `documents.embedding` 컬럼은 유지하더라도 쓰지 않습니다.
-- 레거시 스키마가 `embedding` non-null/vector 제약을 아직 요구하면 `SUPABASE_DUMMY_EMBEDDING_DIMENSIONS` 길이의 zero vector를 저장해 원문 insert만 통과시킵니다.
-- 일부 섹션 타이틀 생성 로직은 현재 `OPENAI_API_KEY`를 사용합니다.
+   ```bash
+   python main.py                               # http://localhost:8005
+   .venv/Scripts/python.exe -m pytest -q        # Windows (POSIX: .venv/bin/python -m pytest -q)
+   ```
 
-## 설치
-
-```bash
-pip install -r requirements.txt
-```
-
-또는 프로젝트가 `pyproject.toml` 기반이라면 사용 중인 패키지 매니저(`uv`, `pip`)에 맞춰 설치하세요.
-
-## 실행
-
-```bash
-python main.py
-```
+   시작 로그의 "Provider configuration" 에 실제로 쓰는 LLM·임베딩 프로바이더와 모델이 찍힌다.
 
 기본 실행 주소:
 - `http://localhost:8005`
@@ -186,9 +165,9 @@ curl "http://localhost:8005/search?query=계약금액&tenant_id=localhost&top_k=
 
 ## 문제 해결
 
-- `LLM_PROXY_API_KEY` 또는 `OPENAI_API_KEY`가 없으면 RAG LLM 초기화가 실패할 수 있습니다.
-- `OPENAI_API_KEY`가 없으면 임베딩/일부 섹션 타이틀 생성이 실패할 수 있습니다.
+- LLM·임베딩 초기화 실패: 시작 로그의 "Provider configuration" 에서 프로바이더·주소·모델을 확인한다. 키 이름은 프로바이더마다
+  다르다(configuration.md).
 - `documents` insert가 `embedding` 없이 실패하면 DB에서 `embedding` 컬럼이 여전히 non-null/vector 제약을 요구하는지 확인하세요. 즉시 우회가 필요하면 `SUPABASE_DUMMY_EMBEDDING_DIMENSIONS`를 기존 차원으로 맞추세요.
+- HWP·HWPX 보기용 PDF 가 안 나오면 `rhwp` 가 PATH 에 있는지(또는 `HWPX_RHWP`) 확인한다.
 - Drive 인증 오류 시 `/auth/google/url`로 OAuth URL을 먼저 발급하세요.
 - 이미지 분석 실패 시 Supabase Storage 공개 URL 접근 가능 여부를 확인하세요.
-- HWP/HWPX 파서(`extract-hwp`)가 없거나 실패하면 PDF 변환 폴백을 시도합니다. 이 경로를 쓰려면 서버/컨테이너에 `LibreOffice(soffice)`가 설치되어 있어야 합니다.

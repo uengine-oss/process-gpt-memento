@@ -82,6 +82,8 @@
   쪽 넘김 표 머리행, 기본 전략 `pymupdf_region`, DOCX 병합 격자, HWPX·DOCX 병합 값 채우기·그림 크기/중복 필터,
   HWPX 머리말 제외, HWP → rhwp HWPX 변환, 한글 문서 형식 판별, 괘선 없는 표 되살림,
   선 없는 하위 행 나누기(10-01, DESIGN_NOTES "선 없는 하위 행"). `PARSER_VERSION = 2026-10-01.subrows`.
+- 표 LLM 파싱 옵션 `MEMENTO_TABLE_LLM`(기본 끔, 10-01, DESIGN_NOTES "PDF 표: 규칙 대 LLM"). 설정 전체는
+  `docs/specs/configuration.md`, `.env.example` 과 맞춘다. 켜는 배포는 `reindex_stale --ext pdf`.
 - 재인덱싱: `python -m scripts.reindex_stale <tenant> [--folder] [--ext] [--dry-run]` 이 옛 버전 파일을 pending 으로
   돌리고 서버 sweeper 가 다시 인덱싱한다. 그림 설명·카드 LLM 을 다시 부르므로 형식·폴더를 나눠 돌린다
   (먼저 `--ext hwp,pdf`: 개선 폭이 크다). 로컬 dry-run 622건.

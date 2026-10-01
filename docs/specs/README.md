@@ -7,6 +7,7 @@
 |---|---|
 | [`knowledge-map.md`](knowledge-map.md) | 인제스트 → 페이지 → 문서·폴더 카드 → 지도 API, 상태, 호출처 |
 | [`artifact-bucket.md`](artifact-bucket.md) | 에이전트 산출물의 비공개 보관과 서명 주소 |
+| [`configuration.md`](configuration.md) | 환경 변수 전체 — 프로바이더·역할별 모델·파서·인제스트 |
 
 ## 쓰는 법
 

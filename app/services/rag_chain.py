@@ -50,18 +50,6 @@ class RAGChain:
     def __init__(self):
         print("Initializing RAG Chain...")
 
-        llm_api_key = (
-            os.getenv("LLM_API_KEY")
-            or os.getenv("LLM_PROXY_API_KEY")
-            or os.getenv("OPENROUTER_API_KEY")
-            or os.getenv("OPENAI_API_KEY")
-        )
-        if not llm_api_key:
-            raise ValueError(
-                "No LLM API key found. Set one of: "
-                "LLM_API_KEY, LLM_PROXY_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY"
-            )
-        
         # Initialize proxy-routed LLM via shared helper
         print("Initializing proxy-routed LLM...")
         self.llm = create_llm(temperature=0.0)

@@ -6,7 +6,7 @@
 
 ## 스택
 
-- Python 3.12+, FastAPI + Uvicorn, Pydantic
+- Python 3.11+, FastAPI + Uvicorn, Pydantic
 - Supabase(PostgREST/Storage) — 파일 목록, 페이지, 카드, 원본 파일
 - 벡터 인덱스 — `VECTOR_BACKEND` (`chroma` 기본, `qdrant` 지원). 검색 힌트 전용
 - LLM·임베딩 — `app/services/llm.py`, 프로바이더는 `MEMENTO_LLM_PROVIDER`
@@ -52,8 +52,10 @@ codex·vue3·agent-sdk·office-mcp가 이 서비스를 부른다. 호출처 대�
 결과로 넘어가서, 지워도 에러가 나지 않고 기능만 사라진다. 호출처 목록은
 [`docs/specs/knowledge-map.md`](docs/specs/knowledge-map.md#호출처)에 있다.
 
-### 설정의 출처는 코드다
-설정 목록과 기본값은 `app/core/config.py`에서 본다. LLM 샘플링은 `config/llm_sampling.json`.
+### 설정은 서버가 정하고 한 표에 모은다
+설정은 배포마다 환경 변수로 정한다. 저장되는 결과(파싱·색인)를 바꾸는 값을 호출처의 요청 파라미터로 받지 않는다.
+목록·기본값·뜻은 [`docs/specs/configuration.md`](docs/specs/configuration.md), 읽는 코드는 주로 `app/core/config.py`.
+새 설정은 `MEMENTO_` 로 시작하고 configuration.md 와 `.env.example` 을 같이 고친다. LLM 샘플링은 `config/llm_sampling.json`.
 
 ### 계약을 바꾸면 spec을 같이 고친다
 `docs/specs/` 아래 문서는 현재 코드의 계약이다. 코드만 바꾸고 두면 다음 사람이 spec을 믿고 틀린다.

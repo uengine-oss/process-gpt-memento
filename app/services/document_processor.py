@@ -10,10 +10,8 @@ import io
 import zipfile
 from typing import List, Optional, Dict, Any, Tuple, AsyncIterator
 from pathlib import Path
-from pydantic import BaseModel
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from openai import OpenAI
 
 from app.plugins.chunkers import get_chunker
 from app.plugins.parsers import get_pdf_parser
@@ -175,62 +173,11 @@ class DocumentProcessor:
         # Chunking strategy is selected via chunkers/config.py (STRATEGY 값).
         # chunk_size/chunk_overlap이 None이면 config.py + PER_STRATEGY_OVERRIDES 값을 사용한다.
         self.chunker = get_chunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        self._openai_client: Optional[OpenAI] = None
-
-    def _get_openai_client(self) -> OpenAI:
-        if self._openai_client is None:
-            self._openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        return self._openai_client
-
-    async def _generate_section_title_single(
-        self, content: str, semaphore: asyncio.Semaphore
-    ) -> str:
-        """청크 1개의 section_title을 Structured Output으로 생성한다."""
-
-        class _TitleResponse(BaseModel):
-            title: str
-
-        snippet = content[:300].replace("\n", " ")
-        async with semaphore:
-            try:
-                client = self._get_openai_client()
-                response = await asyncio.to_thread(
-                    client.beta.chat.completions.parse,
-                    model="gpt-4o-mini",
-                    messages=[{
-                        "role": "user",
-                        "content": (
-                            "다음 문서 내용에 어울리는 소제목(10자 이내)을 생성하세요.\n\n"
-                            f"{snippet}"
-                        ),
-                    }],
-                    response_format=_TitleResponse,
-                    temperature=0,
-                    max_tokens=50,
-                )
-                parsed = response.choices[0].message.parsed
-                return parsed.title.strip() if parsed else ""
-            except Exception as e:
-                print(f"section_title 생성 실패: {e}")
-                return ""
-
-    async def _generate_section_titles(self, chunks: List[Document]) -> List[str]:
-        """청크별 section_title을 병렬로 생성한다 (Structured Output 사용).
-
-        동시 요청 수를 semaphore로 제한해 rate limit를 방지한다.
-        """
-        semaphore = asyncio.Semaphore(10)
-        tasks = [
-            self._generate_section_title_single(chunk.page_content or "", semaphore)
-            for chunk in chunks
-        ]
-        return list(await asyncio.gather(*tasks))
 
     def _load_docx_with_python_docx(self, tmp_path: str, file_name: str) -> List[Document]:
         """DOCX 구조화 추출 — 표 마크다운 / 메모 위치 / placeholder / 이미지 *설명* 보존.
 
-        Vision LLM 호출 자동 (env vars CUSTOM_LLM_BASE_URL/API_KEY/MODEL 갖춰져 있으면).
-        env 없으면 parser 가 알아서 skip + 자리표시만 기록 (fail-open).
+        그림 설명은 MEMENTO_LLM_PROVIDER 의 모델로 부른다. 호출이 실패하면 자리표시만 남긴다(fail-open).
         """
         # 지연 import — 순환 회피 + parser 의존성 격리
         from app.plugins.parsers.docx_structured import parse as parse_structured
