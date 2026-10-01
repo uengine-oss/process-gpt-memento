@@ -41,7 +41,7 @@ _RHWP_RUNTIME = Path.home() / ".cache/codex-runtimes/codex-primary-runtime/depen
 _locks: Dict[str, asyncio.Lock] = {}
 
 
-def _find_rhwp() -> Optional[str]:
+def find_rhwp() -> Optional[str]:
     for cand in (os.getenv("HWPX_RHWP"), shutil.which("rhwp"), str(_RHWP_RUNTIME)):
         if cand and Path(cand).is_file():
             return cand
@@ -50,8 +50,8 @@ def _find_rhwp() -> Optional[str]:
 
 def renderer_for(file_name: str) -> Optional[str]:
     ext = Path(file_name).suffix.lower()
-    if ext == ".hwpx":
-        return "rhwp" if _find_rhwp() else None
+    if ext in {".hwpx", ".hwp"}:
+        return "rhwp" if find_rhwp() else None
     if ext in {".docx", ".doc", ".rtf", ".odt"}:
         return "soffice"
     return None
@@ -60,7 +60,7 @@ def renderer_for(file_name: str) -> Optional[str]:
 def _render_pdf(src: Path, out: Path, renderer: str) -> None:
     if renderer == "rhwp":
         proc = subprocess.run(
-            [_find_rhwp(), "export-pdf", str(src), "-o", str(out), "--json"],
+            [find_rhwp(), "export-pdf", str(src), "-o", str(out), "--json"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=RHWP_TIMEOUT,
         )
         if proc.returncode != 0 or not out.is_file():

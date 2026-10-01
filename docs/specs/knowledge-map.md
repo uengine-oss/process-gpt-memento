@@ -37,13 +37,19 @@
 
 | 형식 | 한 "페이지" | 파서 |
 |---|---|---|
-| PDF | 실제 쪽 | `PDF_STRATEGY` (`pymupdf` 기본). 텍스트 없는 쪽은 VLM OCR |
+| PDF | 실제 쪽 | `PDF_STRATEGY` (`pymupdf_region` 기본). 텍스트 없는 쪽·깨진 텍스트 레이어 쪽은 VLM OCR |
 | PPTX | 슬라이드 | LibreOffice로 PDF 변환 후 PDF 파서 |
 | XLSX | 시트 | openpyxl, 시트당 최대 20,000행 |
 | DOCX, DOC | **문서 전체가 1쪽** | `docx_structured` (DOC는 LibreOffice로 DOCX 변환) |
 | HWPX | **문서 전체가 1쪽** | `hwpx_structured` |
-| HWP | **문서 전체가 1쪽** | `vendor/extract_hwp`, 실패 시 PDF 변환 폴백 |
+| HWP | **문서 전체가 1쪽** | rhwp 로 HWPX 변환 후 `hwpx_structured`, rhwp 가 없거나 실패하면 `vendor/extract_hwp`(글만) |
 | TXT·MD·코드 | 문서 전체가 1쪽 | UTF-8 디코드 |
+
+한글 문서는 확장자 대신 파일 첫 바이트로 형식을 가른다(HWP5 바이너리에 `.hwpx` 가 붙은 파일이 실제로 돈다).
+
+PDF 본문은 PDF 에 기록된 글 순서를 따르고 표·그림 설명은 그 순서 안의 제자리에 끼운다. 여러 쪽의 위·아래
+가장자리에 되풀이되는 글(머리말·꼬리말·쪽 번호)은 뺀다. 표는 병합 칸을 덮인 칸마다 같은 값으로 채운다(PDF·DOCX·HWPX 공통). 선이 없는 PDF 표는 글 블록 배치로 되살린다(`PDF_UNRULED_TABLES`, 기본 켬).
+그림은 짧은 변 80px 미만을 설명하지 않고, 같은 그림은 한 번만 설명해 처음 나온 자리에만 넣는다.
 
 DOCX·HWPX·HWP는 흐르는 문서라 파일에 쪽 정보가 없다. 렌더러로 계산한 쪽은 사용자가
 보는 쪽과 다르므로 쪽 번호로 인용하지 않는다([근거](../DESIGN_NOTES.md#흐르는-문서의-쪽-번호)).
@@ -147,14 +153,14 @@ end_block, title, summary, chars, source)`.
 | `GET /document/page-image` | PDF(흐르는 문서는 변환본) 한 쪽(`page`, 1부터)을 PNG로. `scale` 기본 1.5. bbox 는 PDF 포인트 단위라 이미지 픽셀 ÷ `scale` 로 맞춘다 |
 | `GET /document/locate` | 인용 문장(`quote`)이 걸친 블록 범위. `...`·`…` 은 사이 400자 이내 생략으로 본다. 글자·숫자만 비교하고(태그는 먼저 지움), 정확 일치가 없으면 낱말 사이 40자 끼어듦을 허용해 `loose: true` 로 돌려준다. 같은 문장이 여러 곳이면 모두 `matches` 로(항목마다 `section`) |
 
-변환본(`app/services/rendition.py`): HWPX 는 rhwp(`HWPX_RHWP` → PATH → codex 런타임 경로), DOCX·DOC·RTF·ODT 는
+변환본(`app/services/rendition.py`): HWPX·HWP 는 rhwp(`HWPX_RHWP` → PATH → codex 런타임 경로), DOCX·DOC·RTF·ODT 는
 LibreOffice 로 PDF를 만들고 `RENDITION_CACHE_DIR`(기본 `.cache/renditions`)에 원본 해시로 둔다. 블록은 변환본 글자 흐름
 (글자·숫자만)에 맞춘다 — 한 번만 나오는 블록 중 순서가 맞는 것을 고정점으로 잡고, 나머지는 고정점 사이에서만 찾는다.
 인제스트가 블록을 저장한 직후 변환을 백그라운드로 미리 돌린다(`RENDITION_PREWARM`, 기본 켬, 동시 1개
 `RENDITION_PREWARM_CONCURRENCY`). 변환본 PDF와 블록 배치는 로컬 캐시와 함께 비공개 버킷
 `artifacts/renditions/` 에도 둬서 파드가 바뀌어도 다시 그리지 않는다. 배치 키에는 블록 내용 해시가 들어가
 재인덱싱으로 블록이 바뀌면 배치만 다시 한다. 미리 변환이 실패했으면 첫 열람 때 변환한다(HWPX 수십 초). 미리 변환이 생기기 전에 올라온 문서는 `python -m scripts.prewarm_renditions <tenant> [--folder]` 로 채운다(있으면 건너뜀).
-변환본 쪽 번호는 보기용이며 인용 앵커가 아니다. 컨테이너에는 rhwp 와 한글 글꼴(fonts-nanum, fonts-noto-cjk)이 있어야 한다(Dockerfile).
+변환본 쪽 번호는 보기용이며 인용 앵커가 아니다. rhwp 는 다단을 그리지 않고 쪽을 넘기는 표를 잘라, HWPX 변환본의 쪽 모양은 원본과 다를 수 있다. 컨테이너에는 rhwp 와 한글 글꼴(fonts-nanum, fonts-noto-cjk)이 있어야 한다(Dockerfile).
 
 ## 호출처
 

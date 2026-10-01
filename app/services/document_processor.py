@@ -89,6 +89,41 @@ def _docx_blocks(parsed: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return blocks
 
 
+_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def sniff_hwp_extension(data: bytes, file_extension: str) -> str:
+    """한글 문서는 확장자와 실제 형식이 다른 채로 돈다(HWP5 바이너리에 .hwpx). 첫 바이트로 가른다."""
+    if file_extension in (".hwp", ".hwpx"):
+        if data[:8] == _OLE_MAGIC:
+            return ".hwp"
+        if data[:2] == b"PK":
+            return ".hwpx"
+    return file_extension
+
+
+def _hwp_to_hwpx(file_path: str) -> Optional[str]:
+    """HWP5 → HWPX (rhwp). 변환본 경로, 못 하면 None."""
+    import subprocess
+    from app.services.rendition import find_rhwp
+
+    rhwp = find_rhwp()
+    if not rhwp:
+        return None
+    fd, out = tempfile.mkstemp(suffix=".hwpx")
+    os.close(fd)
+    try:
+        proc = subprocess.run([rhwp, "export-hwpx", file_path, out],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+        if proc.returncode == 0 and os.path.getsize(out) > 0:
+            return out
+        print(f"[hwp] rhwp export-hwpx 실패: {proc.stderr.decode('utf-8', 'replace')[-300:]}")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"[hwp] rhwp export-hwpx 실패: {e}")
+    os.unlink(out)
+    return None
+
+
 def _extract_text_from_hwp_or_hwpx(
     file_path: str, file_extension: str
 ) -> Tuple[Optional[str], Optional[str], Optional[List[Dict[str, Any]]]]:
@@ -108,6 +143,17 @@ def _extract_text_from_hwp_or_hwpx(
             return (None, str(e), None)
 
     if file_extension == ".hwp":
+        # rhwp 로 HWPX 로 바꾸면 표·헤딩 구조를 살린다(배포용 문서도 읽힌다). 없으면 글만 뽑는 extract_hwp.
+        converted = _hwp_to_hwpx(file_path)
+        if converted:
+            try:
+                from app.plugins.parsers.hwpx_structured import parse_blocks
+                blocks = parse_blocks(converted, describe=True)
+                return ("\n\n".join(b["text"] for b in blocks), None, blocks)
+            except Exception as e:
+                print(f"[hwp] rhwp 변환본 파싱 실패, extract_hwp 로: {e}")
+            finally:
+                os.unlink(converted)
         try:
             from extract_hwp import extract_text_from_hwp
             text, error = extract_text_from_hwp(file_path)
@@ -305,8 +351,10 @@ class DocumentProcessor:
                 data = await asyncio.to_thread(file_content.read)
                 documents = await get_pdf_parser().parse(data, file_name)
             elif file_extension in ('.hwp', '.hwpx'):
+                data = await asyncio.to_thread(file_content.read)
+                file_extension = sniff_hwp_extension(data, file_extension)
                 with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
-                    await asyncio.to_thread(tmp.write, file_content.read())
+                    await asyncio.to_thread(tmp.write, data)
                     tmp_path = tmp.name
                 converted_pdf_path = None
                 try:

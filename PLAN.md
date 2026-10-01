@@ -75,15 +75,25 @@
   원자료 `test-field/출처테스트/citation-bench-2026-09-29/`.
 - 로컬에서 knowledge MCP 를 바꾸면 codex 대화 컨테이너 이미지를 다시 빌드해야 한다(codex AGENTS.md). 안 하면 옛 도구로 잰다.
 
+### 7. 파서 점검·수정 ✅ (2026-09-30, 미커밋·미배포)
+- 벤치 `test-field/parser-bench/`: 합성(명세 하나 → DOCX·HWPX·PDF), 실제 공공 HWPX·PDF 짝 18건, olmOCR-Bench 부분셋,
+  KoPub·Allganize PDF. 결함·조치·전후 수치는 DESIGN_NOTES "파서 점검", 읽기 순서 결정 근거는 "PDF 읽기 순서".
+- 고친 것: PDF 기록 순서·표에 걸친 글 보존·가짜 표 버림·안 그려진 그림 건너뜀·깨진 텍스트 레이어 OCR·반복 머리말 제거·
+  쪽 넘김 표 머리행, 기본 전략 `pymupdf_region`, DOCX 병합 격자, HWPX·DOCX 병합 값 채우기·그림 크기/중복 필터,
+  HWPX 머리말 제외, HWP → rhwp HWPX 변환, 한글 문서 형식 판별, 괘선 없는 표 되살림. `PARSER_VERSION = 2026-09-30.layout`.
+- 재인덱싱: `python -m scripts.reindex_stale <tenant> [--folder] [--ext] [--dry-run]` 이 옛 버전 파일을 pending 으로
+  돌리고 서버 sweeper 가 다시 인덱싱한다. 그림 설명·카드 LLM 을 다시 부르므로 형식·폴더를 나눠 돌린다
+  (먼저 `--ext hwp,pdf`: 개선 폭이 크다). 로컬 dry-run 622건.
+
 ## 남은 일 (다음에 이어서)
 
-1. **2단 PDF 읽기 순서** — 파서가 두 단을 한 줄씩 번갈아 추출한다. 검증셋에서 못 찾은 발췌 50개 중 36개가 이 때문이고,
-   에이전트가 읽는 본문·검색도 깎인다. 파서 수정 + 재인덱싱 계획. 가장 먼저.
-2. **배포** — memento·codex·vue3 모두 미push(`main` push = 배포). memento 이미지에 rhwp·한글 폰트(Dockerfile). 배포 뒤
+1. **파서 남은 것** — 한컴 PDF 표 셀의 절반이 표로 안 나오는 원인 찾기(괘선 없는 표 규칙은 넣었지만 +129셀뿐),
+   XLSX 병합 셀, 암호화 HWPX, 장식 그림 가리기. 폐쇄망 VLM 으로 그림 사실 회수 재측정.
+2. **배포** — memento·codex·vue3 모두 미push(`main` push = 배포). 배포 뒤 `scripts.reindex_stale` 로 재인덱싱. memento 이미지에 rhwp·한글 폰트(Dockerfile). 배포 뒤
    `python -m scripts.prewarm_renditions <tenant>` 로 기존 문서 변환본을 채운다(HWPX 첫 열람 30~70초 방지).
 3. **검색 품질** — 일반 문서에서 정답 파일을 인용 못 한 문항이 56개 중 6~7개. 인용이 아니라 문서 찾기 문제.
 4. **생각 과정 유출** — 최종 답에 모델의 생각이 섞이는 일(웹 인용 표식이 있을 때만 잡는다). 일반 탐지는 미해결.
-5. 검증하지 않은 상수: 발췌 여럿 사이 구분자 8자, 말줄임 사이 400자.
+5. 검증하지 않은 상수: 발췌 여럿 사이 구분자 8자, 말줄임 사이 400자. 표본으로만 확인한 상수: 머리말 띠 쪽 높이 10%·쪽 절반 반복, 깨진 글 판별 50%·80%.
 6. 로컬 KB 전체 재인덱싱(블록·섹션·섹션 벡터), 배포 환경 SQL 선적용(1~4단계 몫).
 7. 머지 전: 계약은 specs 에 있다. 근거를 DESIGN_NOTES 로 옮기고 이 파일을 지운다.
 

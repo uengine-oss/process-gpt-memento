@@ -44,6 +44,7 @@ CLI:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
@@ -199,33 +200,64 @@ def _extract_comments_in_paragraph(p) -> List[Dict[str, Any]]:
 # 표 → 마크다운
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _cell_span(tc) -> Tuple[int, Optional[str]]:
+    """(gridSpan, vMerge). vMerge 는 None(병합 없음) | "restart" | "continue"."""
+    pr = tc.find(W + "tcPr")
+    if pr is None:
+        return 1, None
+    gs = pr.find(W + "gridSpan")
+    vm = pr.find(W + "vMerge")
+    span = int(gs.get(W + "val", "1")) if gs is not None else 1
+    merge = (vm.get(W + "val") or "continue") if vm is not None else None
+    return max(span, 1), merge
+
+
+def _cell_plain_text(tc) -> str:
+    """셀 글. 셀 안의 중첩 표는 행을 ' / ', 칸을 ' | ' 로 이어 붙인다."""
+    parts = []
+    for child in tc:
+        if child.tag == W + "p":
+            parts.append(_paragraph_text(child))
+        elif child.tag == W + "tbl":
+            rows = [" | ".join(_cell_plain_text(c).replace("\n", " ") for c in tr.findall(W + "tc"))
+                    for tr in child.findall(W + "tr")]
+            parts.append(" / ".join(rows))
+    return "\n".join(parts).strip()
+
+
 def _table_to_markdown(table_el, rels: Dict[str, str]) -> Tuple[str, List[List[Dict[str, Any]]]]:
     rows_data: List[List[Dict[str, Any]]] = []
+    grid: List[Dict[int, str]] = []
+    above: Dict[int, str] = {}
     for tr in table_el.findall(W + "tr"):
         row = []
+        cells: Dict[int, str] = {}
+        tr_pr = tr.find(W + "trPr")
+        before = tr_pr.find(W + "gridBefore") if tr_pr is not None else None
+        col = int(before.get(W + "val", "0")) if before is not None else 0
         for tc in tr.findall(W + "tc"):
-            cell_text_parts = []
             cell_comments: List[Dict[str, Any]] = []
             cell_images: List[Dict[str, Any]] = []
-            for p in tc.findall(W + "p"):
-                cell_text_parts.append(_paragraph_text(p))
+            for p in tc.iter(W + "p"):
                 cell_comments.extend(_extract_comments_in_paragraph(p))
                 cell_images.extend(_images_in_paragraph(p, rels))
-            cell_text = "\n".join(cell_text_parts).strip()
+            cell_text = _cell_plain_text(tc)
             row.append({"text": cell_text, "comments": cell_comments, "images": cell_images})
+            span, merge = _cell_span(tc)
+            # 병합된 칸은 덮인 칸마다 같은 값을 둔다(떼어 읽은 행·열에도 머리가 남게)
+            value = above.get(col, "") if merge == "continue" else cell_text
+            for k in range(span):
+                cells[col + k] = value
+            col += span
+        above.update(cells)
         rows_data.append(row)
+        grid.append(cells)
     if not rows_data:
         return "(empty table)", rows_data
-    num_cols = max(len(r) for r in rows_data)
+    num_cols = max((max(g) + 1 for g in grid if g), default=0)
     md_lines = []
-    for ri, row in enumerate(rows_data):
-        cells_md = []
-        for ci in range(num_cols):
-            if ci < len(row):
-                cell_txt = row[ci]["text"].replace("\n", " / ").replace("|", "\\|")
-                cells_md.append(cell_txt or " ")
-            else:
-                cells_md.append(" ")
+    for ri, cells in enumerate(grid):
+        cells_md = [(cells.get(ci) or " ").replace("\n", " / ").replace("|", "\\|") for ci in range(num_cols)]
         md_lines.append("| " + " | ".join(cells_md) + " |")
         if ri == 0:
             md_lines.append("| " + " | ".join(["---"] * num_cols) + " |")
@@ -401,19 +433,29 @@ def extract_images_and_describe(
     # 지연 import — describe 안 쓰는 standalone 경로의 app 의존성 격리.
     from app.plugins.parsers import vision
 
-    print(f"[vision] {len(seen_bytes)}개 이미지 병렬 처리 시작", file=sys.stderr)
+    # 작은 그림은 빼고, 같은 내용이 여러 media 로 들어 있으면 한 번만 부른다
+    by_hash: Dict[str, str] = {}
+    targets: Dict[str, bytes] = {}
+    for media_path, data in seen_bytes.items():
+        if not vision.worth_describing(data):
+            continue
+        first = by_hash.setdefault(hashlib.sha1(data).hexdigest(), media_path)
+        if first == media_path:
+            targets[media_path] = data
+    print(f"[vision] {len(targets)}개 이미지 병렬 처리 시작", file=sys.stderr)
     tasks = [
         (
             media_path,
             (lambda d=data, m=vision.guess_image_mime(media_path): vision.describe_image(d, mime_type=m)),
         )
-        for media_path, data in seen_bytes.items()
+        for media_path, data in targets.items()
     ]
     results = vision.run_parallel(tasks)
+    # 설명은 같은 그림의 첫 자리에만 둔다(반복 로고가 쪽마다 [그림] 으로 끼지 않게)
     for media_path, desc in results.items():
-        # 같은 media_path 의 모든 entry 에 description 복사
-        for e in entries_by_media.get(media_path) or []:
-            e["description"] = desc
+        entries = entries_by_media.get(media_path) or []
+        if entries:
+            entries[0]["description"] = desc
 
 
 # ─────────────────────────────────────────────────────────────────────────────

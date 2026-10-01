@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import sys
 import zipfile
@@ -38,16 +39,23 @@ def _t_text(node) -> str:
     return "".join(parts)
 
 
-def _collect_text(elem) -> str:
-    """엘리먼트 하위의 모든 <t> 텍스트(표 내부 제외)."""
-    parts: List[str] = []
-    for node in elem.iter():
-        lt = _local_tag(node)
-        if lt == "tbl":
+# 머리말·꼬리말은 첫 문단의 조판 부호 안에 들어 있어 본문 글로 섞여 나온다.
+_NOT_BODY = {"header", "footer"}
+
+
+def _iter_body(elem, skip=_NOT_BODY):
+    """하위 노드를 문서 순서로. skip 태그의 하위는 건너뛴다."""
+    for child in elem:
+        if _local_tag(child) in skip:
             continue
-        if lt == "t":
-            parts.append(_t_text(node))
-    return "".join(parts)
+        yield child
+        yield from _iter_body(child, skip)
+
+
+def _collect_text(elem) -> str:
+    """엘리먼트 하위의 모든 <t> 텍스트(표·머리말·꼬리말 제외)."""
+    return "".join(_t_text(node) for node in _iter_body(elem, _NOT_BODY | {"tbl"})
+                   if _local_tag(node) == "t")
 
 
 def _parse_table_to_markdown(tbl_elem) -> str:
@@ -97,20 +105,16 @@ def _parse_table_to_markdown(tbl_elem) -> str:
 
     grid = [["" for _ in range(max_col)] for _ in range(max_row)]
     for row, col, col_span, row_span, text in cells:
-        grid[row][col] = text
-
-    col_widths = [3] * max_col
-    for r in range(max_row):
-        for c in range(max_col):
-            col_widths[c] = max(col_widths[c], len(grid[r][c]))
+        # 병합된 칸은 덮인 칸마다 같은 값을 둔다(떼어 읽은 행·열에도 머리가 남게)
+        for r in range(row, min(row + row_span, max_row)):
+            for c in range(col, min(col + col_span, max_col)):
+                grid[r][c] = text
 
     lines = []
     for r in range(max_row):
-        row_cells = [grid[r][c].ljust(col_widths[c]) for c in range(max_col)]
-        lines.append("| " + " | ".join(row_cells) + " |")
+        lines.append("| " + " | ".join(grid[r][c].replace("|", "\\|") or " " for c in range(max_col)) + " |")
         if r == 0:
-            sep = ["-" * col_widths[c] for c in range(max_col)]
-            lines.append("| " + " | ".join(sep) + " |")
+            lines.append("| " + " | ".join(["---"] * max_col) + " |")
 
     return "\n".join(lines)
 
@@ -232,7 +236,7 @@ def _walk(elem, tokens: List[Token], outline: Dict[str, int]) -> None:
                 tokens.append(("text", text, outline.get(elem.get("paraPrIDRef", ""))))
         # 이미지는 표 유무와 무관하게 문단에서 수집(문단 처리 뒤 삽입).
         # HWPX 는 이미지가 표와 같은 문단에 묶이는 경우가 흔하다.
-        for sub in elem.iter():
+        for sub in _iter_body(elem):
             if _local_tag(sub) == "img":
                 ref = sub.get("binaryItemIDRef")
                 if ref:
@@ -265,7 +269,10 @@ def parse_blocks(path: str, describe: bool = True) -> List[Dict[str, Any]]:
 
         # 이미지 ref 수집(dedup) → 추출 → VLM 병렬 설명
         desc_map: Dict[str, str] = {}
+        canon: Dict[str, str] = {}  # ref → 같은 내용의 첫 ref
         if describe:
+            from app.plugins.parsers import vision  # 지연 import — app 의존성 격리
+
             ordered_refs: List[str] = []
             seen = set()
             for kind, val, _level in tokens:
@@ -273,15 +280,19 @@ def parse_blocks(path: str, describe: bool = True) -> List[Dict[str, Any]]:
                     seen.add(val)
                     ordered_refs.append(val)
             images: Dict[str, Tuple[bytes, str]] = {}
+            by_hash: Dict[str, str] = {}
             for ref in ordered_refs:
                 loaded = _load_image(z, manifest, ref)
-                if loaded:
-                    images[ref] = loaded
-                else:
+                if not loaded:
                     print(f"[hwpx] 이미지 추출 실패: ref={ref}", file=sys.stderr)
+                    continue
+                if not vision.worth_describing(loaded[0]):
+                    continue
+                # 같은 그림이 BinData 항목 여러 개로 들어 있어도(반복 로고 등) 한 번만 설명한다
+                canon[ref] = by_hash.setdefault(hashlib.sha1(loaded[0]).hexdigest(), ref)
+                if canon[ref] == ref:
+                    images[ref] = loaded
             if images:
-                from app.plugins.parsers import vision  # 지연 import — app 의존성 격리
-
                 print(
                     f"[vision] HWPX {len(images)}개 이미지 병렬 처리 시작",
                     file=sys.stderr,
@@ -296,9 +307,14 @@ def parse_blocks(path: str, describe: bool = True) -> List[Dict[str, Any]]:
                 desc_map = vision.run_parallel(tasks)
 
     blocks: List[Dict[str, Any]] = []
+    placed = set()
     for kind, val, level in tokens:
         if kind == "image":
-            desc = (desc_map.get(val) or "").strip()
+            ref = canon.get(val)
+            if ref is None or ref in placed:
+                continue  # 설명 안 한 그림, 또는 이미 앞에서 설명을 넣은 같은 그림
+            placed.add(ref)
+            desc = (desc_map.get(ref) or "").strip()
             if desc:
                 blocks.append({"kind": "image", "text": f"[그림: {desc}]", "heading_level": None})
         else:

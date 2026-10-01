@@ -28,7 +28,8 @@ from typing import Any, Dict, List, Tuple
 from langchain.schema import Document
 
 from . import vision
-from .pymupdf_parser import PyMuPDFParser
+from .pymupdf_parser import (PyMuPDFParser, carry_table_header, garbled_text, place_key,
+                             repeated_margin_text)
 
 
 class PyMuPDFRegionParser(PyMuPDFParser):
@@ -73,6 +74,7 @@ class PyMuPDFRegionParser(PyMuPDFParser):
         docs: List[Document] = []
         try:
             pdf = fitz.open(tmp_path)
+            margins = repeated_margin_text(pdf)
 
             # ── 0차 패스: 반복 이미지(로고/워터마크) 서명 수집 → 페이지당 VLM 스킵 ──
             boilerplate = self._detect_boilerplate(pdf) if vision_on else set()
@@ -81,7 +83,11 @@ class PyMuPDFRegionParser(PyMuPDFParser):
             page_infos: List[Dict[str, Any]] = []
             tasks: List[Tuple[str, Any]] = []  # (key, thunk)
             for page_num, page in enumerate(pdf):
-                text_items, page_size = self._text_items(page)
+                text_items, page_size = self._text_items(page, margins)
+                # 깨진 텍스트 레이어는 글이 없는 쪽처럼 OCR 로 보낸다
+                garbled = bool(text_items) and garbled_text(page.get_text())
+                if garbled:
+                    text_items = []
                 has_text = bool(text_items)
                 page_w, page_h = page_size
                 page_area = (page_w * page_h) or 1.0
@@ -93,7 +99,7 @@ class PyMuPDFRegionParser(PyMuPDFParser):
 
                 if vision_on and not has_text:
                     # 2번: 텍스트 레이어 없음 → 페이지 전체 OCR (부모와 동일).
-                    if self._has_raw_image(page) or self._has_vector(page):
+                    if garbled or self._has_raw_image(page) or self._has_vector(page):
                         png = self._render_page_png(page)
                         if png:
                             key = f"ocr:{page_num}"
@@ -127,19 +133,21 @@ class PyMuPDFRegionParser(PyMuPDFParser):
             results = vision.run_parallel(tasks) if tasks else {}
 
             # ── 2차 패스: Document 조립 ───────────────────────────────────────
+            prev_table = None  # 앞 쪽이 표로 끝났으면 그 표
             for info in page_infos:
                 page_num = info["page_num"]
                 page_size = info["page_size"]
                 meta_extra: Dict[str, Any] = {}
 
                 if info["mode"] == "ocr":
+                    prev_table = None
                     ocr_text = (results.get(info["ocr_key"]) or "").strip()
                     markdown = f"# 페이지 {page_num + 1}\n\n{ocr_text}" if ocr_text else ""
                     blocks: list = []
                     if ocr_text:
                         meta_extra["vision_ocr"] = True
                 else:
-                    entries = list(info["text_items"])  # [(y, text, bbox)]
+                    entries = list(info["text_items"])  # [(순서 키, text, bbox)]
                     used = 0
                     for reg in info["regions"]:
                         out = (results.get(reg.get("key", "")) or "").strip()
@@ -147,8 +155,9 @@ class PyMuPDFRegionParser(PyMuPDFParser):
                             continue
                         # 큰 영역(OCR)은 본문 그대로, 작은 영역(캡션)은 [그림: ...] 로 표시.
                         text = out if reg.get("is_ocr") else f"[그림: {out}]"
-                        entries.append((reg["y"], text, reg["bbox"]))
+                        entries.append((place_key(info["text_items"], reg["bbox"]), text, reg["bbox"]))
                         used += 1
+                    entries, prev_table = carry_table_header(entries, prev_table)
                     markdown, blocks = self._build_markdown(page_num, entries)
                     if used:
                         meta_extra["vision_regions"] = used

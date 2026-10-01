@@ -15,6 +15,7 @@ PDF 페이지 OCR/그림 처리 토글은 ``PDF_VISION_ENABLED`` 상수(기본 o
 from __future__ import annotations
 
 import base64
+import io
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, List, Optional, Tuple
@@ -56,6 +57,21 @@ DESCRIBE_IMAGE_PROMPT = (
     "3. 그림 안에 보이는 모든 텍스트 라벨·숫자를 원문 그대로 인용.\n"
     "원본에 실제로 있는 정보만 사용. 추측 금지. 2~6줄로 요약."
 )
+
+
+#: 짧은 변이 이보다 작은 그림(아이콘·글머리 기호·구분선)은 설명하지 않는다. PDF·DOCX·HWPX 공통.
+IMG_MIN_PX = 80
+
+
+def worth_describing(image_bytes: bytes) -> bool:
+    """설명할 만한 크기인가. 크기를 못 읽으면 설명한다(놓치는 쪽보다 한 번 더 부르는 쪽이 낫다)."""
+    try:
+        from PIL import Image
+
+        w, h = Image.open(io.BytesIO(image_bytes)).size
+    except Exception:
+        return True
+    return min(w, h) >= IMG_MIN_PX
 
 
 def pdf_vision_enabled() -> bool:
