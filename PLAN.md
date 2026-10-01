@@ -80,15 +80,16 @@
   KoPub·Allganize PDF. 결함·조치·전후 수치는 DESIGN_NOTES "파서 점검", 읽기 순서 결정 근거는 "PDF 읽기 순서".
 - 고친 것: PDF 기록 순서·표에 걸친 글 보존·가짜 표 버림·안 그려진 그림 건너뜀·깨진 텍스트 레이어 OCR·반복 머리말 제거·
   쪽 넘김 표 머리행, 기본 전략 `pymupdf_region`, DOCX 병합 격자, HWPX·DOCX 병합 값 채우기·그림 크기/중복 필터,
-  HWPX 머리말 제외, HWP → rhwp HWPX 변환, 한글 문서 형식 판별, 괘선 없는 표 되살림. `PARSER_VERSION = 2026-09-30.layout`.
+  HWPX 머리말 제외, HWP → rhwp HWPX 변환, 한글 문서 형식 판별, 괘선 없는 표 되살림,
+  선 없는 하위 행 나누기(10-01, DESIGN_NOTES "선 없는 하위 행"). `PARSER_VERSION = 2026-10-01.subrows`.
 - 재인덱싱: `python -m scripts.reindex_stale <tenant> [--folder] [--ext] [--dry-run]` 이 옛 버전 파일을 pending 으로
   돌리고 서버 sweeper 가 다시 인덱싱한다. 그림 설명·카드 LLM 을 다시 부르므로 형식·폴더를 나눠 돌린다
   (먼저 `--ext hwp,pdf`: 개선 폭이 크다). 로컬 dry-run 622건.
 
 ## 남은 일 (다음에 이어서)
 
-1. **파서 남은 것** — 한컴 PDF 표 셀의 절반이 표로 안 나오는 원인 찾기(괘선 없는 표 규칙은 넣었지만 +129셀뿐),
-   XLSX 병합 셀, 암호화 HWPX, 장식 그림 가리기. 폐쇄망 VLM 으로 그림 사실 회수 재측정.
+1. **파서 남은 것** — 표 영역이 이름 열을 빼고 잡히는 PDF 표, 벡터 차트, 제호를 본문 뒤에 기록한 PDF,
+   XLSX 병합 셀, 암호화 HWPX, 한글로 깨진 텍스트 레이어, 장식 그림 가리기. 폐쇄망 VLM 으로 그림 사실 회수 재측정.
 2. **배포** — memento·codex·vue3 모두 미push(`main` push = 배포). 배포 뒤 `scripts.reindex_stale` 로 재인덱싱. memento 이미지에 rhwp·한글 폰트(Dockerfile). 배포 뒤
    `python -m scripts.prewarm_renditions <tenant>` 로 기존 문서 변환본을 채운다(HWPX 첫 열람 30~70초 방지).
 3. **검색 품질** — 일반 문서에서 정답 파일을 인용 못 한 문항이 56개 중 6~7개. 인용이 아니라 문서 찾기 문제.

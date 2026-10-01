@@ -14,3 +14,6 @@ PDF_STRATEGY: str = os.getenv("PDF_STRATEGY", "pymupdf_region")
 
 # 괘선 없는 표를 글 블록 배치에서 되살린다(unruled_tables). 끄려면 false.
 PDF_UNRULED_TABLES: bool = os.getenv("PDF_UNRULED_TABLES", "true").strip().lower() not in ("0", "false", "no")
+
+# 가로선 없이 한 행에 묶인 하위 행을 글자 줄로 나눈다(subrows). 끄려면 false.
+PDF_SPLIT_SUBROWS: bool = os.getenv("PDF_SPLIT_SUBROWS", "true").strip().lower() not in ("0", "false", "no")

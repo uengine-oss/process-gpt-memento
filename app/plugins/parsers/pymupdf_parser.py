@@ -22,6 +22,7 @@ from langchain.schema import Document
 
 from .base import BaseParser
 from . import config, unruled_tables, vision
+from .subrows import split_subrows
 
 
 # 본문 삽입 그림 필터: 너무 작은 로고/아이콘, 페이지 전면 배경은 설명 대상에서 제외.
@@ -258,7 +259,10 @@ class PyMuPDFParser(BaseParser):
                 # 한 행짜리도 받는다: 한 표를 행마다 따로 잡는 PDF 가 있다
                 if tab.col_count < 2 or len(cells) < 2:
                     continue
-                out.append((list(tab.bbox), tab.to_markdown()))
+                md = tab.to_markdown()
+                if config.PDF_SPLIT_SUBROWS:
+                    md = split_subrows(page, tab, md)
+                out.append((list(tab.bbox), md))
             except Exception:
                 continue
         return out
