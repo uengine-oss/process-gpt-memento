@@ -10,12 +10,12 @@ OLD = ["OPENAI_LLM_API_KEY", "LLM_API_KEY", "LLM_PROXY_API_KEY", "OPENAI_API_KEY
        "OPENAI_EMBEDDING_MODEL", "LLM_EMBEDDING_MODEL", "EMBEDDING_BATCH_SIZE"]
 NEW = ["MEMENTO_LLM_PROVIDER", "MEMENTO_LLM_BASE_URL", "MEMENTO_LLM_API_KEY", "MEMENTO_LLM_MODEL",
        "MEMENTO_EMBEDDING_PROVIDER", "MEMENTO_EMBEDDING_BASE_URL", "MEMENTO_EMBEDDING_API_KEY", "MEMENTO_EMBEDDING_MODEL",
-       "MEMENTO_EMBEDDING_BATCH_SIZE", "MEMENTO_TABLE_LLM_MODEL"]
+       "MEMENTO_EMBEDDING_BATCH_SIZE", "MEMENTO_TABLE_LLM_MODEL", "QDRANT_COLLECTION_NAME", "KB_CARD_CONCURRENCY"]
 
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    for n in OLD + NEW:
+    for n in OLD + NEW + list(config.IGNORED_ENV) + ["CHROMA_COLLECTION_NAME"]:
         monkeypatch.delenv(n, raising=False)
     config._warned_legacy.clear()
 
@@ -72,3 +72,16 @@ def test_embedding_batch_size(monkeypatch):
     assert config.embedding_batch_size() == 64
     monkeypatch.setenv("MEMENTO_EMBEDDING_BATCH_SIZE", "32")
     assert config.embedding_batch_size() == 32
+
+
+def test_collection_name_keeps_an_old_override(monkeypatch, capsys):
+    assert config.qdrant_collection_name() == "documents"
+    monkeypatch.setenv("QDRANT_COLLECTION_NAME", "dev_docs")
+    assert config.qdrant_collection_name() == "dev_docs"
+    assert "QDRANT_COLLECTION_NAME=dev_docs 를 아직 따르지만" in capsys.readouterr().out
+
+
+def test_ignored_names_are_reported(monkeypatch, capsys):
+    monkeypatch.setenv("KB_CARD_CONCURRENCY", "3")
+    assert config.warn_ignored_env() == ["KB_CARD_CONCURRENCY"]
+    assert "KB_CARD_CONCURRENCY 는 더 이상 읽지 않는다" in capsys.readouterr().out

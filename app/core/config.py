@@ -142,7 +142,7 @@ EMBEDDING_PROVIDERS: Dict[str, Dict[str, Any]] = {
         "client": "openai_compatible",
     },
     "custom": {
-        # 사내 GPU 임베딩 서버(bge-m3, OpenAI 호환 /v1/embeddings). base_url 은 .../v1 까지.
+        # 자체 임베딩 서버(OpenAI 호환 /v1/embeddings). base_url 은 .../v1 까지.
         "base_url": None,
         "model": "BAAI/bge-m3",
         "legacy_api_key": ["CUSTOM_EMBEDDING_API_KEY"],
@@ -195,6 +195,26 @@ def _legacy(names: list, new: str) -> str:
 def env_with_legacy(new: str, legacy: list, default: Any = None) -> Any:
     """새 이름 → 예전 이름(경고) → 기본값."""
     return _env(new) or _legacy(legacy, new) or default
+
+
+#: 예전에 읽었지만 지금은 코드 상수인 이름. .env 에 남아 있으면 시작할 때 무시된다고 알린다.
+IGNORED_ENV = (
+    "CUSTOM_LLM_DISABLE_THINKING", "OPENROUTER_HTTP_REFERER", "OPENROUTER_APP_TITLE", "EMBEDDING_TIMEOUT_SEC",
+    "MEMENTO_EMBED_MAX_RETRIES", "KB_SECTION_COLLECTION", "QDRANT_QUANTIZATION", "QDRANT_SEARCH_OVERSAMPLING",
+    "QDRANT_HNSW_EF", "SUPABASE_WRITE_EMBEDDING", "SUPABASE_DUMMY_EMBEDDING_DIMENSIONS", "MEMENTO_INGEST_MAX_RETRIES",
+    "MEMENTO_INGEST_QUEUE_MAX", "MEMENTO_INGEST_LEASE_SEC", "MEMENTO_INGEST_SWEEP_SEC", "MEMENTO_VISION_MAX_RETRIES",
+    "KB_CARD_CONCURRENCY", "KB_CARD_WINDOW_CHARS", "KB_CARD_MAX_WINDOWS", "KB_SECTION_MAX_CHARS",
+    "KB_SECTION_EMBED_CHARS", "RENDITION_PREWARM_CONCURRENCY", "ARTIFACT_URL_TTL_SECONDS", "ROBO_GLOSSARY_TIMEOUT_SEC",
+    "MIGRATE_BATCH_SIZE",
+)
+
+
+def warn_ignored_env() -> list:
+    """값이 들어 있지만 더 읽지 않는 이름. 시작 로그에 한 번 알린다(docs/specs/configuration.md)."""
+    found = [n for n in IGNORED_ENV if _env(n)]
+    for n in found:
+        print(f"[config] 경고: {n} 는 더 이상 읽지 않는다(코드 상수) — .env 에서 지운다", flush=True)
+    return found
 
 
 def get_llm_provider() -> str:
@@ -275,8 +295,17 @@ def chroma_persist_directory() -> str:
     return _env("CHROMA_PERSIST_DIRECTORY", CHROMA_PERSIST_DIRECTORY)
 
 
+def _collection(name: str, default: str) -> str:
+    # 컬렉션 이름을 바꿔 쓰던 로컬 환경이 받자마자 다른 컬렉션을 보지 않게 아직 읽는다
+    v = _env(name)
+    if v and name not in _warned_legacy:
+        _warned_legacy.add(name)
+        print(f"[config] 경고: {name}={v} 를 아직 따르지만 곧 읽지 않는다 — 컬렉션 이름은 코드 상수 '{default}'", flush=True)
+    return v or default
+
+
 def chroma_collection_name() -> str:
-    return CHROMA_COLLECTION_NAME
+    return _collection("CHROMA_COLLECTION_NAME", CHROMA_COLLECTION_NAME)
 
 
 def chroma_server_host() -> str:
@@ -323,7 +352,7 @@ def qdrant_api_key() -> Optional[str]:
 
 
 def qdrant_collection_name() -> str:
-    return QDRANT_COLLECTION_NAME
+    return _collection("QDRANT_COLLECTION_NAME", QDRANT_COLLECTION_NAME)
 
 
 def qdrant_vector_size() -> int:

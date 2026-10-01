@@ -25,6 +25,9 @@ def _mask_secret(value: str) -> str:
 
 def log_provider_config() -> None:
     """Print a summary of the resolved LLM + Embedding provider configs."""
+    from app.core.config import warn_ignored_env
+
+    warn_ignored_env()
     try:
         llm_cfg = resolve_llm_config()
     except Exception as e:
