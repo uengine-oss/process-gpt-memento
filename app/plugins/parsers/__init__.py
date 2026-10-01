@@ -7,6 +7,17 @@ from typing import Dict, Optional, Type
 # 파서 출력이 바뀌면 올린다. knowledge_files.parser_version 으로 재인덱싱 대상을 고른다.
 PARSER_VERSION = "2026-10-01.subrows"
 
+
+def parser_version() -> str:
+    """기록·비교에 쓰는 버전. 표 LLM 을 켜면 그 모델이 붙어, 켜고 끄거나 모델을 바꾼 파일이 옛 버전이 된다."""
+    from .table_llm import enabled
+
+    if not enabled():
+        return PARSER_VERSION
+    from app.core.config import resolve_llm_config
+
+    return f"{PARSER_VERSION}+table-llm:{resolve_llm_config(role='table')['model']}"
+
 from . import config
 from .base import BaseParser
 from .pymupdf_parser import PyMuPDFParser

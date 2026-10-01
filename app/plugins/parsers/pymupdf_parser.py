@@ -23,6 +23,7 @@ from langchain.schema import Document
 from .base import BaseParser
 from . import config, unruled_tables, vision
 from .subrows import split_subrows
+from . import table_llm
 
 
 # 본문 삽입 그림 필터: 너무 작은 로고/아이콘, 페이지 전면 배경은 설명 대상에서 제외.
@@ -163,8 +164,11 @@ class PyMuPDFParser(BaseParser):
                 info: Dict[str, Any] = {
                     "page_num": page_num, "page_size": page_size,
                     "text_items": text_items, "img_items": [],
-                    "ocr_key": None, "mode": "text",
+                    "ocr_key": None, "mode": "text", "tables": [],
                 }
+                if has_text and table_llm.enabled():
+                    t_tasks, info["tables"] = table_llm.page_tasks(page, page_num, text_items)
+                    tasks.extend(t_tasks)
 
                 if vision_on and not has_text:
                     # 2번: 이미지만(텍스트 레이어 없음) → 페이지 전체 OCR.
@@ -222,6 +226,9 @@ class PyMuPDFParser(BaseParser):
                         if desc:
                             entries.append((place_key(info["text_items"], it["bbox"]), f"[그림: {desc}]", it["bbox"]))
                             used += 1
+                    if info["tables"]:
+                        entries, t_used, t_dropped = table_llm.apply(entries, info["tables"], results)
+                        meta_extra.update(table_llm=t_used, table_llm_dropped=t_dropped)
                     entries, prev_table = carry_table_header(entries, prev_table)
                     markdown, blocks = self._build_markdown(page_num, entries)
                     if used:

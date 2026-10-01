@@ -17,3 +17,7 @@ PDF_UNRULED_TABLES: bool = os.getenv("PDF_UNRULED_TABLES", "true").strip().lower
 
 # 가로선 없이 한 행에 묶인 하위 행을 글자 줄로 나눈다(subrows). 끄려면 false.
 PDF_SPLIT_SUBROWS: bool = os.getenv("PDF_SPLIT_SUBROWS", "true").strip().lower() not in ("0", "false", "no")
+
+# PDF 표 영역을 LLM(잘라낸 그림 + 그 영역 PDF 글자)으로 다시 읽는다. 표마다 10초 안팎이라 기본 끔.
+# 모델은 MEMENTO_TABLE_LLM_PROVIDER / _MODEL(없으면 기본 LLM). 근거: DESIGN_NOTES "PDF 표: 규칙 대 LLM".
+TABLE_LLM: bool = os.getenv("MEMENTO_TABLE_LLM", "false").strip().lower() in ("1", "true", "yes", "on")

@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Tuple
 
 from langchain.schema import Document
 
-from . import vision
+from . import table_llm, vision
 from .pymupdf_parser import (PyMuPDFParser, carry_table_header, garbled_text, place_key,
                              repeated_margin_text)
 
@@ -94,8 +94,11 @@ class PyMuPDFRegionParser(PyMuPDFParser):
 
                 info: Dict[str, Any] = {
                     "page_num": page_num, "page_size": page_size,
-                    "text_items": text_items, "regions": [], "ocr_key": None, "mode": "text",
+                    "text_items": text_items, "regions": [], "ocr_key": None, "mode": "text", "tables": [],
                 }
+                if has_text and table_llm.enabled():
+                    t_tasks, info["tables"] = table_llm.page_tasks(page, page_num, text_items)
+                    tasks.extend(t_tasks)
 
                 if vision_on and not has_text:
                     # 2번: 텍스트 레이어 없음 → 페이지 전체 OCR (부모와 동일).
@@ -157,6 +160,9 @@ class PyMuPDFRegionParser(PyMuPDFParser):
                         text = out if reg.get("is_ocr") else f"[그림: {out}]"
                         entries.append((place_key(info["text_items"], reg["bbox"]), text, reg["bbox"]))
                         used += 1
+                    if info["tables"]:
+                        entries, t_used, t_dropped = table_llm.apply(entries, info["tables"], results)
+                        meta_extra.update(table_llm=t_used, table_llm_dropped=t_dropped)
                     entries, prev_table = carry_table_header(entries, prev_table)
                     markdown, blocks = self._build_markdown(page_num, entries)
                     if used:

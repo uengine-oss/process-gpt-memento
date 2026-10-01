@@ -284,12 +284,12 @@ async def schedule_card_build(
 
 
 async def _record_parser_version(tenant_id: str, file_id: str) -> None:
-    from app.plugins.parsers import PARSER_VERSION
+    from app.plugins.parsers import parser_version
 
     try:
         await asyncio.to_thread(
             supabase.table("knowledge_files")
-            .update({"parser_version": PARSER_VERSION})
+            .update({"parser_version": parser_version()})
             .eq("tenant_id", tenant_id)
             .eq("source_ref", file_id)
             .execute

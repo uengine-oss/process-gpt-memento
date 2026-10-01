@@ -199,8 +199,20 @@ def _first_env(names: list[str]) -> str:
     return ""
 
 
-def get_llm_provider() -> str:
-    return (os.getenv("MEMENTO_LLM_PROVIDER") or "openai").strip().lower()
+#: 기본 LLM 과 다른 모델을 쓸 수 있는 역할. MEMENTO_<역할>_LLM_PROVIDER / _MODEL 로 덮는다(없으면 기본 LLM).
+LLM_ROLES = ("table",)
+
+
+def _role_env(role: Optional[str], key: str) -> str:
+    if not role:
+        return ""
+    if role not in LLM_ROLES:
+        raise ValueError(f"Unknown LLM role: {role}")
+    return (os.getenv(f"MEMENTO_{role.upper()}_LLM_{key}") or "").strip()
+
+
+def get_llm_provider(role: Optional[str] = None) -> str:
+    return (_role_env(role, "PROVIDER") or os.getenv("MEMENTO_LLM_PROVIDER") or "openai").strip().lower()
 
 
 def get_embedding_provider() -> str:
@@ -218,8 +230,8 @@ def _openrouter_headers() -> Dict[str, str]:
     return headers
 
 
-def resolve_llm_config(model_override: Optional[str] = None) -> Dict[str, Any]:
-    provider = get_llm_provider()
+def resolve_llm_config(model_override: Optional[str] = None, role: Optional[str] = None) -> Dict[str, Any]:
+    provider = get_llm_provider(role)
     if provider not in LLM_PROVIDERS:
         raise ValueError(f"Unknown MEMENTO_LLM_PROVIDER: {provider}")
     spec = LLM_PROVIDERS[provider]
@@ -228,7 +240,7 @@ def resolve_llm_config(model_override: Optional[str] = None) -> Dict[str, Any]:
     if provider == "custom" and not base_url:
         raise ValueError("MEMENTO_LLM_PROVIDER=custom requires CUSTOM_LLM_BASE_URL")
 
-    model = model_override or _first_env(spec["model_env"]) or spec["model"]
+    model = model_override or _role_env(role, "MODEL") or _first_env(spec["model_env"]) or spec["model"]
 
     return {
         "provider": provider,

@@ -124,13 +124,15 @@ def chat_completion(
     retries: int = 1,
     extra_payload: Optional[Dict[str, Any]] = None,
     log_prefix: str = "llm",
+    role: Optional[str] = None,
 ) -> str:
     """OpenAI 호환 ``/chat/completions`` 직접 호출. 실패하면 빈 문자열.
 
     langchain 을 거치지 않는 호출부(vision·구조화기)가 쓰는 단일 경로다. 모델별
     파라미터를 여기서 한 번만 맞추므로 호출부는 messages 만 만들면 된다.
+    ``role`` 을 주면 그 역할에 따로 지정한 프로바이더·모델을 쓴다(config.LLM_ROLES).
     """
-    cfg = resolve_llm_config()
+    cfg = resolve_llm_config(role=role)
     base_url = (cfg.get("base_url") or "").rstrip("/")
     model = cfg.get("model") or ""
     if not base_url or not model:

@@ -85,7 +85,7 @@ def _disable_thinking() -> bool:
     )
 
 
-def _vlm_call(image_bytes: bytes, prompt: str, mime_type: str, max_tokens: int) -> str:
+def _vlm_call(image_bytes: bytes, prompt: str, mime_type: str, max_tokens: int, role: Optional[str] = None) -> str:
     """이미지 한 장을 VLM 에 묻는다. 실패 시 빈 문자열."""
     from app.services.llm import chat_completion
 
@@ -100,7 +100,7 @@ def _vlm_call(image_bytes: bytes, prompt: str, mime_type: str, max_tokens: int) 
         }
     ]
     extra = {}
-    if resolve_llm_config().get("provider") == "custom" and _disable_thinking():
+    if resolve_llm_config(role=role).get("provider") == "custom" and _disable_thinking():
         extra["chat_template_kwargs"] = {"enable_thinking": False}
 
     text = chat_completion(
@@ -110,6 +110,7 @@ def _vlm_call(image_bytes: bytes, prompt: str, mime_type: str, max_tokens: int) 
         timeout=VISION_TIMEOUT_SEC,
         extra_payload=extra,
         log_prefix="vision",
+        role=role,
     )
     # VLM 이 출력 전체를 ```markdown ... ``` 로 감싸는 경우가 잦다 -> 바깥 펜스 제거.
     return strip_wrapping_fence(text)
