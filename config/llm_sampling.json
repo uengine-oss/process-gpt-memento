@@ -27,6 +27,19 @@
     }
   },
   "models": {
+    "frentis": {
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "presence_penalty": 1.5,
+      "extra_body": {
+        "top_k": 20,
+        "min_p": 0.0,
+        "repetition_penalty": 1.0,
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        }
+      }
+    },
     "gpt-5": {
       "locked": {
         "temperature": 1

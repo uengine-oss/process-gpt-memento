@@ -20,6 +20,17 @@ def test_joined_year_month_label_is_not_an_invented_value():
     assert table_llm.accept("| 기간 | 값 |\n|---|---|\n| 2019.3 | 1,234 |", TEXT)
 
 
+def test_rejects_a_table_that_drops_rule_table_values():
+    rule = "|구분|2019|2020|\n|---|---|---|\n|**전국**|-1.1|△0.5|\n|서울|1,234||"
+    assert table_llm.accept("| 구분 | 2019 | 2020 |\n|---|---|---|\n| 전국 | -1.1 | △0.5 |", TEXT, rule) is None
+    assert table_llm.accept("| 구분 | 2019 | 2020 |\n|---|---|---|\n| 전국 | -1.1 | △0.5 |\n| 서울 | 1,234 | |", TEXT, rule)
+
+
+def test_rejects_a_row_cut_off_by_trailing_words():
+    md = "| 구분 | 전국 |\n|---|---|\n| 2019 | -1.1 | -> Wait, looking at the image again."
+    assert table_llm.accept(md, TEXT) is None
+
+
 def test_rejects_an_answer_without_a_table():
     assert table_llm.accept("표가 아닙니다", TEXT) is None
 

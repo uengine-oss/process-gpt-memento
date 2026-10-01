@@ -85,3 +85,9 @@ def test_ignored_names_are_reported(monkeypatch, capsys):
     monkeypatch.setenv("KB_CARD_CONCURRENCY", "3")
     assert config.warn_ignored_env() == ["KB_CARD_CONCURRENCY"]
     assert "KB_CARD_CONCURRENCY 는 더 이상 읽지 않는다" in capsys.readouterr().out
+
+
+def test_frentis_thinking_is_off_through_any_provider():
+    for provider in ("openai", "custom"):
+        params = config.resolve_chat_params(provider=provider, model="frentis-ai-model")
+        assert params["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}

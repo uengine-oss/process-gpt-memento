@@ -1,7 +1,7 @@
 """PDF 표 영역을 LLM 으로 다시 읽는다(MEMENTO_TABLE_LLM). 근거·측정: docs/DESIGN_NOTES.md "PDF 표: 규칙 대 LLM".
 
 find_tables 가 찾은 표마다 영역 그림과 그 영역의 PDF 글자를 함께 주고 마크다운 표를 받는다. 받은 표의 숫자가 모두
-PDF 글자에 있을 때만 쓴다 — 아니면 규칙으로 만든 표를 그대로 둔다.
+PDF 글자에 있고 규칙 표의 숫자를 빠뜨리지 않았을 때만 쓴다 — 아니면 규칙으로 만든 표를 그대로 둔다.
 """
 from __future__ import annotations
 
@@ -54,15 +54,23 @@ def page_tasks(page, page_num: int, text_items) -> Tuple[List[Tuple[str, Callabl
     return tasks, infos
 
 
-def accept(md: str, text: str) -> Optional[str]:
-    """LLM 표를 쓸지. 표 행이 둘 이상이고 숫자가 모두 영역 글자에 있으면 표 행만, 아니면 None."""
+def _squash(s: str) -> str:
+    return re.sub(r"\s|\*\*", "", s).replace("−", "-")
+
+
+def accept(md: str, text: str, rule_md: str = "") -> Optional[str]:
+    """LLM 표를 쓸지. 표 행만 남겨 숫자가 모두 영역 글자에 있고 규칙 표의 숫자를 빠뜨리지 않았으면 그 행들, 아니면 None."""
     rows = [ln.strip() for ln in (md or "").splitlines() if ln.strip().startswith("|")]
-    if len(rows) < 2:
+    if len(rows) < 2 or any(not r.endswith("|") for r in rows):  # 행 끝에 붙은 말은 표가 끊긴 흔적이다
         return None
-    hay = re.sub(r"\s", "", text).replace("−", "-")
+    hay = _squash(text)
     for tok in _NUM.findall("\n".join(rows)):
         tok = tok.replace("−", "-")
         if tok not in hay and not _YEAR_MONTH.fullmatch(tok.lstrip("+-")):
+            return None
+    got = _squash("\n".join(rows))
+    for tok in _NUM.findall(re.sub(r"Col\d+", "", rule_md)):  # 규칙 표에 있던 값을 빼먹은 표는 쓰지 않는다
+        if tok.replace("−", "-") not in got:
             return None
     return "\n".join(rows)
 
@@ -70,9 +78,10 @@ def accept(md: str, text: str) -> Optional[str]:
 def apply(entries, infos: List[Dict[str, Any]], results: Dict[str, str]):
     """entries [(순서 키, text, bbox)] 의 표를 받아들인 LLM 표로 바꾼다. (entries, 바꾼 수, 버린 수)."""
     by_bbox = {}
+    rule = {tuple(b): t for _, t, b in entries if t.lstrip().startswith("|")}
     used = dropped = 0
     for info in infos:
-        md = accept(results.get(info["key"], ""), info["text"])
+        md = accept(results.get(info["key"], ""), info["text"], rule.get(tuple(info["bbox"]), ""))
         if md:
             by_bbox[tuple(info["bbox"])] = md
             used += 1

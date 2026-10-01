@@ -31,6 +31,7 @@ memento 의 설정은 **배포마다 환경 변수(.env)** 로 정한다. 호출
 | `MEMENTO_LLM_MODEL` | openai `gpt-5.6-luna`, openrouter `openai/gpt-oss-120b`, custom `/models/openai/gpt-oss-120b` | 모델 |
 
 샘플링 값(temperature·top_p·thinking 끄기 등)은 환경 변수가 아니라 `config/llm_sampling.json` 이 프로바이더·모델별로 정한다.
+frentis 는 모델 규칙으로 thinking 을 끈다 — 운영처럼 `openai` 프로바이더(litellm)로 불러도 꺼진다.
 
 ## 임베딩
 
