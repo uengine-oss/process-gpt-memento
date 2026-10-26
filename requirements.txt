@@ -30,6 +30,6 @@ qdrant-client>=1.19,<1.20
 onnxruntime==1.18.1
 markdown>=3.8.2
 beautifulsoup4==4.12.3
-process-gpt-document-parser[pdf,hwp-distribution,images] @ git+https://github.com/uengine-oss/process-gpt-document-parser@v0.1.0
+process-gpt-document-parser[pdf,hwp-distribution,images] @ git+https://github.com/uengine-oss/process-gpt-document-parser@v0.2.0
 openpyxl==3.1.2
 pandas==2.2.1

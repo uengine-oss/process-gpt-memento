@@ -66,7 +66,7 @@ dependencies = [
     "pillow==10.0.1",
     "pydantic==2.7.4",
     "pyjwt>=2.8.0",
-    "process-gpt-document-parser[pdf,hwp-distribution,images] @ git+https://github.com/uengine-oss/process-gpt-document-parser@v0.1.0",
+    "process-gpt-document-parser[pdf,hwp-distribution,images] @ git+https://github.com/uengine-oss/process-gpt-document-parser@v0.2.0",
     "pypdf==4.0.1",
     "python-dateutil==2.8.2",
     "python-docx==1.1.2",

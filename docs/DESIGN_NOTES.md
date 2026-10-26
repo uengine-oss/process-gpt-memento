@@ -290,9 +290,9 @@ python score_real.py --mode stub --out out/swap/<before|after>     # synth 는 s
   글만 뽑는 extract_hwp 로 떨어져 문장 22% 였다. 순서 76% 는 같은 문서의 HWPX 와 같다.
 - 합성 16종(synth)은 전후 60줄 점수가 모두 같다.
 - 그림은 VLM 이 먼저 정보가 있는지 보고 로고·사진은 `SKIP` 으로 거른다(라이브러리 BENCHMARKS "문서 속 그림").
-- **느린 PDF**: 벡터 차트가 많은 24쪽 PDF(`real/knhanes_2025` 별첨)가 라이브러리만으로 101초, 인제스트 160초.
-  시간의 70% 가 pdfminer 의 내용 스트림 해석(명령 800만 개)이다. 순수 파이썬이라 그동안 API 응답이 8ms → 중앙값 0.29초,
-  최대 1.3초로 늘었다(같은 서버의 `[http] <-` 로그). 프로세스로 떼어 돌리는 것은 아직 하지 않았다.
+- **느린 PDF**: 벡터 차트가 많은 24쪽 PDF(`real/knhanes_2025` 별첨)가 v0.1.0 에서 인제스트 160초였다(pdfminer 가 그리기 명령
+  800만 개를 파이썬으로 해석). v0.2.0 은 선을 pdfium 으로 읽어 40초, 그동안 API 응답(서버 `[http] <-` 로그)은 중앙값 0.14초·최대
+  1.2초(유휴 8ms). 파싱은 아직 서버 프로세스 안 스레드에서 돈다. 측정은 라이브러리 VERIFICATION "pdfium 엔진".
 - PyMuPDF(AGPL)를 걷어 냈다. 쪽 그림·강조·삽입 그림 추출은 pypdfium2(`app/services/pdf_render.py`).
   변환본 글자 흐름(`rendition._pdf_chars`)은 굵게 보이려 겹쳐 찍은 글자를 PyMuPDF 는 겹친 수만큼, pdfium 은 한 번 읽는다.
 
