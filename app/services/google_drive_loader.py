@@ -18,7 +18,6 @@ from datetime import datetime
 from app.core.env_loader import load_project_dotenv
 from app.services.document_processor import get_document_processor
 
-import fitz  # PyMuPDF for PDF image extraction
 from PIL import Image
 import io
 import tempfile

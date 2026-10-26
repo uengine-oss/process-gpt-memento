@@ -37,18 +37,17 @@
 
 | 형식 | 한 "페이지" | 파서 |
 |---|---|---|
-| PDF | 실제 쪽 | `PDF_STRATEGY` (`pymupdf_region` 기본). 텍스트 없는 쪽·깨진 텍스트 레이어 쪽은 VLM OCR |
+| PDF | 실제 쪽 | process-gpt-document-parser. 글 레이어가 없는 쪽은 VLM OCR |
 | PPTX | 슬라이드 | LibreOffice로 PDF 변환 후 PDF 파서 |
 | XLSX | 시트 | openpyxl, 시트당 최대 20,000행 |
-| DOCX, DOC | **문서 전체가 1쪽** | `docx_structured` (DOC는 LibreOffice로 DOCX 변환) |
-| HWPX | **문서 전체가 1쪽** | `hwpx_structured` |
-| HWP | **문서 전체가 1쪽** | rhwp 로 HWPX 변환 후 `hwpx_structured`, rhwp 가 없거나 실패하면 `vendor/extract_hwp`(글만) |
+| DOCX, DOC, HWPX, HWP | **문서 전체가 1쪽** | process-gpt-document-parser. 읽지 못하면 LibreOffice 로 PDF 를 만들어 PDF 로 읽는다 |
 | TXT·MD·코드 | 문서 전체가 1쪽 | UTF-8 디코드 |
 
-한글 문서는 확장자 대신 파일 첫 바이트로 형식을 가른다(HWP5 바이너리에 `.hwpx` 가 붙은 파일이 실제로 돈다).
+HWP·HWPX·DOC·DOCX 는 확장자 대신 파일 내용으로 형식을 가른다(HWP5 바이너리에 `.hwpx` 가 붙은 파일이 실제로 돈다).
 
-PDF 본문은 PDF 에 기록된 글 순서를 따르고 표·그림 설명은 그 순서 안의 제자리에 끼운다. 여러 쪽의 위·아래
-가장자리에 되풀이되는 글(머리말·꼬리말·쪽 번호)은 뺀다. 표는 병합 칸을 덮인 칸마다 같은 값으로 채운다(PDF·DOCX·HWPX 공통). 선이 없는 PDF 표는 글 블록 배치로 되살린다(`PDF_UNRULED_TABLES`, 기본 켬). 가로선 없이 한 칸에 묶인 PDF 표의 하위 행은 글자 줄로 나누고 이름 칸을 채운다(`PDF_SPLIT_SUBROWS`, 기본 켬). `MEMENTO_TABLE_LLM` 을 켜면 PDF 표를 LLM 으로 다시 읽고, 숫자가 모두 PDF 글자에 있을 때만 그 표를 쓴다(기본 끔, [configuration.md](configuration.md#pdf-표-llm-파싱-memento_table_llm)).
+PDF 본문은 쪽 위의 위치로 읽는 순서를 잡고(단 나눔 포함) 표·그림 설명은 그 순서 안의 제자리에 끼운다. 여러 쪽의
+위·아래 가장자리에 되풀이되는 글(머리말·꼬리말·쪽 번호)은 뺀다. 표는 병합 칸을 덮인 칸마다 같은 값으로 채운다(모든 형식 공통).
+그림은 VLM 이 먼저 읽을 정보가 있는지 보고, 로고·사진처럼 없으면 건너뛴다(`SKIP`). 정보가 있으면 `[그림: ...]` 으로 옮긴다.
 그림은 짧은 변 80px 미만을 설명하지 않고, 같은 그림은 한 번만 설명해 처음 나온 자리에만 넣는다.
 
 DOCX·HWPX·HWP는 흐르는 문서라 파일에 쪽 정보가 없다. 렌더러로 계산한 쪽은 사용자가
@@ -60,13 +59,13 @@ DOCX·HWPX·HWP는 흐르는 문서라 파일에 쪽 정보가 없다. 렌더러
 heading_level, page_number, bbox)`.
 
 - `kind`: `paragraph` | `table` | `image`(그림 설명).
-- DOCX·HWPX는 파서의 구조를 그대로 쓴다. `page_number` 는 `null` 이다.
+- DOCX·DOC·HWPX·HWP는 파서의 구조를 그대로 쓴다. `page_number` 는 `null` 이다.
   `heading_level` 은 파일에 명시된 헤딩만 — DOCX 제목 스타일·`outlineLvl`(basedOn 상속),
   HWPX 개요 수준 문단 모양. 번호 패턴으로 추측하지 않는다. DOCX 콘텐츠 컨트롤(`sdt`) 안도 읽는다.
 - 그 밖의 형식은 쪽 본문을 빈 줄로 나누고 쪽 번호를 단다. PDF는 `blocks_json` offset으로 `bbox` 를 붙인다.
-  HWP(`extract_hwp`)·TXT는 쪽이 없어 `page_number` 가 `null` 이다.
+  TXT는 쪽이 없어 `page_number` 가 `null` 이다.
 - 2,000자를 넘는 블록은 줄 경계에서 나눈다. 표는 행 경계에서 나누고 머리행을 반복한다. 헤딩은 나누지 않는다.
-- 파서 출력이 바뀌면 `app/plugins/parsers.PARSER_VERSION` 을 올린다.
+- `app/plugins/parsers.PARSER_VERSION` 은 설치된 process-gpt-document-parser 버전에서 나온다. 라이브러리를 올리면 재인덱싱 대상이 된다.
 
 ## 상태
 

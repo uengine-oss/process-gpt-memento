@@ -36,8 +36,8 @@ FastAPI 기반 멀티테넌트 지식베이스 서비스입니다.
    ```
 
 2. **외부 도구** (Docker 이미지에는 들어 있다 — `Dockerfile`)
-   - LibreOffice(`soffice`): DOC·PPTX 변환, DOCX 보기용 PDF
-   - [rhwp](https://github.com/edwardkim/rhwp) 0.8.4: HWP→HWPX 변환과 한글 문서 보기용 PDF. PATH 에 두거나 `HWPX_RHWP` 로 지정
+   - LibreOffice(`soffice`): PPTX 변환, DOCX 보기용 PDF, 파싱 실패 시 PDF 폴백
+   - [rhwp](https://github.com/edwardkim/rhwp) 0.8.4: 한글 문서 보기용 PDF. PATH 에 두거나 `HWPX_RHWP` 로 지정
    - 한글 글꼴(나눔·Noto CJK): 보기용 PDF 렌더링
 
 3. **환경 변수**: `cp .env.example .env` 후 채운다. 필수는 `SUPABASE_URL`·`SUPABASE_KEY` 와 LLM·임베딩 프로바이더 하나씩.
@@ -45,7 +45,6 @@ FastAPI 기반 멀티테넌트 지식베이스 서비스입니다.
    - 주소·키·모델은 프로바이더와 상관없이 `MEMENTO_LLM_BASE_URL`·`_API_KEY`·`_MODEL`(임베딩은 `MEMENTO_EMBEDDING_*`)
    - 사내망 모델(vLLM 등): `MEMENTO_LLM_PROVIDER=custom` + `MEMENTO_LLM_BASE_URL`
    - litellm 프록시: `MEMENTO_LLM_PROVIDER=openai` + `MEMENTO_LLM_BASE_URL`(프록시 주소)·`MEMENTO_LLM_API_KEY`·`MEMENTO_LLM_MODEL`
-   - PDF 표 LLM 파싱은 기본 끔(`MEMENTO_TABLE_LLM`). 켤 때는 configuration.md 의 "PDF 표 LLM 파싱"을 먼저 읽는다.
 
 4. **Supabase 마이그레이션**: `sql/` 의 SQL 을 SQL 에디터에서 한 번씩 실행한다(배포 환경에는 push 전에).
    `knowledge_doc_cards.sql`, `knowledge_folder_cards.sql`, `kb_mirror.sql`, `knowledge_files_path.sql`,

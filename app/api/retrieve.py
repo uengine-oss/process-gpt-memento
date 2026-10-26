@@ -485,7 +485,7 @@ async def preview_pdf_highlight(
     dpi: int = 150,
 ):
     """PDF 한 페이지 + bbox 하이라이트를 PNG로 렌더링해 Supabase에 캐시 후 public URL 반환."""
-    import pymupdf
+    from app.services.pdf_render import render_page
 
     try:
         bbox_parts = [float(v.strip()) for v in bbox.split(",")]
@@ -530,29 +530,10 @@ async def preview_pdf_highlight(
     if not pdf_bytes:
         raise HTTPException(status_code=404, detail=f"PDF empty: {file_id}")
 
-    def _render() -> tuple[bytes, int, int]:
-        pdf = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        try:
-            if page < 0 or page >= pdf.page_count:
-                raise ValueError(f"page {page} out of range (0..{pdf.page_count - 1})")
-            pg = pdf.load_page(page)
-            rect = pymupdf.Rect(x0, y0, x1, y1)
-            rect = rect & pg.rect
-            pg.draw_rect(
-                rect,
-                color=(1, 0.75, 0),
-                fill=(1, 0.92, 0.2),
-                fill_opacity=0.35,
-                width=1.5,
-            )
-            pix = pg.get_pixmap(dpi=dpi)
-            return pix.tobytes("png"), pix.width, pix.height
-        finally:
-            pdf.close()
-
     try:
-        png_bytes, img_w, img_h = await asyncio.to_thread(_render)
-    except ValueError as exc:
+        png_bytes, _, _, img_w, img_h = await asyncio.to_thread(
+            render_page, pdf_bytes, page, dpi / 72, (x0, y0, x1, y1))
+    except IndexError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"render failed: {exc}")

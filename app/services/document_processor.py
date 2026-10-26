@@ -2,34 +2,24 @@
 Document loader and processor
 """
 import os
-import docx
 import uuid
 import tempfile
 import asyncio
 import io
 import zipfile
-from typing import List, Optional, Dict, Any, Tuple, AsyncIterator
+from typing import List, Optional, Dict, Any, AsyncIterator
 from pathlib import Path
 from langchain.schema import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
+from process_gpt_document_parser import EncryptedDocumentError, ParseError, detect_format
+
 from app.plugins.chunkers import get_chunker
 from app.plugins.parsers import get_pdf_parser
+from app.plugins.parsers.document_parser import parse_flowing
 from app.services.document_blocks import BLOCKS_KEY
-from langchain_community.document_loaders import (
-    UnstructuredWordDocumentLoader,
-    UnstructuredPowerPointLoader,
-    UnstructuredFileLoader,
-    PyPDFLoader,
-    TextLoader
-)
-import fitz  # PyMuPDF for PDF image extraction
-from app.services.file_to_pdf import convert_to_pdf, convert_to_docx, FileToPdfError
-
-# Allow loading vendored extract_hwp when the installed extract-hwp package has no module (PyPI 0.1.0 packaging bug)
-_vendor_dir = Path(__file__).resolve().parents[2] / "vendor"
-if _vendor_dir.is_dir() and str(_vendor_dir) not in __import__("sys").path:
-    __import__("sys").path.insert(0, str(_vendor_dir))
+from app.services import pdf_render
+from app.services.file_to_pdf import convert_to_pdf, FileToPdfError
 
 
 def _load_xlsx_documents(data: bytes, file_name: str) -> List[Document]:
@@ -73,99 +63,6 @@ def _load_xlsx_documents(data: bytes, file_name: str) -> List[Document]:
     return docs
 
 
-def _docx_blocks(parsed: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """docx_structured 블록 → document_blocks 입력. 그림 설명은 문단 뒤 별도 블록."""
-    blocks: List[Dict[str, Any]] = []
-    for b in parsed:
-        if b["type"] == "table":
-            blocks.append({"kind": "table", "text": b["markdown"], "heading_level": None})
-            continue
-        blocks.append({"kind": "paragraph", "text": b["text"], "heading_level": b.get("heading_level")})
-        for img in b.get("images") or []:
-            if img.get("description"):
-                blocks.append({"kind": "image", "text": f"[그림: {img['description']}]", "heading_level": None})
-    return blocks
-
-
-_OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
-
-
-def sniff_hwp_extension(data: bytes, file_extension: str) -> str:
-    """한글 문서는 확장자와 실제 형식이 다른 채로 돈다(HWP5 바이너리에 .hwpx). 첫 바이트로 가른다."""
-    if file_extension in (".hwp", ".hwpx"):
-        if data[:8] == _OLE_MAGIC:
-            return ".hwp"
-        if data[:2] == b"PK":
-            return ".hwpx"
-    return file_extension
-
-
-def _hwp_to_hwpx(file_path: str) -> Optional[str]:
-    """HWP5 → HWPX (rhwp). 변환본 경로, 못 하면 None."""
-    import subprocess
-    from app.services.rendition import find_rhwp
-
-    rhwp = find_rhwp()
-    if not rhwp:
-        return None
-    fd, out = tempfile.mkstemp(suffix=".hwpx")
-    os.close(fd)
-    try:
-        proc = subprocess.run([rhwp, "export-hwpx", file_path, out],
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
-        if proc.returncode == 0 and os.path.getsize(out) > 0:
-            return out
-        print(f"[hwp] rhwp export-hwpx 실패: {proc.stderr.decode('utf-8', 'replace')[-300:]}")
-    except (OSError, subprocess.TimeoutExpired) as e:
-        print(f"[hwp] rhwp export-hwpx 실패: {e}")
-    os.unlink(out)
-    return None
-
-
-def _extract_text_from_hwp_or_hwpx(
-    file_path: str, file_extension: str
-) -> Tuple[Optional[str], Optional[str], Optional[List[Dict[str, Any]]]]:
-    """
-    Extract text from HWP or HWPX file.
-      - .hwpx → app 측 구조화 파서(hwpx_structured): 블록(문단·표·그림 설명) + 개요 수준 헤딩.
-      - .hwp  → vendored extract_hwp(HWP 5.0/OLE). 미설치 시 설치 안내. 블록 구조 없음.
-    Returns (text, error_message, blocks); error_message is None on success.
-    PyPI extract-hwp 0.1.0 ships no module (packaging bug); .hwp 는 Git 설치 또는 vendor 사용.
-    """
-    if file_extension == ".hwpx":
-        try:
-            from app.plugins.parsers.hwpx_structured import parse_blocks
-            blocks = parse_blocks(file_path, describe=True)
-            return ("\n\n".join(b["text"] for b in blocks), None, blocks)
-        except Exception as e:
-            return (None, str(e), None)
-
-    if file_extension == ".hwp":
-        # rhwp 로 HWPX 로 바꾸면 표·헤딩 구조를 살린다(배포용 문서도 읽힌다). 없으면 글만 뽑는 extract_hwp.
-        converted = _hwp_to_hwpx(file_path)
-        if converted:
-            try:
-                from app.plugins.parsers.hwpx_structured import parse_blocks
-                blocks = parse_blocks(converted, describe=True)
-                return ("\n\n".join(b["text"] for b in blocks), None, blocks)
-            except Exception as e:
-                print(f"[hwp] rhwp 변환본 파싱 실패, extract_hwp 로: {e}")
-            finally:
-                os.unlink(converted)
-        try:
-            from extract_hwp import extract_text_from_hwp
-            text, error = extract_text_from_hwp(file_path)
-            return (text, error, None)
-        except ModuleNotFoundError:
-            return (
-                None,
-                "HWP 파일 처리를 위해 extract-hwp를 GitHub에서 설치해 주세요: uv pip install \"extract-hwp @ git+https://github.com/thlee/extract-hwp.git\" (또는 vendor 폴더에 소스 추가)",
-                None,
-            )
-
-    return (None, f"Unsupported extension: {file_extension}", None)
-
-
 class DocumentProcessor:
     def __init__(self, chunk_size: int | None = None, chunk_overlap: int | None = None):
         self.chunk_size = chunk_size
@@ -174,34 +71,24 @@ class DocumentProcessor:
         # chunk_size/chunk_overlap이 None이면 config.py + PER_STRATEGY_OVERRIDES 값을 사용한다.
         self.chunker = get_chunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
-    def _load_docx_with_python_docx(self, tmp_path: str, file_name: str) -> List[Document]:
-        """DOCX 구조화 추출 — 표 마크다운 / 메모 위치 / placeholder / 이미지 *설명* 보존.
-
-        그림 설명은 MEMENTO_LLM_PROVIDER 의 모델로 부른다. 호출이 실패하면 자리표시만 남긴다(fail-open).
-        """
-        # 지연 import — 순환 회피 + parser 의존성 격리
-        from app.plugins.parsers.docx_structured import parse as parse_structured
-        import tempfile as _tempfile
-        with _tempfile.TemporaryDirectory() as tmp_img_dir:
-            result = parse_structured(tmp_path, out_dir=Path(tmp_img_dir), describe=True)
-        flat_text = result.get("flat_text") or ""
-        if not flat_text.strip():
-            # fallback — 빈 결과면 옛 평탄화 추출
-            if docx is None:
-                raise RuntimeError("python-docx is not installed")
-            doc = docx.Document(tmp_path)
-            parts = []
-            for p in doc.paragraphs:
-                if p.text.strip():
-                    parts.append(p.text)
-            for table in doc.tables:
-                for row in table.rows:
-                    for cell in row.cells:
-                        if cell.text.strip():
-                            parts.append(cell.text)
-            flat_text = "\n\n".join(parts)
-            return [Document(page_content=flat_text)]
-        return [Document(page_content=flat_text, metadata={BLOCKS_KEY: _docx_blocks(result["blocks"])})]
+    async def _parse_via_pdf(self, data: bytes, file_name: str, file_extension: str) -> Optional[List[Document]]:
+        """LibreOffice 로 PDF 를 만들어 PDF 파서로 읽는다. 못 하면 None."""
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
+            await asyncio.to_thread(tmp.write, data)
+            tmp_path = tmp.name
+        converted_pdf_path = None
+        try:
+            converted_pdf_path = await asyncio.to_thread(convert_to_pdf, tmp_path, os.path.dirname(tmp_path))
+            with open(converted_pdf_path, "rb") as f:
+                pdf_bytes = await asyncio.to_thread(f.read)
+            return await get_pdf_parser().parse(pdf_bytes, f"{Path(file_name).stem}.pdf")
+        except FileToPdfError as e:
+            print(f"[parser] {file_name} PDF 변환 실패: {e}")
+            return None
+        finally:
+            if converted_pdf_path and converted_pdf_path != tmp_path and os.path.exists(converted_pdf_path):
+                await asyncio.to_thread(os.unlink, converted_pdf_path)
+            await asyncio.to_thread(os.unlink, tmp_path)
 
     async def load_document(self, file_content: bytes, file_name: str) -> Optional[List[Document]]:
         """Async: Load a document from memory (BytesIO object)."""
@@ -224,41 +111,6 @@ class DocumentProcessor:
                     except UnicodeDecodeError:
                         content = content.decode('utf-8', errors='replace')
                 documents = [Document(page_content=content)]
-            elif file_extension == '.docx':
-                # Save BytesIO to temporary file
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp:
-                    await asyncio.to_thread(tmp.write, file_content.read())
-                    tmp_path = tmp.name
-                try:
-                    documents = await asyncio.to_thread(
-                        self._load_docx_with_python_docx,
-                        tmp_path,
-                        file_name
-                    )
-                finally:
-                    await asyncio.to_thread(os.unlink, tmp_path)
-            elif file_extension == '.doc':
-                # 레거시 바이너리 .doc: LibreOffice 로 .docx 변환 후 docx 구조화 파서 재사용
-                # (메모/표/이미지 VLM 보존). 서버에 LibreOffice(soffice) 필요.
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.doc') as tmp:
-                    await asyncio.to_thread(tmp.write, file_content.read())
-                    tmp_path = tmp.name
-                converted_docx_path = None
-                try:
-                    try:
-                        converted_docx_path = await asyncio.to_thread(
-                            convert_to_docx, tmp_path, os.path.dirname(tmp_path)
-                        )
-                    except FileToPdfError as conv_err:
-                        print(f"[doc] LibreOffice .docx 변환 실패 for {file_name}: {conv_err}")
-                        return None
-                    documents = await asyncio.to_thread(
-                        self._load_docx_with_python_docx, converted_docx_path, file_name
-                    )
-                finally:
-                    if converted_docx_path and os.path.exists(converted_docx_path):
-                        await asyncio.to_thread(os.unlink, converted_docx_path)
-                    await asyncio.to_thread(os.unlink, tmp_path)
             elif file_extension == '.pptx':
                 # pptx → LibreOffice 로 PDF 변환 후 PDF 파서(슬라이드 이미지/도식도 Vision OCR).
                 # 서버에 LibreOffice(soffice) 필요.
@@ -296,45 +148,20 @@ class DocumentProcessor:
             elif file_extension == '.pdf':
                 data = await asyncio.to_thread(file_content.read)
                 documents = await get_pdf_parser().parse(data, file_name)
-            elif file_extension in ('.hwp', '.hwpx'):
+            elif file_extension in ('.hwp', '.hwpx', '.doc', '.docx'):
                 data = await asyncio.to_thread(file_content.read)
-                file_extension = sniff_hwp_extension(data, file_extension)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
-                    await asyncio.to_thread(tmp.write, data)
-                    tmp_path = tmp.name
-                converted_pdf_path = None
                 try:
-                    text, error, hwp_blocks = await asyncio.to_thread(
-                        _extract_text_from_hwp_or_hwpx, tmp_path, file_extension
-                    )
-                    if error is not None:
-                        print(f"HWP/HWPX extraction error for {file_name}: {error}")
-                        # Fallback: parser dependency(e.g. extract-hwp) missing or broken.
-                        # Try converting the original file to PDF, then parse through PDF pipeline.
-                        try:
-                            converted_pdf_path = await asyncio.to_thread(
-                                convert_to_pdf,
-                                tmp_path,
-                                os.path.dirname(tmp_path),
-                            )
-                            with open(converted_pdf_path, "rb") as f:
-                                converted_pdf_bytes = await asyncio.to_thread(f.read)
-                            converted_pdf_name = f"{Path(file_name).stem}.pdf"
-                            documents = await get_pdf_parser().parse(converted_pdf_bytes, converted_pdf_name)
-                            print(f"[fallback] converted {file_extension} -> PDF for {file_name}")
-                        except FileToPdfError as conv_err:
-                            print(f"[fallback] file to PDF conversion error for {file_name}: {conv_err}")
-                            return None
-                        except Exception as conv_err:
-                            print(f"[fallback] unexpected conversion error for {file_name}: {conv_err}")
-                            return None
-                    else:
-                        meta = {BLOCKS_KEY: hwp_blocks} if hwp_blocks else {}
-                        documents = [Document(page_content=text or "", metadata=meta)]
-                finally:
-                    if converted_pdf_path and os.path.exists(converted_pdf_path):
-                        await asyncio.to_thread(os.unlink, converted_pdf_path)
-                    await asyncio.to_thread(os.unlink, tmp_path)
+                    # 확장자와 실제 형식이 다른 채로 도는 파일이 있다(HWP5 바이너리에 .hwpx)
+                    file_extension = "." + detect_format(data, file_name)
+                    documents = await parse_flowing(data, file_name)
+                except EncryptedDocumentError as e:
+                    print(f"[parser] 암호가 걸린 문서 {file_name}: {e}")
+                    return None
+                except ParseError as e:
+                    print(f"[parser] {file_name} 읽기 실패, PDF 로 바꿔 다시 읽는다: {e}")
+                    documents = await self._parse_via_pdf(data, file_name, file_extension)
+                    if documents is None:
+                        return None
             else:
                 print(f"Unsupported file type: {file_extension}")
                 return None
@@ -509,57 +336,7 @@ class DocumentProcessor:
 
     async def _extract_images_from_pdf(self, file_content: bytes, file_name: str, file_id: str) -> List[Dict[str, Any]]:
         """PDF 파일에서 이미지 추출"""
-        extracted_images = []
-        
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
-                tmp.write(file_content)
-                tmp_path = tmp.name
-            
-            try:
-                doc = fitz.open(tmp_path)
-                
-                for page_num in range(len(doc)):
-                    page = doc[page_num]
-                    image_list = page.get_images()
-                    
-                    for img_index, img in enumerate(image_list):
-                        try:
-                            xref = img[0]
-                            base_image = doc.extract_image(xref)
-                            image_bytes = base_image['image']
-                            
-                            # 이미지 메타데이터
-                            image_metadata = {
-                                'format': base_image.get('ext', 'png'),
-                                'source_path': file_name,
-                                'page_number': page_num + 1,
-                                'image_index': img_index
-                            }
-                            
-                            # 이미지 이름 생성
-                            image_name = f"{file_id}_page{page_num+1}_img{img_index}.{image_metadata['format']}"
-                            
-                            extracted_images.append({
-                                'image_id': f"{file_id}_page{page_num+1}_img{img_index}",
-                                'image_name': image_name,
-                                'image_data': image_bytes,
-                                'metadata': image_metadata
-                            })
-                            
-                        except Exception as e:
-                            print(f"Error extracting image {img_index} from page {page_num + 1}: {e}")
-                            continue
-                
-                doc.close()
-                
-            finally:
-                os.unlink(tmp_path)
-                
-        except Exception as e:
-            print(f"Error processing PDF file {file_name}: {e}")
-            
-        return extracted_images
+        return [img async for img in self._iter_pdf_images(file_content, file_name, file_id)]
 
     async def _extract_images_from_docx(self, file_content: bytes, file_name: str, file_id: str) -> List[Dict[str, Any]]:
         """DOCX 파일에서 이미지 추출"""
@@ -713,35 +490,24 @@ class DocumentProcessor:
     async def _iter_pdf_images(
         self, file_content: bytes, file_name: str, file_id: str
     ) -> AsyncIterator[Dict[str, Any]]:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
-            tmp.write(file_content)
-            tmp_path = tmp.name
         try:
-            doc = fitz.open(tmp_path)
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-                for img_index, img in enumerate(page.get_images()):
-                    try:
-                        base_image = doc.extract_image(img[0])
-                        image_bytes = base_image['image']
-                        ext = base_image.get('ext', 'png')
-                        yield {
-                            'image_id': f"{file_id}_page{page_num+1}_img{img_index}",
-                            'image_name': f"{file_id}_page{page_num+1}_img{img_index}.{ext}",
-                            'image_data': image_bytes,
-                            'metadata': {
-                                'format': ext,
-                                'source_path': file_name,
-                                'page_number': page_num + 1,
-                                'image_index': img_index,
-                            },
-                        }
-                    except Exception as e:
-                        print(f"Error extracting image {img_index} from page {page_num + 1}: {e}")
-                        continue
-            doc.close()
-        finally:
-            os.unlink(tmp_path)
+            images = await asyncio.to_thread(lambda: list(pdf_render.iter_images(file_content)))
+        except Exception as e:
+            print(f"Error processing PDF file {file_name}: {e}")
+            return
+        for page_index, img_index, image_bytes, ext in images:
+            image_id = f"{file_id}_page{page_index + 1}_img{img_index}"
+            yield {
+                'image_id': image_id,
+                'image_name': f"{image_id}.{ext}",
+                'image_data': image_bytes,
+                'metadata': {
+                    'format': ext,
+                    'source_path': file_name,
+                    'page_number': page_index + 1,
+                    'image_index': img_index,
+                },
+            }
 
     async def _iter_zip_images(
         self, file_content: bytes, file_id: str, suffix: str, prefix: str, id_tpl: str

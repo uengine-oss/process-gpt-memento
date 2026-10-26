@@ -48,29 +48,14 @@ frentis 는 모델 규칙으로 thinking 을 끈다 — 운영처럼 `openai` �
 
 ## 파서
 
-근거·측정은 `docs/DESIGN_NOTES.md` "파서 점검"·"선 없는 하위 행"·"PDF 표: 규칙 대 LLM".
+HWP·HWPX·DOC·DOCX·PDF 는 [process-gpt-document-parser](https://github.com/uengine-oss/process-gpt-document-parser) 로 읽는다.
+표 구조는 규칙으로 읽고, 그림 설명·스캔 쪽 OCR 만 아래 LLM 을 부른다. 측정은 그 저장소 `docs/BENCHMARKS.md`.
 
 | 이름 | 기본값 | 뜻 |
 |---|---|---|
-| `MEMENTO_TABLE_LLM` | `false` | **PDF 표를 LLM 으로 다시 읽음**(아래). 표마다 10초 안팎 |
-| `MEMENTO_TABLE_LLM_MODEL` | `MEMENTO_LLM_MODEL` | 표 파싱 모델. 같은 주소·키로 부른다. 그림을 받는 모델이어야 한다 |
-| `MEMENTO_PDF_VISION_WORKERS` | `4` | 한 문서의 그림 설명·OCR·표 파싱 동시 호출 수(LLM 서버 용량에 맞춘다) |
-| `MEMENTO_IMAGE_ANALYSIS` | 프로바이더가 그림을 받으면 켬 | 추출 이미지·이미지 파일 재분석. PDF 쪽·그림 영역 VLM 은 이 값과 무관하게 돈다 |
-| `PDF_STRATEGY` | `pymupdf_region` | PDF 파서: `pymupdf_region` / `pymupdf` / `pdfplumber` |
-| `PDF_UNRULED_TABLES` | `true` | 괘선 없는 표를 글 배치로 되살림 |
-| `PDF_SPLIT_SUBROWS` | `true` | 표 안에서 가로선 없이 묶인 하위 행을 나눔 |
-| `HWPX_RHWP` | PATH 의 `rhwp` | HWP→HWPX 변환·변환본에 쓰는 rhwp 실행 파일 |
-
-### PDF 표 LLM 파싱 (`MEMENTO_TABLE_LLM`)
-
-켜면 PDF 를 읽을 때 `find_tables` 가 찾은 표마다 영역 그림과 그 영역의 PDF 글자를 LLM(`MEMENTO_TABLE_LLM_MODEL`)에 주고
-마크다운 표를 받는다. 받은 표의 숫자가 모두 그 영역의 PDF 글자에 있을 때만 바꾸고, 아니면 규칙으로 만든 표를 둔다
-(쪽 메타데이터 `table_llm`·`table_llm_dropped`). 선이 없어 `find_tables` 가 못 찾은 표는 대상이 아니다.
-
-- 인제스트 큐 안에서 돈다. 표가 많은 문서는 인제스트가 그만큼 길어진다(`MEMENTO_INGEST_JOB_TIMEOUT` 확인).
-- 켜면 파서 버전에 모델이 붙는다(`2026-10-01.subrows+table-llm:<모델>`). 켜거나 끄거나 모델을 바꾼 뒤
-  `python -m scripts.reindex_stale <tenant> --ext pdf` 로 PDF 만 다시 인덱싱한다.
-- 폐쇄망은 사내 모델(frentis)로도 효과가 있다(DESIGN_NOTES).
+| `MEMENTO_PDF_VISION_WORKERS` | `4` | 한 문서의 그림 설명·OCR 동시 호출 수(LLM 서버 용량에 맞춘다) |
+| `MEMENTO_IMAGE_ANALYSIS` | 프로바이더가 그림을 받으면 켬 | 추출 이미지·이미지 파일 재분석. 문서 속 그림 설명·스캔 쪽 OCR 은 이 값과 무관하게 돈다 |
+| `HWPX_RHWP` | PATH 의 `rhwp` | 한글 문서 보기용 PDF 를 만드는 rhwp 실행 파일 |
 
 ## 벡터 인덱스
 

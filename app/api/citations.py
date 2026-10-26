@@ -17,7 +17,7 @@ from fastapi.responses import Response
 
 from app.api.sections import _file_ref
 from app.core.supabase_client import supabase
-from app.services import rendition
+from app.services import pdf_render, rendition
 from app.storage.artifact_bucket import bucket_for
 
 router = APIRouter()
@@ -153,20 +153,13 @@ async def document_page_image(
     scale: float = Query(default=1.5, gt=0.2, le=4.0),
 ):
     """PDF(흐르는 문서는 변환본) 한 쪽을 PNG 로. bbox 는 PDF 포인트 단위라 X-Page-Width/Height 로 비율을 맞춘다."""
-    import fitz  # PyMuPDF
-
     ref = await _file_ref(tenant_id, file_id, path)
     data = await _pdf_bytes(tenant_id, ref)
 
-    def render() -> tuple[bytes, float, float]:
-        with fitz.open(stream=data, filetype="pdf") as pdf:
-            if page > pdf.page_count:
-                raise HTTPException(status_code=404, detail="page out of range")
-            p = pdf[page - 1]
-            png = p.get_pixmap(matrix=fitz.Matrix(scale, scale)).tobytes("png")
-            return png, p.rect.width, p.rect.height
-
-    png, width, height = await asyncio.to_thread(render)
+    try:
+        png, width, height, _, _ = await asyncio.to_thread(pdf_render.render_page, data, page - 1, scale)
+    except IndexError:
+        raise HTTPException(status_code=404, detail="page out of range")
     return Response(content=png, media_type="image/png", headers={
         "X-Page-Width": f"{width:.2f}", "X-Page-Height": f"{height:.2f}",
         "Access-Control-Expose-Headers": "X-Page-Width, X-Page-Height",

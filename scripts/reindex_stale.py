@@ -1,7 +1,6 @@
 """옛 파서로 인덱싱된 업로드 파일을 재인덱싱 대기(pending)로 돌린다.
 
-`knowledge_files.parser_version` 이 지금 파서 버전(`parser_version()`, 표 LLM 을 켜면 모델이 붙는다)과 다른(또는 비어 있는)
-indexed 파일이 대상이다. 표 LLM 을 켜고 끈 뒤에는 `--ext pdf` 로 PDF 만 돌린다(다른 형식은 결과가 같다).
+`knowledge_files.parser_version` 이 지금 파서 버전(`parser_version()`)과 다른(또는 비어 있는) indexed 파일이 대상이다.
 실제 재처리는 돌고 있는 memento 서버의 인제스트 sweeper 가 pending 을 다시 적재해서 한다(멱등: 옛 페이지·블록·
 카드·벡터를 먼저 지운다). 그림 설명·카드 LLM 을 다시 부르므로 폴더·형식을 좁혀 나눠 돌린다.
 

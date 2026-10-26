@@ -24,10 +24,8 @@ chromadb = "*"
 exceptiongroup = "*"
 setuptools = "==39.1.0"
 requests = "*"
-pymupdf = "*"
 docx = "*"
-extract-hwp = {git = "https://github.com/thlee/extract-hwp.git"}
-olefile = ">=0.47"
+process-gpt-document-parser = {git = "https://github.com/uengine-oss/process-gpt-document-parser.git", ref = "v0.1.0", extras = ["pdf", "hwp-distribution", "images"]}
 
 [dev-packages]
 

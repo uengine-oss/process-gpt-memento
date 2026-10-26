@@ -83,25 +83,34 @@ def _squash(text: str) -> str:
 
 def _pdf_chars(pdf_path: Path) -> Tuple[str, List[Tuple[int, int, Tuple[float, float, float, float]]], List[Tuple[float, float]]]:
     """공백을 뺀 글자 흐름과 글자별 (쪽, 줄 id, bbox), 쪽 크기."""
-    import fitz
+    import pypdfium2 as pdfium
 
     chars: List[str] = []
     where: List[Tuple[int, int, Tuple[float, float, float, float]]] = []
     sizes: List[Tuple[float, float]] = []
     line_id = 0
-    with fitz.open(pdf_path) as pdf:
-        for page_no, page in enumerate(pdf, start=1):
-            sizes.append((page.rect.width, page.rect.height))
-            for block in page.get_text("rawdict")["blocks"]:
-                for line in block.get("lines", []):
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    try:
+        for page_no in range(1, len(pdf) + 1):
+            page = pdf[page_no - 1]
+            width, height = page.get_size()
+            sizes.append((width, height))
+            text = page.get_textpage()
+            prev = None
+            for i in range(text.count_chars()):
+                c = text.get_text_range(i, 1)
+                if not _keep(c):
+                    continue
+                left, bottom, right, top = text.get_charbox(i)
+                box = (round(left, 1), round(height - top, 1), round(right, 1), round(height - bottom, 1))
+                # 새 줄: 앞 글자와 세로로 안 겹치거나 왼쪽으로 되돌아갈 때
+                if prev is None or box[1] >= prev[3] or box[3] <= prev[1] or box[0] < prev[0] - 1:
                     line_id += 1
-                    for span in line["spans"]:
-                        for ch in span["chars"]:
-                            c = ch["c"]
-                            if not _keep(c):
-                                continue
-                            chars.append(c)
-                            where.append((page_no, line_id, tuple(round(v, 1) for v in ch["bbox"])))
+                prev = box
+                chars.append(c)
+                where.append((page_no, line_id, box))
+    finally:
+        pdf.close()
     return "".join(chars), where, sizes
 
 
