@@ -1,6 +1,7 @@
 """검색/조회 라우터: /search, /retrieve, /documents/list, /documents/full-text.
 
-/documents/chunks-metadata, /retrieve-by-indices, /preview/pdf-highlight 는 office-mcp 가 호출한다.
+/documents/chunks-metadata, /retrieve-by-indices, /preview/pdf-highlight 는 office-mcp 가,
+/documents/chunks-with-embeddings 는 bpmn-extractor(pdf2bpmn)가 호출한다.
 
 벡터 검색은 에이전트가 진입점을 잡는 힌트다(codex 미러의 HINTS.md). 문서를 실제로 읽는
 경로는 navigator/folders 라우터의 지도(카드·grep·페이지)이고, 여기는 그 보조다.
@@ -458,6 +459,154 @@ async def get_full_text(
         {fid: meta.get("total_chars") for fid, meta in out.items()},
     )
     return out
+
+
+def _candidate_file_paths(file_path: str) -> List[str]:
+    """
+    메멘토는 storage 업로드 시 `files/{uuid}.{ext}` 형태로 file_path를 저장한다.
+    하지만 work-assistant-agent MCP는 `/files/` 마커 이후 부분만 잘라
+    `{uuid}.{ext}` 형태로 path를 전달하기도 한다.
+    두 형태 모두에서 청크를 찾을 수 있도록 후보 경로를 생성한다.
+    """
+    raw = (file_path or "").strip().split("?", 1)[0]  # 서명 주소에서 잘라 온 경로의 ?token=… 도 뗀다
+    if not raw:
+        return []
+
+    candidates: List[str] = [raw]
+    if not raw.startswith("files/"):
+        candidates.append(f"files/{raw.lstrip('/')}")
+    elif raw.startswith("files/"):
+        candidates.append(raw[len("files/"):])
+
+    # dedupe but preserve order
+    seen: set = set()
+    out: List[str] = []
+    for c in candidates:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+@router.get("/documents/chunks-with-embeddings")
+async def get_chunks_with_embeddings(
+    tenant_id: str,
+    file_path: Optional[str] = None,
+    file_name: Optional[str] = None,
+    room_id: Optional[str] = None,
+    include_embeddings: bool = True,
+    limit: int = Query(default=2000, ge=1, le=5000),
+):
+    """
+    bpmn-extractor(pdf2bpmn)가 채팅에 붙인 문서로 프로세스를 만들 때 부른다 — 없으면 「메멘토에 사전 처리된
+    청크가 없습니다」로 바로 실패한다(694df6a 에서 쓰지 않는 것으로 알고 지웠다가 되살림).
+
+    pdf2bpmn 등 다운스트림 에이전트가 메멘토의 청크와 임베딩을 그대로 재사용할 수 있도록
+    file_path 또는 file_name 기준으로 (1) Supabase documents의 본문/메타와
+    (2) Chroma에 저장된 임베딩 벡터를 합쳐서 반환한다.
+
+    매칭 우선순위:
+      1) file_path (memento storage 경로). `files/` prefix 유무에 모두 대응.
+      2) file_name (동일 tenant 내에서 unique한 케이스가 일반적).
+
+    응답 형식:
+      {
+        "tenant_id", "file_path", "file_name", "room_id",
+        "total_chunks", "embedding_count",
+        "chunks": [{"page_content", "metadata", "embedding"|null}, ...]
+      }
+    """
+    if not file_path and not file_name:
+        raise HTTPException(status_code=400, detail="file_path 또는 file_name 중 하나는 필수입니다.")
+
+    try:
+        rows: List[dict] = []
+
+        if file_path:
+            for candidate in _candidate_file_paths(file_path):
+                query = (
+                    supabase.table("documents")
+                    .select("id, content, metadata")
+                    .eq("metadata->>tenant_id", tenant_id)
+                    .eq("metadata->>file_path", candidate)
+                    .limit(limit)
+                )
+                if room_id:
+                    query = query.eq("metadata->>room_id", room_id)
+                response = query.execute()
+                if response.data:
+                    rows = response.data
+                    break
+
+        if not rows and file_name:
+            query = (
+                supabase.table("documents")
+                .select("id, content, metadata")
+                .eq("metadata->>tenant_id", tenant_id)
+                .eq("metadata->>file_name", file_name)
+                .limit(limit)
+            )
+            if room_id:
+                query = query.eq("metadata->>room_id", room_id)
+            response = query.execute()
+            rows = response.data or []
+
+        text_rows: List[dict] = []
+        for row in rows:
+            meta = row.get("metadata") or {}
+            if meta.get("type") == "image_analysis":
+                continue
+            if room_id and str(meta.get("room_id") or "") != str(room_id):
+                continue
+            text_rows.append(row)
+
+        text_rows.sort(key=lambda c: int((c.get("metadata") or {}).get("chunk_index") or 0))
+
+        embeddings_map: dict = {}
+        if include_embeddings and text_rows:
+            row_ids = [str(r.get("id") or "") for r in text_rows if r.get("id")]
+            if row_ids:
+                try:
+                    from app.services.vector_store import get_vector_store
+
+                    vsm = get_vector_store()
+                    embeddings_map = await vsm.get_embeddings_by_ids(row_ids)
+                except Exception as e:
+                    logger.warning("[chunks-with-embeddings] 인덱스 임베딩 조회 실패: %s", e)
+
+        chunks: List[dict] = []
+        for row in text_rows:
+            rid = str(row.get("id") or "")
+            chunk_payload = {
+                "page_content": row.get("content") or "",
+                "metadata": row.get("metadata") or {},
+            }
+            if include_embeddings:
+                chunk_payload["embedding"] = embeddings_map.get(rid)
+            chunks.append(chunk_payload)
+
+        embedding_count = sum(1 for c in chunks if c.get("embedding"))
+        logger.info(
+            "[/documents/chunks-with-embeddings] tenant=%r file_path=%r file_name=%r "
+            "room_id=%r → chunks=%d embeddings=%d",
+            tenant_id, file_path, file_name, room_id, len(chunks), embedding_count,
+        )
+
+        return {
+            "tenant_id": tenant_id,
+            "file_path": file_path,
+            "file_name": file_name,
+            "room_id": room_id,
+            "total_chunks": len(chunks),
+            "embedding_count": embedding_count,
+            "chunks": chunks,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("[/documents/chunks-with-embeddings] failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/documents/chunks-metadata")
