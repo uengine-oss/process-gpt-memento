@@ -10,6 +10,8 @@
 """
 from __future__ import annotations
 
+from app.services.text_language import bullet_language_word
+
 
 # 모든 요약 작업이 공유하는 코어 원칙. 새 프롬프트 짤 때 이걸 참고/포함.
 CORE_PRINCIPLES = """\
@@ -25,7 +27,7 @@ CORE_PRINCIPLES = """\
 # Mini-summary — 페이지 batch 단위 요약
 #
 # 입력: 한 batch (예: p.21-40) 의 본문 + 문서 전체 abstract 힌트
-# 출력: 4~8 개 한국어 불릿
+# 출력: 4~8 개 불릿 (본문 언어 — 한국어/영어)
 # ─────────────────────────────────────────────────────────────────────────────
 
 MINI_SUMMARY_PROMPT_TEMPLATE = """\
@@ -38,7 +40,7 @@ MINI_SUMMARY_PROMPT_TEMPLATE = """\
 이 문서 총 {n_pages}페이지 중 *p.{batch_start}-{batch_end}* (본 batch {page_count}페이지).
 
 [지시]
-이 페이지 범위의 핵심 사실을 *한국어 불릿 4~8개* 로 정리해라.
+이 페이지 범위의 핵심 사실을 *{lang_word} 불릿 4~8개* 로 정리해라.
 
 규칙:
 {core_principles}
@@ -71,6 +73,7 @@ def build_mini_summary_prompt(
         page_count=page_count,
         batch_text=batch_text,
         core_principles=CORE_PRINCIPLES,
+        lang_word=bullet_language_word(batch_text),
     )
 
 
@@ -82,7 +85,7 @@ def build_mini_summary_prompt(
 
 DOC_CARD_ABSTRACT_PROMPT_TEMPLATE = """\
 다음은 어떤 문서의 앞부분과 마지막 페이지 일부다.
-이 문서가 무엇인지 *1~2 문장* 의 한국어 평문으로 적어라.
+이 문서가 무엇인지 *1~2 문장* 의 {lang_word} 평문으로 적어라.
 
 규칙:
 {core_principles}
@@ -100,4 +103,5 @@ def build_doc_card_abstract_prompt(sample_text: str) -> str:
     return DOC_CARD_ABSTRACT_PROMPT_TEMPLATE.format(
         sample_text=sample_text,
         core_principles=CORE_PRINCIPLES,
+        lang_word=bullet_language_word(sample_text),
     )

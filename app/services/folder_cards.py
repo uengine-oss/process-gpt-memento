@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.supabase_client import supabase
 from app.services.llm_output import parse_json_object
+from app.services.text_language import english_output_rule
 
 logger = logging.getLogger(__name__)
 
@@ -379,7 +380,8 @@ def _build_summary_prompt(
         "- 여기 적힌 사실만 쓴다. 추측·일반 지식 보충 금지.\n"
         "- reading_guide 의 화살표 오른쪽은 위 목록에 실제로 있는 파일명 또는 하위 폴더명만 쓴다.\n"
         "- 문서가 하나뿐이면 reading_guide 는 그 문서로 가는 한 줄이면 된다.\n"
-        "- 모든 내용은 문서들의 언어를 따른다. JSON 객체만 출력한다. 코드펜스·설명 금지.\n\n"
+        "- 모든 내용은 문서들의 언어를 따른다. JSON 객체만 출력한다. 코드펜스·설명 금지.\n"
+        f"{english_output_rule(body, 'summary·topics·reading_guide')}\n"
         f"{body}\n\n[JSON]"
     )
 

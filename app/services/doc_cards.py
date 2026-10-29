@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.services.llm_output import parse_json_object
+from app.services.text_language import english_output_rule
 
 logger = logging.getLogger(__name__)
 
@@ -333,6 +334,7 @@ def build_first_prompt(file_name: str, window: Window, context: Optional[CardCon
         "이 조각만 보고 아래 JSON 을 채워라. 다른 조각은 나중에 따로 본다.\n"
         f"{_JSON_SHAPE}\n"
         f"규칙:\n{_CORE_RULES}"
+        f"{english_output_rule(window.text, 'title·doc_type·summary·distinguishers·topics·entities·keywords·answers_questions·sections')}"
         "- answers_questions 는 요약이 아니라 *검색 표면* 이다. 이 문서에만 있는 정보를 묻는 질문을 적어라.\n"
         "- distinguishers 는 같은 폴더의 다른 문서(위 목록)와 헷갈리지 않게 해 주는 사실만 담는다.\n"
         f"{_SECTION_RULES if window.block_ids else ''}"
@@ -375,6 +377,7 @@ def build_update_prompt(
         ' "title": "카드의 제목이 틀렸을 때만", "doc_type": "카드의 종류가 틀렸을 때만"'
         f"{sections_shape}}}\n\n"
         f"규칙:\n{_CORE_RULES}"
+        f"{english_output_rule(window.text, 'summary·new_*·title·doc_type·sections')}"
         "- new_* 는 카드에 아직 없는 것만 담는다. 이미 있는 항목을 반복하지 마라.\n"
         "- 이 조각이 참고문헌·상용구뿐이면 new_* 를 모두 비운다.\n"
         f"{sections_rules}"
